@@ -156,27 +156,22 @@ mod tests {
     }
 
     #[test]
-    fn treasury_model_calculates_positive_net() {
-        let result = calculate_economics(
+    fn treasury_model_calculates_positive_net() -> Result<(), EconomicsError> {
+        let economics = calculate_economics(
             &sample_quote(),
             &sample_execution(),
             FundingMode::Treasury,
             None,
-        );
-
-        assert!(result.is_ok());
-
-        let economics = match result {
-            Ok(value) => value,
-            Err(error) => panic!("unexpected economics error: {error}"),
-        };
+        )?;
 
         assert!(economics.expected_net_usd > 0.0);
         assert!(economics.passes_minimum);
+
+        Ok(())
     }
 
     #[test]
-    fn flash_model_includes_flash_costs() {
+    fn flash_model_includes_flash_costs() -> Result<(), EconomicsError> {
         let flash = FlashCosts {
             borrow_fee_usd: 0.01,
             added_execution_cost_usd: 0.02,
@@ -187,29 +182,18 @@ mod tests {
             &sample_execution(),
             FundingMode::Treasury,
             None,
-        );
+        )?;
 
         let flash_result = calculate_economics(
             &sample_quote(),
             &sample_execution(),
             FundingMode::Flash,
             Some(&flash),
-        );
-
-        assert!(treasury.is_ok());
-        assert!(flash_result.is_ok());
-
-        let treasury = match treasury {
-            Ok(value) => value,
-            Err(error) => panic!("unexpected treasury error: {error}"),
-        };
-
-        let flash_result = match flash_result {
-            Ok(value) => value,
-            Err(error) => panic!("unexpected flash error: {error}"),
-        };
+        )?;
 
         assert!(flash_result.expected_net_usd < treasury.expected_net_usd);
+
+        Ok(())
     }
 
     #[test]
