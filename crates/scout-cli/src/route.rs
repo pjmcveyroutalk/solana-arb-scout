@@ -17,11 +17,7 @@ pub struct RouteLeg {
 }
 
 impl RouteLeg {
-    fn new(
-        pool: &NormalizedPoolState,
-        input_mint: &str,
-        output_mint: &str,
-    ) -> Self {
+    fn new(pool: &NormalizedPoolState, input_mint: &str, output_mint: &str) -> Self {
         Self {
             venue: pool.venue,
             pool_id: pool.pool_id.clone(),
@@ -75,9 +71,7 @@ impl TwoLegRouteCandidate {
     }
 }
 
-pub fn generate_two_leg_routes(
-    pools: &[NormalizedPoolState],
-) -> Vec<TwoLegRouteCandidate> {
+pub fn generate_two_leg_routes(pools: &[NormalizedPoolState]) -> Vec<TwoLegRouteCandidate> {
     let mut routes = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -151,10 +145,7 @@ fn add_candidate(
     }
 }
 
-fn counter_mint<'a>(
-    pool: &'a NormalizedPoolState,
-    anchor_mint: &str,
-) -> Option<&'a str> {
+fn counter_mint<'a>(pool: &'a NormalizedPoolState, anchor_mint: &str) -> Option<&'a str> {
     let token_a_is_anchor = pool.token_a.mint == anchor_mint;
     let token_b_is_anchor = pool.token_b.mint == anchor_mint;
 
@@ -168,9 +159,7 @@ fn counter_mint<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scout_core::{
-        NormalizedToken, PoolTradingState, QuoteReserveState,
-    };
+    use scout_core::{NormalizedToken, PoolTradingState, QuoteReserveState};
 
     const TEST_TOKEN: &str = "Token1111111111111111111111111111111111111";
     const OTHER_TOKEN: &str = "Other1111111111111111111111111111111111111";
@@ -274,18 +263,8 @@ mod tests {
     #[test]
     fn unsupported_anchor_does_not_form_route() {
         let pools = vec![
-            sample_pool(
-                Venue::RaydiumCpmm,
-                "raydium-pool",
-                OTHER_TOKEN,
-                TEST_TOKEN,
-            ),
-            sample_pool(
-                Venue::PumpSwap,
-                "pumpswap-pool",
-                OTHER_TOKEN,
-                TEST_TOKEN,
-            ),
+            sample_pool(Venue::RaydiumCpmm, "raydium-pool", OTHER_TOKEN, TEST_TOKEN),
+            sample_pool(Venue::PumpSwap, "pumpswap-pool", OTHER_TOKEN, TEST_TOKEN),
         ];
 
         assert!(generate_two_leg_routes(&pools).is_empty());
@@ -316,18 +295,8 @@ mod tests {
     #[test]
     fn usdc_anchor_is_permitted() {
         let pools = vec![
-            sample_pool(
-                Venue::RaydiumCpmm,
-                "raydium-pool",
-                USDC_MINT,
-                TEST_TOKEN,
-            ),
-            sample_pool(
-                Venue::PumpSwap,
-                "pumpswap-pool",
-                TEST_TOKEN,
-                USDC_MINT,
-            ),
+            sample_pool(Venue::RaydiumCpmm, "raydium-pool", USDC_MINT, TEST_TOKEN),
+            sample_pool(Venue::PumpSwap, "pumpswap-pool", TEST_TOKEN, USDC_MINT),
         ];
 
         let routes = generate_two_leg_routes(&pools);
@@ -339,18 +308,8 @@ mod tests {
     #[test]
     fn usdt_anchor_is_permitted() {
         let pools = vec![
-            sample_pool(
-                Venue::RaydiumCpmm,
-                "raydium-pool",
-                USDT_MINT,
-                TEST_TOKEN,
-            ),
-            sample_pool(
-                Venue::PumpSwap,
-                "pumpswap-pool",
-                TEST_TOKEN,
-                USDT_MINT,
-            ),
+            sample_pool(Venue::RaydiumCpmm, "raydium-pool", USDT_MINT, TEST_TOKEN),
+            sample_pool(Venue::PumpSwap, "pumpswap-pool", TEST_TOKEN, USDT_MINT),
         ];
 
         let routes = generate_two_leg_routes(&pools);
