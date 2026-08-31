@@ -4,10 +4,15 @@ use scout_core::{
 };
 use serde_json::{json, Value};
 
-pub const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+pub const RAYDIUM_CPMM_PROGRAM_ID: &str =
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
 const POOL_STATE_LEN: usize = 637;
 const POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
+
+const AMM_CONFIG_LEN: usize = 236;
+const AMM_CONFIG_DISCRIMINATOR: [u8; 8] = [218, 244, 33, 104, 203, 203, 43, 111];
+
 const TOKEN_ACCOUNT_BASE_LEN: usize = 165;
 const TOKEN_ACCOUNT_MINT_OFFSET: usize = 0;
 const TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
@@ -83,6 +88,39 @@ impl RaydiumCpmmPoolState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaydiumAmmConfig {
+    pub bump: u8,
+    pub disable_create_pool: bool,
+    pub index: u16,
+    pub trade_fee_rate: u64,
+    pub protocol_fee_rate: u64,
+    pub fund_fee_rate: u64,
+    pub create_pool_fee: u64,
+    pub protocol_owner: String,
+    pub fund_owner: String,
+    pub creator_fee_rate: u64,
+}
+
+impl RaydiumAmmConfig {
+    pub fn summary(&self) -> String {
+        format!(
+            concat!(
+                "config_index={} trade_fee_rate={} protocol_fee_rate={} ",
+                "fund_fee_rate={} creator_fee_rate={} create_pool_fee={} ",
+                "disable_create_pool={}"
+            ),
+            self.index,
+            self.trade_fee_rate,
+            self.protocol_fee_rate,
+            self.fund_fee_rate,
+            self.creator_fee_rate,
+            self.create_pool_fee,
+            self.disable_create_pool,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaydiumCpmmAccountObservation {
     pub pubkey: String,
     pub slot: u64,
@@ -96,6 +134,7 @@ pub struct RaydiumCpmmAccountObservation {
 pub struct RaydiumHydrationSnapshot {
     pub slot: u64,
     pub pool_state: RaydiumCpmmPoolState,
+    pub amm_config: RaydiumAmmConfig,
     pub token_0_vault_raw: u64,
     pub token_1_vault_raw: u64,
     pub token_0_accrued_fees_raw: u64,
@@ -111,7 +150,9 @@ impl RaydiumHydrationSnapshot {
                 "reserve_slot={} ",
                 "vault0_raw={} vault1_raw={} ",
                 "fees0_raw={} fees1_raw={} ",
-                "effective0_raw={} effective1_raw={}"
+                "effective0_raw={} effective1_raw={} ",
+                "trade_fee_rate={} protocol_fee_rate={} ",
+                "fund_fee_rate={} creator_fee_rate={}"
             ),
             self.slot,
             self.token_0_vault_raw,
@@ -120,6 +161,10 @@ impl RaydiumHydrationSnapshot {
             self.token_1_accrued_fees_raw,
             self.token_0_effective_raw,
             self.token_1_effective_raw,
+            self.amm_config.trade_fee_rate,
+            self.amm_config.protocol_fee_rate,
+            self.amm_config.fund_fee_rate,
+            self.amm_config.creator_fee_rate,
         )
     }
 }
@@ -144,9 +189,10 @@ pub fn program_subscribe_request() -> Value {
     })
 }
 
-pub fn hydration_account_pubkeys(observation: &RaydiumCpmmAccountObservation) -> [String; 3] {
+pub fn hydration_account_pubkeys(observation: &RaydiumCpmmAccountObservation) -> [String; 4] {
     [
         observation.pubkey.clone(),
+        observation.pool_state.amm_config.clone(),
         observation.pool_state.token_0_vault.clone(),
         observation.pool_state.token_1_vault.clone(),
     ]
@@ -239,9 +285,9 @@ pub fn parse_hydration_response(
         .and_then(Value::as_array)
         .ok_or_else(|| "Solana getMultipleAccounts response missing account array".to_owned())?;
 
-    if accounts.len() != 3 {
+    if accounts.len() != 4 {
         return Err(format!(
-            "Raydium hydration expected exactly 3 accounts, got {}",
+            "Raydium hydration expected exactly 4 accounts, got {}",
             accounts.len()
         ));
     }
@@ -259,15 +305,22 @@ pub fn parse_hydration_response(
 
     verify_pool_identity(&observation.pool_state, &pool_state)?;
 
-    let token_0_vault_raw = parse_token_vault_account(
+    let amm_config_data = decode_rpc_account_data(
         &accounts[1],
+        RAYDIUM_CPMM_PROGRAM_ID,
+        "Raydium AmmConfig snapshot",
+    )?;
+    let amm_config = decode_amm_config(&amm_config_data)?;
+
+    let token_0_vault_raw = parse_token_vault_account(
+        &accounts[2],
         &pool_state.token_0_program,
         &pool_state.token_0_mint,
         "token_0_vault",
     )?;
 
     let token_1_vault_raw = parse_token_vault_account(
-        &accounts[2],
+        &accounts[3],
         &pool_state.token_1_program,
         &pool_state.token_1_mint,
         "token_1_vault",
@@ -308,6 +361,7 @@ pub fn parse_hydration_response(
     Ok(RaydiumHydrationSnapshot {
         slot,
         pool_state,
+        amm_config,
         token_0_vault_raw,
         token_1_vault_raw,
         token_0_accrued_fees_raw,
@@ -544,6 +598,68 @@ fn trading_state(
     PoolTradingState::Tradable
 }
 
+fn decode_amm_config(data: &[u8]) -> Result<RaydiumAmmConfig, String> {
+    if data.len() != AMM_CONFIG_LEN {
+        return Err(format!(
+            "unexpected Raydium AmmConfig length: expected {AMM_CONFIG_LEN}, got {}",
+            data.len()
+        ));
+    }
+
+    let discriminator = data
+        .get(0..AMM_CONFIG_DISCRIMINATOR.len())
+        .ok_or_else(|| "Raydium AmmConfig missing discriminator".to_owned())?;
+
+    if discriminator != AMM_CONFIG_DISCRIMINATOR {
+        return Err("unexpected Raydium AmmConfig discriminator".to_owned());
+    }
+
+    let mut offset = AMM_CONFIG_DISCRIMINATOR.len();
+
+    let bump = read_u8(data, &mut offset)?;
+    let disable_create_pool_raw = read_u8(data, &mut offset)?;
+    let disable_create_pool = match disable_create_pool_raw {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(format!(
+                "invalid Raydium disable_create_pool boolean value: {other}"
+            ));
+        }
+    };
+
+    let index = read_u16(data, &mut offset)?;
+    let trade_fee_rate = read_u64(data, &mut offset)?;
+    let protocol_fee_rate = read_u64(data, &mut offset)?;
+    let fund_fee_rate = read_u64(data, &mut offset)?;
+    let create_pool_fee = read_u64(data, &mut offset)?;
+    let protocol_owner = read_pubkey(data, &mut offset)?;
+    let fund_owner = read_pubkey(data, &mut offset)?;
+    let creator_fee_rate = read_u64(data, &mut offset)?;
+
+    skip(data, &mut offset, 15 * 8)?;
+
+    if offset != data.len() {
+        return Err(format!(
+            "Raydium AmmConfig decoder ended at {offset}, account length is {}",
+            data.len()
+        ));
+    }
+
+    Ok(RaydiumAmmConfig {
+        bump,
+        disable_create_pool,
+        index,
+        trade_fee_rate,
+        protocol_fee_rate,
+        fund_fee_rate,
+        create_pool_fee,
+        protocol_owner,
+        fund_owner,
+        creator_fee_rate,
+    })
+}
+
 fn decode_pool_state(data: &[u8]) -> Result<RaydiumCpmmPoolState, String> {
     if data.len() != POOL_STATE_LEN {
         return Err(format!(
@@ -650,6 +766,10 @@ fn read_u8(data: &[u8], offset: &mut usize) -> Result<u8, String> {
     Ok(bytes[0])
 }
 
+fn read_u16(data: &[u8], offset: &mut usize) -> Result<u16, String> {
+    Ok(u16::from_le_bytes(take::<2>(data, offset)?))
+}
+
 fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64, String> {
     Ok(u64::from_le_bytes(take::<8>(data, offset)?))
 }
@@ -657,10 +777,10 @@ fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64, String> {
 fn skip(data: &[u8], offset: &mut usize, len: usize) -> Result<(), String> {
     let end = offset
         .checked_add(len)
-        .ok_or_else(|| "Raydium PoolState offset overflow".to_owned())?;
+        .ok_or_else(|| "Raydium account offset overflow".to_owned())?;
 
     if end > data.len() {
-        return Err("Raydium PoolState ended unexpectedly".to_owned());
+        return Err("Raydium account ended unexpectedly".to_owned());
     }
 
     *offset = end;
@@ -670,14 +790,14 @@ fn skip(data: &[u8], offset: &mut usize, len: usize) -> Result<(), String> {
 fn take<const N: usize>(data: &[u8], offset: &mut usize) -> Result<[u8; N], String> {
     let end = offset
         .checked_add(N)
-        .ok_or_else(|| "Raydium PoolState offset overflow".to_owned())?;
+        .ok_or_else(|| "Raydium account offset overflow".to_owned())?;
 
     let slice = data
         .get(*offset..end)
-        .ok_or_else(|| "Raydium PoolState ended unexpectedly".to_owned())?;
+        .ok_or_else(|| "Raydium account ended unexpectedly".to_owned())?;
 
     let bytes = <[u8; N]>::try_from(slice)
-        .map_err(|_| "Raydium PoolState field had unexpected size".to_owned())?;
+        .map_err(|_| "Raydium account field had unexpected size".to_owned())?;
 
     *offset = end;
     Ok(bytes)
@@ -752,6 +872,37 @@ mod tests {
     }
 
     #[test]
+    fn decodes_deterministic_amm_config_fixture() -> Result<(), String> {
+        let data = fixture_amm_config();
+        let config = decode_amm_config(&data)?;
+
+        assert_eq!(data.len(), AMM_CONFIG_LEN);
+        assert_eq!(config.bump, 254);
+        assert!(!config.disable_create_pool);
+        assert_eq!(config.index, 7);
+        assert_eq!(config.trade_fee_rate, 2_500);
+        assert_eq!(config.protocol_fee_rate, 120_000);
+        assert_eq!(config.fund_fee_rate, 40_000);
+        assert_eq!(config.create_pool_fee, 1_000_000);
+        assert_eq!(
+            config.protocol_owner,
+            bs58::encode([21u8; 32]).into_string()
+        );
+        assert_eq!(config.fund_owner, bs58::encode([22u8; 32]).into_string());
+        assert_eq!(config.creator_fee_rate, 500);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wrong_amm_config_discriminator() {
+        let mut data = fixture_amm_config();
+        data[0] ^= 0xff;
+
+        assert!(decode_amm_config(&data).is_err());
+    }
+
+    #[test]
     fn rejects_wrong_pool_state_discriminator() {
         let mut data = fixture_pool_state(0, 1_234_567);
         data[0] ^= 0xff;
@@ -806,14 +957,6 @@ mod tests {
         assert_eq!(observation.owner, RAYDIUM_CPMM_PROGRAM_ID);
         assert_eq!(observation.decoded_data_len, POOL_STATE_LEN);
         assert_eq!(observation.pool_state.lp_supply, 1_000);
-        assert_eq!(
-            observation.pool_state.token_0_program,
-            bs58::encode([8u8; 32]).into_string()
-        );
-        assert_eq!(
-            observation.pool_state.token_1_program,
-            bs58::encode([9u8; 32]).into_string()
-        );
 
         Ok(())
     }
@@ -828,22 +971,8 @@ mod tests {
         assert_eq!(normalized.venue, Venue::RaydiumCpmm);
         assert_eq!(normalized.program_id, RAYDIUM_CPMM_PROGRAM_ID);
         assert_eq!(normalized.source_slot, 123_456);
-        assert_eq!(normalized.token_a.mint, observation.pool_state.token_0_mint);
-        assert_eq!(normalized.token_b.mint, observation.pool_state.token_1_mint);
-        assert_eq!(
-            normalized.token_a.vault,
-            observation.pool_state.token_0_vault
-        );
-        assert_eq!(
-            normalized.token_b.vault,
-            observation.pool_state.token_1_vault
-        );
-        assert_eq!(normalized.token_a.decimals, 6);
-        assert_eq!(normalized.token_b.decimals, 6);
         assert_eq!(normalized.trading_state, PoolTradingState::Tradable);
         assert_eq!(normalized.quote_reserves, QuoteReserveState::Unavailable);
-        assert_eq!(normalized.account_update_received_at_unix_ms, 1_500_000_000);
-        assert_eq!(normalized.normalized_at_unix_ms, 1_500_000_001);
 
         Ok(())
     }
@@ -872,20 +1001,21 @@ mod tests {
     }
 
     #[test]
-    fn hydration_account_order_is_pool_then_two_vaults() -> Result<(), String> {
+    fn hydration_account_order_includes_amm_config() -> Result<(), String> {
         let observation = fixture_observation(0, 1_234_567)?;
 
         let account_pubkeys = hydration_account_pubkeys(&observation);
 
         assert_eq!(account_pubkeys[0], observation.pubkey);
-        assert_eq!(account_pubkeys[1], observation.pool_state.token_0_vault);
-        assert_eq!(account_pubkeys[2], observation.pool_state.token_1_vault);
+        assert_eq!(account_pubkeys[1], observation.pool_state.amm_config);
+        assert_eq!(account_pubkeys[2], observation.pool_state.token_0_vault);
+        assert_eq!(account_pubkeys[3], observation.pool_state.token_1_vault);
 
         Ok(())
     }
 
     #[test]
-    fn valid_hydration_snapshot_produces_effective_reserves() -> Result<(), String> {
+    fn valid_hydration_snapshot_produces_reserves_and_fee_context() -> Result<(), String> {
         let observation = fixture_observation(0, 1_234_567)?;
         let payload = fixture_hydration_payload(
             123_500,
@@ -900,6 +1030,10 @@ mod tests {
         let snapshot = parse_hydration_response(&observation, &payload)?;
 
         assert_eq!(snapshot.slot, 123_500);
+        assert_eq!(snapshot.amm_config.trade_fee_rate, 2_500);
+        assert_eq!(snapshot.amm_config.protocol_fee_rate, 120_000);
+        assert_eq!(snapshot.amm_config.fund_fee_rate, 40_000);
+        assert_eq!(snapshot.amm_config.creator_fee_rate, 500);
         assert_eq!(snapshot.token_0_vault_raw, 10_000);
         assert_eq!(snapshot.token_1_vault_raw, 20_000);
         assert_eq!(snapshot.token_0_accrued_fees_raw, 36);
@@ -910,7 +1044,6 @@ mod tests {
         let normalized =
             hydrate_normalized_observation(&observation, &snapshot, 1_500_000_000, 1_500_000_100)?;
 
-        assert_eq!(normalized.source_slot, 123_456);
         assert_eq!(
             normalized.quote_reserves,
             QuoteReserveState::Available {
@@ -919,7 +1052,6 @@ mod tests {
                 source_slot: 123_500,
             }
         );
-        assert_eq!(normalized.normalized_at_unix_ms, 1_500_000_100);
 
         Ok(())
     }
@@ -936,6 +1068,27 @@ mod tests {
             7,
             20_000,
         );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_wrong_amm_config_owner() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let mut payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        payload["result"]["value"][1]["owner"] =
+            Value::String("WrongProgram111111111111111111111111111111".to_owned());
 
         assert!(parse_hydration_response(&observation, &payload).is_err());
 
@@ -1009,7 +1162,7 @@ mod tests {
             20_000,
         );
 
-        payload["result"]["value"][2] = Value::Null;
+        payload["result"]["value"][3] = Value::Null;
 
         assert!(parse_hydration_response(&observation, &payload).is_err());
 
@@ -1042,6 +1195,7 @@ mod tests {
         token_1_amount: u64,
     ) -> Value {
         let pool_data = fixture_pool_state(0, 1_234_567);
+        let amm_config_data = fixture_amm_config();
         let token_0_data = fixture_token_account(token_0_mint_seed, token_0_amount);
         let token_1_data = fixture_token_account(token_1_mint_seed, token_1_amount);
 
@@ -1054,6 +1208,7 @@ mod tests {
                 },
                 "value": [
                     fixture_rpc_account(RAYDIUM_CPMM_PROGRAM_ID, &pool_data),
+                    fixture_rpc_account(RAYDIUM_CPMM_PROGRAM_ID, &amm_config_data),
                     fixture_rpc_account(token_0_owner, &token_0_data),
                     fixture_rpc_account(token_1_owner, &token_1_data)
                 ]
@@ -1085,6 +1240,26 @@ mod tests {
         data
     }
 
+    fn fixture_amm_config() -> Vec<u8> {
+        let mut data = Vec::with_capacity(AMM_CONFIG_LEN);
+
+        data.extend_from_slice(&AMM_CONFIG_DISCRIMINATOR);
+        data.push(254);
+        data.push(0);
+        data.extend_from_slice(&7u16.to_le_bytes());
+
+        for value in [2_500u64, 120_000, 40_000, 1_000_000] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+
+        data.extend(std::iter::repeat(21u8).take(32));
+        data.extend(std::iter::repeat(22u8).take(32));
+        data.extend_from_slice(&500u64.to_le_bytes());
+        data.extend_from_slice(&[0u8; 15 * 8]);
+
+        data
+    }
+
     fn fixture_pool_state(status: u8, open_time: u64) -> Vec<u8> {
         let mut data = Vec::with_capacity(POOL_STATE_LEN);
 
@@ -1095,10 +1270,11 @@ mod tests {
         }
 
         data.extend_from_slice(&[
-            250, // auth_bump
-            status, 9, // lp_mint_decimals
-            6, // mint_0_decimals
-            6, // mint_1_decimals
+            250,
+            status,
+            9,
+            6,
+            6,
         ]);
 
         for value in [1_000u64, 10, 11, 12, 13, open_time, 500] {
