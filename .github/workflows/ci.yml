@@ -1,0 +1,54 @@
+name: Scout V0 CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Compile, Test, Safety
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.80
+        run: |
+          rustup toolchain install 1.80.0 \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
+          rustup default 1.80.0
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+      - name: Read-only capability tripwire
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -RniE \
+            --include='*.rs' \
+            'Keypair|seed phrase|private.?key|send_transaction|sendTransaction|send_bundle|sendBundle|tpu.?client|jito.?searcher' \
+            crates/
+          then
+            echo "Forbidden execution/signing capability marker detected."
+            exit 1
+          fi
+
+          echo "Read-only capability tripwire passed."
