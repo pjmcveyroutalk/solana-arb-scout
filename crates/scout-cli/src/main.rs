@@ -1,3 +1,4 @@
+mod pumpswap;
 mod raydium;
 
 use futures_util::{SinkExt, StreamExt};
@@ -11,6 +12,7 @@ const SOLANA_WSS_URL: &str = "wss://api.mainnet-beta.solana.com";
 const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
+const MAX_PUMPSWAP_OBSERVATIONS: usize = 5;
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -41,6 +43,11 @@ async fn main() {
         eprintln!("Raydium CPMM observation failed: {error}");
         std::process::exit(1);
     }
+
+    if let Err(error) = observe_pumpswap(&rpc_client).await {
+        eprintln!("PumpSwap observation failed: {error}");
+        std::process::exit(1);
+    }
 }
 
 fn install_crypto_provider() -> Result<(), String> {
@@ -57,7 +64,9 @@ fn build_rpc_client() -> Result<Client, String> {
 }
 
 async fn connect() -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
     String,
 > {
     let (socket, _) = connect_async(SOLANA_WSS_URL)
@@ -223,16 +232,140 @@ async fn fetch_raydium_hydration(
 ) -> Result<Value, String> {
     let account_pubkeys = raydium::hydration_account_pubkeys(observation);
 
+    fetch_hydration(
+        rpc_client,
+        3,
+        account_pubkeys,
+        observation.slot,
+        "Raydium",
+    )
+    .await
+}
+
+async fn observe_pumpswap(rpc_client: &Client) -> Result<(), String> {
+    println!("\nDEX adapter: PumpSwap");
+    println!("Program: {}", pumpswap::PUMPSWAP_PROGRAM_ID);
+    println!("Hydration boundary: Solana mainnet read-only HTTP RPC");
+
+    let socket = connect().await?;
+    let (mut writer, mut reader) = socket.split();
+
+    writer
+        .send(Message::Text(
+            pumpswap::program_subscribe_request().to_string(),
+        ))
+        .await
+        .map_err(|error| format!("PumpSwap subscription send error: {error}"))?;
+
+    let mut subscription_confirmed = false;
+    let mut observations = 0usize;
+
+    while observations < MAX_PUMPSWAP_OBSERVATIONS {
+        let payload = next_json_message(&mut reader).await?;
+
+        if payload.get("id") == Some(&Value::from(4)) {
+            if let Some(subscription_id) = payload.get("result").and_then(Value::as_u64) {
+                println!("PumpSwap subscription confirmed: {subscription_id}");
+                subscription_confirmed = true;
+                continue;
+            }
+
+            return Err(format!("PumpSwap subscription rejected: {payload}"));
+        }
+
+        let account_update_received_at_unix_ms = unix_time_ms_now()?;
+
+        let Some(observation) = pumpswap::parse_program_notification(&payload)? else {
+            continue;
+        };
+
+        let hydration_started_at_unix_ms = unix_time_ms_now()?;
+        let hydration_payload = fetch_pumpswap_hydration(rpc_client, &observation).await?;
+        let snapshot = pumpswap::parse_hydration_response(&observation, &hydration_payload)?;
+        let hydrated_at_unix_ms = unix_time_ms_now()?;
+
+        let normalized = pumpswap::hydrate_normalized_observation(
+            &observation,
+            &snapshot,
+            account_update_received_at_unix_ms,
+            hydrated_at_unix_ms,
+        )?;
+
+        observations += 1;
+
+        let hydration_duration_ms =
+            hydrated_at_unix_ms.saturating_sub(hydration_started_at_unix_ms);
+        let total_observation_duration_ms =
+            hydrated_at_unix_ms.saturating_sub(account_update_received_at_unix_ms);
+
+        println!(
+            "pumpswap[{observations}/{MAX_PUMPSWAP_OBSERVATIONS}] slot={} reserve_slot={} pubkey={} owner={} encoded_data_len={} decoded_data_len={}",
+            observation.slot,
+            snapshot.slot,
+            observation.pubkey,
+            observation.owner,
+            observation.encoded_data_len,
+            observation.decoded_data_len,
+        );
+
+        println!("decoded_pool: {}", observation.pool_state.summary());
+        println!("hydrated_reserves: {}", snapshot.summary());
+        println!(
+            "timing: received_at_ms={} hydration_started_at_ms={} hydrated_at_ms={} hydration_duration_ms={} total_observation_duration_ms={}",
+            account_update_received_at_unix_ms,
+            hydration_started_at_unix_ms,
+            hydrated_at_unix_ms,
+            hydration_duration_ms,
+            total_observation_duration_ms,
+        );
+        println!("normalized_pool: {}", normalized.summary());
+    }
+
+    if !subscription_confirmed {
+        return Err("PumpSwap subscription was never confirmed".to_owned());
+    }
+
+    println!("READ-ONLY PUMPSWAP ACCOUNT DECODER PASS");
+    println!("READ-ONLY PUMPSWAP SNAPSHOT HYDRATION PASS");
+    println!("READ-ONLY SECOND VENUE NORMALIZATION PASS");
+    println!("READ-ONLY RUNG 7 OBSERVATION COLLECTION PASS");
+
+    Ok(())
+}
+
+async fn fetch_pumpswap_hydration(
+    rpc_client: &Client,
+    observation: &pumpswap::PumpSwapAccountObservation,
+) -> Result<Value, String> {
+    let account_pubkeys = pumpswap::hydration_account_pubkeys(observation);
+
+    fetch_hydration(
+        rpc_client,
+        5,
+        account_pubkeys,
+        observation.slot,
+        "PumpSwap",
+    )
+    .await
+}
+
+async fn fetch_hydration<const N: usize>(
+    rpc_client: &Client,
+    request_id: u64,
+    account_pubkeys: [String; N],
+    min_context_slot: u64,
+    venue: &str,
+) -> Result<Value, String> {
     let request = json!({
         "jsonrpc": "2.0",
-        "id": 3,
+        "id": request_id,
         "method": "getMultipleAccounts",
         "params": [
             account_pubkeys,
             {
                 "commitment": "processed",
                 "encoding": "base64",
-                "minContextSlot": observation.slot
+                "minContextSlot": min_context_slot
             }
         ]
     });
@@ -242,20 +375,20 @@ async fn fetch_raydium_hydration(
         .json(&request)
         .send()
         .await
-        .map_err(|error| format!("Raydium hydration RPC request failed: {error}"))?;
+        .map_err(|error| format!("{venue} hydration RPC request failed: {error}"))?;
 
     let status = response.status();
 
     if !status.is_success() {
         return Err(format!(
-            "Raydium hydration RPC returned HTTP status {status}"
+            "{venue} hydration RPC returned HTTP status {status}"
         ));
     }
 
     response
         .json::<Value>()
         .await
-        .map_err(|error| format!("Raydium hydration RPC returned invalid JSON: {error}"))
+        .map_err(|error| format!("{venue} hydration RPC returned invalid JSON: {error}"))
 }
 
 fn unix_time_ms_now() -> Result<u64, String> {
@@ -286,6 +419,7 @@ where
             .into_text()
             .map_err(|error| format!("invalid text frame: {error}"))?;
 
-        return serde_json::from_str(&text).map_err(|error| format!("invalid JSON: {error}"));
+        return serde_json::from_str(&text)
+            .map_err(|error| format!("invalid JSON: {error}"));
     }
 }
