@@ -344,7 +344,7 @@ pub fn hydrate_normalized_observation(
             vault: snapshot.pool_state.pool_quote_token_account.clone(),
             decimals: snapshot.quote_decimals,
         },
-        trading_state: snapshot.trading_state.clone(),
+        trading_state: snapshot.trading_state,
         quote_reserves: QuoteReserveState::Available {
             token_a_raw: snapshot.base_vault_raw,
             token_b_raw: snapshot.effective_quote_raw,
@@ -700,70 +700,91 @@ mod tests {
     }
 
     #[test]
-    fn decodes_current_pool_layout() {
-        let state = decode_pool_state(&sample_pool_data()).expect("pool decode");
+    fn decodes_current_pool_layout() -> Result<(), String> {
+        let state = decode_pool_state(&sample_pool_data())?;
 
         assert_eq!(state.pool_bump, 254);
         assert_eq!(state.lp_supply, 123);
         assert_eq!(state.is_mayhem_mode, Some(true));
         assert_eq!(state.is_cashback_coin, Some(false));
         assert_eq!(state.virtual_quote_reserves, 25);
+
+        Ok(())
     }
 
     #[test]
-    fn accepts_legacy_pool_prefix_without_appended_fields() {
+    fn accepts_legacy_pool_prefix_without_appended_fields() -> Result<(), String> {
         let data = sample_pool_data()[..POOL_BASE_LEN].to_vec();
 
-        let state = decode_pool_state(&data).expect("legacy pool decode");
+        let state = decode_pool_state(&data)?;
 
         assert_eq!(state.coin_creator, None);
         assert_eq!(state.is_mayhem_mode, None);
         assert_eq!(state.is_cashback_coin, None);
         assert_eq!(state.virtual_quote_reserves, 0);
+
+        Ok(())
     }
 
     #[test]
-    fn accepts_future_extension_bytes() {
+    fn accepts_future_extension_bytes() -> Result<(), String> {
         let mut data = sample_pool_data();
         data.extend_from_slice(&[9u8; 24]);
 
-        let state = decode_pool_state(&data).expect("future extension decode");
+        let state = decode_pool_state(&data)?;
 
         assert_eq!(state.virtual_quote_reserves, 25);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_partial_appended_field() {
+    fn rejects_partial_appended_field() -> Result<(), String> {
         let data = sample_pool_data()[..220].to_vec();
 
-        let error = decode_pool_state(&data).expect_err("partial extension must fail");
+        let error = match decode_pool_state(&data) {
+            Err(error) => error,
+            Ok(_) => return Err("partial extension unexpectedly decoded".to_owned()),
+        };
 
         assert!(error.contains("ended inside an appended field"));
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_wrong_discriminator() {
+    fn rejects_wrong_discriminator() -> Result<(), String> {
         let mut data = sample_pool_data();
         data[0] ^= 1;
 
-        let error = decode_pool_state(&data).expect_err("wrong discriminator must fail");
+        let error = match decode_pool_state(&data) {
+            Err(error) => error,
+            Ok(_) => return Err("wrong discriminator unexpectedly decoded".to_owned()),
+        };
 
         assert_eq!(error, "unexpected PumpSwap Pool discriminator");
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_invalid_appended_bool() {
+    fn rejects_invalid_appended_bool() -> Result<(), String> {
         let mut data = sample_pool_data();
         data[243] = 2;
 
-        let error = decode_pool_state(&data).expect_err("invalid bool must fail");
+        let error = match decode_pool_state(&data) {
+            Err(error) => error,
+            Ok(_) => return Err("invalid bool unexpectedly decoded".to_owned()),
+        };
 
         assert!(error.contains("is_mayhem_mode invalid bool"));
+
+        Ok(())
     }
 
     #[test]
-    fn hydration_includes_global_config() {
-        let state = decode_pool_state(&sample_pool_data()).expect("pool decode");
+    fn hydration_includes_global_config() -> Result<(), String> {
+        let state = decode_pool_state(&sample_pool_data())?;
 
         let observation = PumpSwapAccountObservation {
             pubkey: "pool".to_owned(),
@@ -778,30 +799,39 @@ mod tests {
 
         assert_eq!(accounts.len(), 6);
         assert_eq!(accounts[5], PUMPSWAP_GLOBAL_CONFIG);
+
+        Ok(())
     }
 
     #[test]
-    fn parses_global_config_disable_flags() {
+    fn parses_global_config_disable_flags() -> Result<(), String> {
         let account = rpc_account(
             PUMPSWAP_PROGRAM_ID,
             &sample_global_config_data(DISABLE_BUY_MASK | DISABLE_SELL_MASK),
         );
 
-        let flags = parse_global_config(&account).expect("global config decode");
+        let flags = parse_global_config(&account)?;
 
         assert_eq!(flags, DISABLE_BUY_MASK | DISABLE_SELL_MASK);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_wrong_global_config_discriminator() {
+    fn rejects_wrong_global_config_discriminator() -> Result<(), String> {
         let mut data = sample_global_config_data(0);
         data[0] ^= 1;
 
         let account = rpc_account(PUMPSWAP_PROGRAM_ID, &data);
 
-        let error = parse_global_config(&account).expect_err("wrong discriminator must fail");
+        let error = match parse_global_config(&account) {
+            Err(error) => error,
+            Ok(_) => return Err("wrong GlobalConfig discriminator unexpectedly decoded".to_owned()),
+        };
 
         assert_eq!(error, "unexpected PumpSwap GlobalConfig discriminator");
+
+        Ok(())
     }
 
     #[test]
@@ -829,33 +859,43 @@ mod tests {
     }
 
     #[test]
-    fn initialized_mint_returns_decimals() {
+    fn initialized_mint_returns_decimals() -> Result<(), String> {
         let data = initialized_mint(9);
+        let decimals = parse_mint_decimals(&data, "test mint")?;
 
-        assert_eq!(
-            parse_mint_decimals(&data, "test mint").expect("mint decode"),
-            9
-        );
+        assert_eq!(decimals, 9);
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_uninitialized_mint() {
+    fn rejects_uninitialized_mint() -> Result<(), String> {
         let mut data = initialized_mint(9);
         data[MINT_INITIALIZED_OFFSET] = 0;
 
-        let error = parse_mint_decimals(&data, "test mint").expect_err("mint must fail");
+        let error = match parse_mint_decimals(&data, "test mint") {
+            Err(error) => error,
+            Ok(_) => return Err("uninitialized mint unexpectedly decoded".to_owned()),
+        };
 
         assert_eq!(error, "test mint is not initialized");
+
+        Ok(())
     }
 
     #[test]
-    fn rejects_invalid_mint_initialized_value() {
+    fn rejects_invalid_mint_initialized_value() -> Result<(), String> {
         let mut data = initialized_mint(9);
         data[MINT_INITIALIZED_OFFSET] = 2;
 
-        let error = parse_mint_decimals(&data, "test mint").expect_err("mint must fail");
+        let error = match parse_mint_decimals(&data, "test mint") {
+            Err(error) => error,
+            Ok(_) => return Err("invalid initialized value unexpectedly decoded".to_owned()),
+        };
 
         assert_eq!(error, "test mint has invalid is_initialized value: 2");
+
+        Ok(())
     }
 
     #[test]
