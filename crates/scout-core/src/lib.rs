@@ -217,12 +217,8 @@ mod tests {
         let mut quote = sample_quote();
         quote.input_usd = 0.0;
 
-        let result = calculate_economics(
-            &quote,
-            &sample_execution(),
-            FundingMode::Treasury,
-            None,
-        );
+        let result =
+            calculate_economics(&quote, &sample_execution(), FundingMode::Treasury, None);
 
         assert!(matches!(result, Err(EconomicsError::InvalidInput)));
     }
