@@ -1,6 +1,4 @@
-use scout_core::{
-    calculate_economics, ExecutionCosts, FlashCosts, FundingMode, RouteQuote,
-};
+use scout_core::{calculate_economics, ExecutionCosts, FlashCosts, FundingMode, RouteQuote};
 
 fn main() {
     println!("ARB Scout V0 — READ ONLY");
@@ -26,42 +24,20 @@ fn main() {
         added_execution_cost_usd: 0.02,
     };
 
-    match calculate_economics(
-        &quote,
-        &execution,
-        FundingMode::Treasury,
-        None,
-    ) {
+    match calculate_economics(&quote, &execution, FundingMode::Treasury, None) {
         Ok(result) => {
-            println!(
-                "Treasury expected net: ${:.6}",
-                result.expected_net_usd
-            );
-            println!(
-                "Treasury passes minimum: {}",
-                result.passes_minimum
-            );
+            println!("Treasury expected net: ${:.6}", result.expected_net_usd);
+            println!("Treasury passes minimum: {}", result.passes_minimum);
         }
         Err(error) => {
             eprintln!("Treasury model error: {error}");
         }
     }
 
-    match calculate_economics(
-        &quote,
-        &execution,
-        FundingMode::Flash,
-        Some(&flash),
-    ) {
+    match calculate_economics(&quote, &execution, FundingMode::Flash, Some(&flash)) {
         Ok(result) => {
-            println!(
-                "Flash expected net: ${:.6}",
-                result.expected_net_usd
-            );
-            println!(
-                "Flash passes minimum: {}",
-                result.passes_minimum
-            );
+            println!("Flash expected net: ${:.6}", result.expected_net_usd);
+            println!("Flash passes minimum: {}", result.passes_minimum);
         }
         Err(error) => {
             eprintln!("Flash model error: {error}");
