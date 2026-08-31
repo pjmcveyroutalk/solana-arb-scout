@@ -2,7 +2,7 @@ mod raydium;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -139,9 +139,19 @@ async fn observe_raydium_cpmm() -> Result<(), String> {
             return Err(format!("Raydium subscription rejected: {payload}"));
         }
 
+        let account_update_received_at_unix_ms = unix_time_ms_now()?;
+
         let Some(observation) = raydium::parse_program_notification(&payload)? else {
             continue;
         };
+
+        let normalized_at_unix_ms = unix_time_ms_now()?;
+
+        let normalized = raydium::normalize_observation(
+            &observation,
+            account_update_received_at_unix_ms,
+            normalized_at_unix_ms,
+        );
 
         observations += 1;
 
@@ -155,6 +165,7 @@ async fn observe_raydium_cpmm() -> Result<(), String> {
         );
 
         println!("decoded_pool: {}", observation.pool_state.summary());
+        println!("normalized_pool: {}", normalized.summary());
     }
 
     if !subscription_confirmed {
@@ -162,8 +173,18 @@ async fn observe_raydium_cpmm() -> Result<(), String> {
     }
 
     println!("READ-ONLY RAYDIUM CPMM ACCOUNT DECODER PASS");
+    println!("READ-ONLY NORMALIZED POOL STATE PASS");
 
     Ok(())
+}
+
+fn unix_time_ms_now() -> Result<u64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock before Unix epoch: {error}"))?;
+
+    u64::try_from(duration.as_millis())
+        .map_err(|_| "Unix timestamp milliseconds exceeded u64".to_owned())
 }
 
 async fn next_json_message<S>(reader: &mut S) -> Result<Value, String>
