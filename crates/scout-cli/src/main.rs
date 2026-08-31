@@ -340,6 +340,8 @@ async fn fetch_hydration<const N: usize>(
     min_context_slot: u64,
     venue: &str,
 ) -> Result<Value, String> {
+    let account_pubkeys = account_pubkeys.to_vec();
+
     let request = json!({
         "jsonrpc": "2.0",
         "id": request_id,
