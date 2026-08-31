@@ -134,7 +134,9 @@ pub fn parse_program_notification(
         .ok_or_else(|| "Raydium notification missing account-data encoding".to_owned())?;
 
     if encoding != "base64" {
-        return Err(format!("unexpected Raydium account-data encoding: {encoding}"));
+        return Err(format!(
+            "unexpected Raydium account-data encoding: {encoding}"
+        ));
     }
 
     let decoded_data = BASE64_STANDARD
@@ -441,4 +443,4 @@ mod tests {
 
         data
     }
-        }
+}
