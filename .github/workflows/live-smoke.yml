@@ -46,4 +46,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout 60s cargo run --locked -p scout-cli
+          timeout 60s cargo run -p scout-cli
