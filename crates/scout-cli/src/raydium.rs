@@ -1,10 +1,8 @@
 use serde_json::{json, Value};
 
-pub const RAYDIUM_CPMM_PROGRAM_ID: &str =
-    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+pub const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
-pub const RAYDIUM_CPMM_POOL_STATE_DISCRIMINATOR: [u8; 8] =
-    [247, 237, 227, 245, 215, 195, 222, 70];
+pub const RAYDIUM_CPMM_POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaydiumCpmmAccountObservation {
