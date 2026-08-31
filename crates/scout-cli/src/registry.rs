@@ -70,6 +70,14 @@ impl ActiveMintRegistry {
         self.latest_pools.len()
     }
 
+    pub fn current_eligible_pools(&self) -> Vec<NormalizedPoolState> {
+        self.latest_pools
+            .values()
+            .filter(|pool| is_eligible(pool))
+            .cloned()
+            .collect()
+    }
+
     pub fn active_mints(&self) -> Vec<ActiveMint> {
         let mut trackers = BTreeMap::<String, MintTracker>::new();
 
@@ -300,6 +308,43 @@ mod tests {
         ));
 
         assert!(registry.active_mints().is_empty());
+    }
+
+    #[test]
+    fn current_eligible_pool_snapshot_excludes_ineligible_state() {
+        let mut registry = ActiveMintRegistry::new();
+
+        registry.upsert(sample_pool(
+            Venue::RaydiumCpmm,
+            "eligible-pool",
+            10,
+            PoolTradingState::Tradable,
+            100,
+            200,
+        ));
+
+        registry.upsert(sample_pool(
+            Venue::PumpSwap,
+            "disabled-pool",
+            11,
+            PoolTradingState::SwapDisabled,
+            300,
+            400,
+        ));
+
+        registry.upsert(sample_pool(
+            Venue::PumpSwap,
+            "zero-pool",
+            12,
+            PoolTradingState::Tradable,
+            0,
+            400,
+        ));
+
+        let eligible = registry.current_eligible_pools();
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0].pool_id, "eligible-pool");
     }
 
     #[test]
