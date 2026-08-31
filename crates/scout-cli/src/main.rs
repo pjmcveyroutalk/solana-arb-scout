@@ -88,14 +88,13 @@ async fn main() {
             "\nREAD-ONLY RUNG 9 DISCOVERY: bounded live sample contains no same-pair cross-venue route"
         );
 
-        let targeted_discovery =
-            match discover_targeted_cross_venue_overlap(&rpc_client).await {
-                Ok(discovery) => discovery,
-                Err(error) => {
-                    eprintln!("Rung 9 targeted discovery failed: {error}");
-                    std::process::exit(1);
-                }
-            };
+        let targeted_discovery = match discover_targeted_cross_venue_overlap(&rpc_client).await {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                eprintln!("Rung 9 targeted discovery failed: {error}");
+                std::process::exit(1);
+            }
+        };
 
         match targeted_discovery {
             Some(discovery) => {
@@ -480,9 +479,7 @@ async fn discover_targeted_cross_venue_overlap(
         if pumpswap_pool_ids.is_empty() {
             println!(
                 "targeted_pumpswap_no_pair: anchor={} intermediate={} raydium_pool={}",
-                candidate.anchor_mint,
-                candidate.intermediate_mint,
-                candidate.raydium_pool_id,
+                candidate.anchor_mint, candidate.intermediate_mint, candidate.raydium_pool_id,
             );
             continue;
         }
@@ -496,17 +493,21 @@ async fn discover_targeted_cross_venue_overlap(
                 pumpswap_pool_id,
             );
 
-            let raydium_observation =
-                match fetch_raydium_pool_observation(rpc_client, &candidate.raydium_pool_id).await {
-                    Ok(observation) => observation,
-                    Err(error) => {
-                        println!(
-                            "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
-                            candidate.raydium_pool_id, error
-                        );
-                        continue;
-                    }
-                };
+            let raydium_observation = match fetch_raydium_pool_observation(
+                rpc_client,
+                &candidate.raydium_pool_id,
+            )
+            .await
+            {
+                Ok(observation) => observation,
+                Err(error) => {
+                    println!(
+                        "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
+                        candidate.raydium_pool_id, error
+                    );
+                    continue;
+                }
+            };
 
             if !raydium_observation_matches_pair(
                 &raydium_observation,
@@ -547,17 +548,21 @@ async fn discover_targeted_cross_venue_overlap(
             let raydium_received_at_unix_ms = unix_time_ms_now()?;
             let raydium_hydration_started_at_unix_ms = unix_time_ms_now()?;
 
-            let raydium_hydration_payload =
-                match fetch_raydium_hydration(rpc_client, &raydium_observation).await {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        println!(
-                            "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
-                            candidate.raydium_pool_id, error
-                        );
-                        continue;
-                    }
-                };
+            let raydium_hydration_payload = match fetch_raydium_hydration(
+                rpc_client,
+                &raydium_observation,
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!(
+                        "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
+                        candidate.raydium_pool_id, error
+                    );
+                    continue;
+                }
+            };
 
             let raydium_snapshot = match raydium::parse_hydration_response(
                 &raydium_observation,
@@ -654,10 +659,10 @@ async fn discover_targeted_cross_venue_overlap(
                 continue;
             }
 
-            let raydium_hydration_duration_ms = raydium_hydrated_at_unix_ms
-                .saturating_sub(raydium_hydration_started_at_unix_ms);
-            let pumpswap_hydration_duration_ms = pumpswap_hydrated_at_unix_ms
-                .saturating_sub(pumpswap_hydration_started_at_unix_ms);
+            let raydium_hydration_duration_ms =
+                raydium_hydrated_at_unix_ms.saturating_sub(raydium_hydration_started_at_unix_ms);
+            let pumpswap_hydration_duration_ms =
+                pumpswap_hydrated_at_unix_ms.saturating_sub(pumpswap_hydration_started_at_unix_ms);
 
             println!(
                 "targeted_raydium_pool: anchor={} intermediate={} pool={} source_slot={} reserve_slot={} hydration_duration_ms={}",
@@ -712,8 +717,7 @@ async fn collect_raydium_inventory_candidates(
     let mut candidates = Vec::new();
 
     for anchor_mint in [WRAPPED_SOL_MINT, USDC_MINT, USDT_MINT] {
-        let anchor_candidates =
-            fetch_raydium_anchor_inventory(rpc_client, anchor_mint).await?;
+        let anchor_candidates = fetch_raydium_anchor_inventory(rpc_client, anchor_mint).await?;
 
         println!(
             "raydium_anchor_inventory: anchor={} cpmm_candidate_count={}",
@@ -722,9 +726,12 @@ async fn collect_raydium_inventory_candidates(
         );
 
         for candidate in anchor_candidates {
-            if candidates.iter().any(|existing: &RaydiumInventoryCandidate| {
-                existing.raydium_pool_id == candidate.raydium_pool_id
-            }) {
+            if candidates
+                .iter()
+                .any(|existing: &RaydiumInventoryCandidate| {
+                    existing.raydium_pool_id == candidate.raydium_pool_id
+                })
+            {
                 continue;
             }
 
@@ -789,9 +796,7 @@ fn raydium_anchor_candidates_from_payload(
     let mut candidates = Vec::new();
 
     for pool in pools {
-        if pool.get("programId").and_then(Value::as_str)
-            != Some(raydium::RAYDIUM_CPMM_PROGRAM_ID)
-        {
+        if pool.get("programId").and_then(Value::as_str) != Some(raydium::RAYDIUM_CPMM_PROGRAM_ID) {
             continue;
         }
 
@@ -810,7 +815,9 @@ fn raydium_anchor_candidates_from_payload(
             .pointer("/mintB/address")
             .and_then(Value::as_str)
             .or_else(|| pool.pointer("/mint2/address").and_then(Value::as_str))
-            .ok_or_else(|| "Raydium CPMM inventory result missing second mint address".to_owned())?;
+            .ok_or_else(|| {
+                "Raydium CPMM inventory result missing second mint address".to_owned()
+            })?;
 
         let intermediate_mint = if mint_a == anchor_mint && mint_b != anchor_mint {
             mint_b
@@ -843,11 +850,7 @@ fn raydium_anchor_candidates_from_payload(
     Ok(candidates)
 }
 
-fn pumpswap_pair_lookup_request(
-    request_id: u64,
-    base_mint: &str,
-    quote_mint: &str,
-) -> Value {
+fn pumpswap_pair_lookup_request(request_id: u64, base_mint: &str, quote_mint: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": request_id,
