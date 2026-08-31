@@ -548,21 +548,17 @@ async fn discover_targeted_cross_venue_overlap(
             let raydium_received_at_unix_ms = unix_time_ms_now()?;
             let raydium_hydration_started_at_unix_ms = unix_time_ms_now()?;
 
-            let raydium_hydration_payload = match fetch_raydium_hydration(
-                rpc_client,
-                &raydium_observation,
-            )
-            .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    println!(
-                        "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
-                        candidate.raydium_pool_id, error
-                    );
-                    continue;
-                }
-            };
+            let raydium_hydration_payload =
+                match fetch_raydium_hydration(rpc_client, &raydium_observation).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
+                            candidate.raydium_pool_id, error
+                        );
+                        continue;
+                    }
+                };
 
             let raydium_snapshot = match raydium::parse_hydration_response(
                 &raydium_observation,
