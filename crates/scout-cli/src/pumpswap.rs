@@ -257,7 +257,6 @@ pub fn parse_hydration_response(
     }
 
     let pool_data = decode_rpc_account_data(&accounts[0], PUMPSWAP_PROGRAM_ID, "PumpSwap pool")?;
-
     let pool_state = decode_pool_state(&pool_data)?;
 
     verify_pool_identity(&observation.pool_state, &pool_state)?;
@@ -294,11 +293,8 @@ pub fn parse_hydration_response(
 
     let effective_quote_raw = u64::try_from(effective_quote).map_err(|_| {
         format!(
-            concat!(
-                "PumpSwap effective quote reserve outside u64 range: ",
-                "raw={} virtual={} effective={effective_quote}"
-            ),
-            quote_vault_raw, pool_state.virtual_quote_reserves
+            "PumpSwap effective quote reserve outside u64 range: raw={} virtual={} effective={}",
+            quote_vault_raw, pool_state.virtual_quote_reserves, effective_quote
         )
     })?;
 
@@ -362,10 +358,8 @@ pub fn hydrate_normalized_observation(
 fn decode_pool_state(data: &[u8]) -> Result<PumpSwapPoolState, String> {
     if data.len() < POOL_BASE_LEN {
         return Err(format!(
-            concat!(
-                "unexpected PumpSwap Pool account length: ",
-                "expected at least {POOL_BASE_LEN}, got {}"
-            ),
+            "unexpected PumpSwap Pool account length: expected at least {}, got {}",
+            POOL_BASE_LEN,
             data.len()
         ));
     }
@@ -484,10 +478,8 @@ fn parse_global_config(account: &Value) -> Result<u8, String> {
 
     if data.len() < GLOBAL_CONFIG_MIN_LEN {
         return Err(format!(
-            concat!(
-                "PumpSwap GlobalConfig shorter than required prefix: ",
-                "expected at least {GLOBAL_CONFIG_MIN_LEN}, got {}"
-            ),
+            "PumpSwap GlobalConfig shorter than required prefix: expected at least {}, got {}",
+            GLOBAL_CONFIG_MIN_LEN,
             data.len()
         ));
     }
@@ -530,10 +522,8 @@ fn decode_supported_mint_account(
 fn parse_mint_decimals(data: &[u8], label: &str) -> Result<u8, String> {
     if data.len() < MINT_ACCOUNT_BASE_LEN {
         return Err(format!(
-            concat!(
-                "{label} shorter than SPL Mint base layout: ",
-                "expected at least {MINT_ACCOUNT_BASE_LEN}, got {}"
-            ),
+            "{label} shorter than SPL Mint base layout: expected at least {}, got {}",
+            MINT_ACCOUNT_BASE_LEN,
             data.len()
         ));
     }
@@ -555,10 +545,8 @@ fn parse_token_vault_account(
 
     if data.len() < TOKEN_ACCOUNT_BASE_LEN {
         return Err(format!(
-            concat!(
-                "{label} shorter than SPL Token account base layout: ",
-                "expected at least {TOKEN_ACCOUNT_BASE_LEN}, got {}"
-            ),
+            "{label} shorter than SPL Token account base layout: expected at least {}, got {}",
+            TOKEN_ACCOUNT_BASE_LEN,
             data.len()
         ));
     }
