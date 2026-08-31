@@ -1,10 +1,14 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use scout_core::{
+    NormalizedPoolState, NormalizedToken, PoolTradingState, QuoteReserveState, Venue,
+};
 use serde_json::{json, Value};
 
 pub const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
 const POOL_STATE_LEN: usize = 637;
 const POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
+const SWAP_DISABLED_BIT: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaydiumCpmmPoolState {
@@ -158,6 +162,59 @@ pub fn parse_program_notification(
         decoded_data_len: decoded_data.len(),
         pool_state,
     }))
+}
+
+pub fn normalize_observation(
+    observation: &RaydiumCpmmAccountObservation,
+    account_update_received_at_unix_ms: u64,
+    normalized_at_unix_ms: u64,
+) -> NormalizedPoolState {
+    let trading_state = trading_state(
+        observation.pool_state.status,
+        observation.pool_state.open_time,
+        account_update_received_at_unix_ms,
+    );
+
+    NormalizedPoolState {
+        pool_id: observation.pubkey.clone(),
+        venue: Venue::RaydiumCpmm,
+        program_id: observation.owner.clone(),
+        source_slot: observation.slot,
+        token_a: NormalizedToken {
+            mint: observation.pool_state.token_0_mint.clone(),
+            vault: observation.pool_state.token_0_vault.clone(),
+            decimals: observation.pool_state.mint_0_decimals,
+        },
+        token_b: NormalizedToken {
+            mint: observation.pool_state.token_1_mint.clone(),
+            vault: observation.pool_state.token_1_vault.clone(),
+            decimals: observation.pool_state.mint_1_decimals,
+        },
+        trading_state,
+        quote_reserves: QuoteReserveState::Unavailable,
+        account_update_received_at_unix_ms,
+        normalized_at_unix_ms,
+    }
+}
+
+fn trading_state(
+    status: u8,
+    open_time_unix_seconds: u64,
+    observed_at_unix_ms: u64,
+) -> PoolTradingState {
+    let swap_disabled_mask = 1u8 << SWAP_DISABLED_BIT;
+
+    if status & swap_disabled_mask != 0 {
+        return PoolTradingState::SwapDisabled;
+    }
+
+    let observed_at_unix_seconds = observed_at_unix_ms / 1_000;
+
+    if open_time_unix_seconds > observed_at_unix_seconds {
+        return PoolTradingState::NotYetOpen;
+    }
+
+    PoolTradingState::Tradable
 }
 
 fn decode_pool_state(data: &[u8]) -> Result<RaydiumCpmmPoolState, String> {
@@ -335,7 +392,7 @@ mod tests {
 
     #[test]
     fn decodes_deterministic_pool_state_fixture() -> Result<(), String> {
-        let data = fixture_pool_state();
+        let data = fixture_pool_state(0, 1_234_567);
         let state = decode_pool_state(&data)?;
 
         assert_eq!(data.len(), POOL_STATE_LEN);
@@ -365,7 +422,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_pool_state_discriminator() {
-        let mut data = fixture_pool_state();
+        let mut data = fixture_pool_state(0, 1_234_567);
         data[0] ^= 0xff;
 
         assert!(decode_pool_state(&data).is_err());
@@ -373,7 +430,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_pool_state_length() {
-        let mut data = fixture_pool_state();
+        let mut data = fixture_pool_state(0, 1_234_567);
         let _ = data.pop();
 
         assert!(decode_pool_state(&data).is_err());
@@ -381,7 +438,7 @@ mod tests {
 
     #[test]
     fn parses_and_decodes_read_only_raydium_observation() -> Result<(), String> {
-        let data = fixture_pool_state();
+        let data = fixture_pool_state(0, 1_234_567);
         let encoded_data = BASE64_STANDARD.encode(&data);
 
         let payload = json!({
@@ -422,7 +479,82 @@ mod tests {
         Ok(())
     }
 
-    fn fixture_pool_state() -> Vec<u8> {
+    #[test]
+    fn normalizes_raydium_pool_without_inventing_reserves() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+
+        let normalized = normalize_observation(&observation, 1_500_000_000, 1_500_000_001);
+
+        assert_eq!(normalized.pool_id, observation.pubkey);
+        assert_eq!(normalized.venue, Venue::RaydiumCpmm);
+        assert_eq!(normalized.program_id, RAYDIUM_CPMM_PROGRAM_ID);
+        assert_eq!(normalized.source_slot, 123_456);
+        assert_eq!(normalized.token_a.mint, observation.pool_state.token_0_mint);
+        assert_eq!(normalized.token_b.mint, observation.pool_state.token_1_mint);
+        assert_eq!(
+            normalized.token_a.vault,
+            observation.pool_state.token_0_vault
+        );
+        assert_eq!(
+            normalized.token_b.vault,
+            observation.pool_state.token_1_vault
+        );
+        assert_eq!(normalized.token_a.decimals, 6);
+        assert_eq!(normalized.token_b.decimals, 6);
+        assert_eq!(normalized.trading_state, PoolTradingState::Tradable);
+        assert_eq!(normalized.quote_reserves, QuoteReserveState::Unavailable);
+        assert_eq!(normalized.account_update_received_at_unix_ms, 1_500_000_000);
+        assert_eq!(normalized.normalized_at_unix_ms, 1_500_000_001);
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalization_marks_future_open_time() -> Result<(), String> {
+        let observation = fixture_observation(0, 2_000_000)?;
+
+        let normalized = normalize_observation(&observation, 1_500_000_000, 1_500_000_001);
+
+        assert_eq!(
+            normalized.trading_state,
+            PoolTradingState::NotYetOpen
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalization_marks_swap_disabled_status() -> Result<(), String> {
+        let swap_disabled_status = 1u8 << SWAP_DISABLED_BIT;
+        let observation = fixture_observation(swap_disabled_status, 1_234_567)?;
+
+        let normalized = normalize_observation(&observation, 1_500_000_000, 1_500_000_001);
+
+        assert_eq!(
+            normalized.trading_state,
+            PoolTradingState::SwapDisabled
+        );
+
+        Ok(())
+    }
+
+    fn fixture_observation(
+        status: u8,
+        open_time: u64,
+    ) -> Result<RaydiumCpmmAccountObservation, String> {
+        let pool_state = decode_pool_state(&fixture_pool_state(status, open_time))?;
+
+        Ok(RaydiumCpmmAccountObservation {
+            pubkey: "ExamplePool111111111111111111111111111111111".to_owned(),
+            slot: 123_456,
+            owner: RAYDIUM_CPMM_PROGRAM_ID.to_owned(),
+            encoded_data_len: 852,
+            decoded_data_len: POOL_STATE_LEN,
+            pool_state,
+        })
+    }
+
+    fn fixture_pool_state(status: u8, open_time: u64) -> Vec<u8> {
         let mut data = Vec::with_capacity(POOL_STATE_LEN);
 
         data.extend_from_slice(&POOL_STATE_DISCRIMINATOR);
@@ -433,13 +565,13 @@ mod tests {
 
         data.extend_from_slice(&[
             250, // auth_bump
-            0,   // status
-            9,   // lp_mint_decimals
-            6,   // mint_0_decimals
-            6,   // mint_1_decimals
+            status,
+            9, // lp_mint_decimals
+            6, // mint_0_decimals
+            6, // mint_1_decimals
         ]);
 
-        for value in [1_000u64, 10, 11, 12, 13, 1_234_567, 500] {
+        for value in [1_000u64, 10, 11, 12, 13, open_time, 500] {
             data.extend_from_slice(&value.to_le_bytes());
         }
 
@@ -454,4 +586,4 @@ mod tests {
 
         data
     }
-}
+        }
