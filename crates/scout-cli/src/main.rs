@@ -418,7 +418,7 @@ async fn discover_targeted_raydium_overlap(
     let mut successful_locator_calls = 0usize;
 
     for batch in candidates.chunks(TARGETED_LOOKUP_BATCH_SIZE) {
-        let lookup_results = join_all(batch.iter().map(|candidate| async {
+        let lookup_results = join_all(batch.iter().map(|candidate| async move {
             let result = fetch_raydium_locator_pool_id(
                 rpc_client,
                 &candidate.anchor_mint,
