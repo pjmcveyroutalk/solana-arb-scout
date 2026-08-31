@@ -64,9 +64,7 @@ fn build_rpc_client() -> Result<Client, String> {
 }
 
 async fn connect() -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
 > {
     let (socket, _) = connect_async(SOLANA_WSS_URL)
@@ -232,14 +230,7 @@ async fn fetch_raydium_hydration(
 ) -> Result<Value, String> {
     let account_pubkeys = raydium::hydration_account_pubkeys(observation);
 
-    fetch_hydration(
-        rpc_client,
-        3,
-        account_pubkeys,
-        observation.slot,
-        "Raydium",
-    )
-    .await
+    fetch_hydration(rpc_client, 3, account_pubkeys, observation.slot, "Raydium").await
 }
 
 async fn observe_pumpswap(rpc_client: &Client) -> Result<(), String> {
@@ -339,14 +330,7 @@ async fn fetch_pumpswap_hydration(
 ) -> Result<Value, String> {
     let account_pubkeys = pumpswap::hydration_account_pubkeys(observation);
 
-    fetch_hydration(
-        rpc_client,
-        5,
-        account_pubkeys,
-        observation.slot,
-        "PumpSwap",
-    )
-    .await
+    fetch_hydration(rpc_client, 5, account_pubkeys, observation.slot, "PumpSwap").await
 }
 
 async fn fetch_hydration<const N: usize>(
@@ -419,7 +403,6 @@ where
             .into_text()
             .map_err(|error| format!("invalid text frame: {error}"))?;
 
-        return serde_json::from_str(&text)
-            .map_err(|error| format!("invalid JSON: {error}"));
+        return serde_json::from_str(&text).map_err(|error| format!("invalid JSON: {error}"));
     }
 }
