@@ -1,8 +1,11 @@
 mod pumpswap;
 mod raydium;
+mod registry;
 
 use futures_util::{SinkExt, StreamExt};
+use registry::ActiveMintRegistry;
 use reqwest::Client;
+use scout_core::NormalizedPoolState;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
@@ -39,13 +42,24 @@ async fn main() {
         }
     };
 
-    if let Err(error) = observe_raydium_cpmm(&rpc_client).await {
-        eprintln!("Raydium CPMM observation failed: {error}");
-        std::process::exit(1);
-    }
+    let raydium_states = match observe_raydium_cpmm(&rpc_client).await {
+        Ok(states) => states,
+        Err(error) => {
+            eprintln!("Raydium CPMM observation failed: {error}");
+            std::process::exit(1);
+        }
+    };
 
-    if let Err(error) = observe_pumpswap(&rpc_client).await {
-        eprintln!("PumpSwap observation failed: {error}");
+    let pumpswap_states = match observe_pumpswap(&rpc_client).await {
+        Ok(states) => states,
+        Err(error) => {
+            eprintln!("PumpSwap observation failed: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = validate_active_mint_registry(raydium_states, pumpswap_states) {
+        eprintln!("Active-mint registry validation failed: {error}");
         std::process::exit(1);
     }
 }
@@ -133,7 +147,7 @@ async fn observe_slots() -> Result<(), String> {
     Ok(())
 }
 
-async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<(), String> {
+async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<Vec<NormalizedPoolState>, String> {
     println!("DEX adapter: Raydium CPMM");
     println!("Program: {}", raydium::RAYDIUM_CPMM_PROGRAM_ID);
     println!("Hydration boundary: Solana mainnet read-only HTTP RPC");
@@ -150,6 +164,7 @@ async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<(), String> {
 
     let mut subscription_confirmed = false;
     let mut observations = 0usize;
+    let mut normalized_states = Vec::with_capacity(MAX_RAYDIUM_OBSERVATIONS);
 
     while observations < MAX_RAYDIUM_OBSERVATIONS {
         let payload = next_json_message(&mut reader).await?;
@@ -210,6 +225,8 @@ async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<(), String> {
             total_observation_duration_ms,
         );
         println!("normalized_pool: {}", normalized.summary());
+
+        normalized_states.push(normalized);
     }
 
     if !subscription_confirmed {
@@ -221,7 +238,7 @@ async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<(), String> {
     println!("READ-ONLY RAYDIUM VAULT HYDRATION PASS");
     println!("READ-ONLY RUNG 6 OBSERVATION COLLECTION PASS");
 
-    Ok(())
+    Ok(normalized_states)
 }
 
 async fn fetch_raydium_hydration(
@@ -233,7 +250,7 @@ async fn fetch_raydium_hydration(
     fetch_hydration(rpc_client, 3, account_pubkeys, observation.slot, "Raydium").await
 }
 
-async fn observe_pumpswap(rpc_client: &Client) -> Result<(), String> {
+async fn observe_pumpswap(rpc_client: &Client) -> Result<Vec<NormalizedPoolState>, String> {
     println!("\nDEX adapter: PumpSwap");
     println!("Program: {}", pumpswap::PUMPSWAP_PROGRAM_ID);
     println!("Hydration boundary: Solana mainnet read-only HTTP RPC");
@@ -250,6 +267,7 @@ async fn observe_pumpswap(rpc_client: &Client) -> Result<(), String> {
 
     let mut subscription_confirmed = false;
     let mut observations = 0usize;
+    let mut normalized_states = Vec::with_capacity(MAX_PUMPSWAP_OBSERVATIONS);
 
     while observations < MAX_PUMPSWAP_OBSERVATIONS {
         let payload = next_json_message(&mut reader).await?;
@@ -310,6 +328,8 @@ async fn observe_pumpswap(rpc_client: &Client) -> Result<(), String> {
             total_observation_duration_ms,
         );
         println!("normalized_pool: {}", normalized.summary());
+
+        normalized_states.push(normalized);
     }
 
     if !subscription_confirmed {
@@ -321,7 +341,7 @@ async fn observe_pumpswap(rpc_client: &Client) -> Result<(), String> {
     println!("READ-ONLY SECOND VENUE NORMALIZATION PASS");
     println!("READ-ONLY RUNG 7 OBSERVATION COLLECTION PASS");
 
-    Ok(())
+    Ok(normalized_states)
 }
 
 async fn fetch_pumpswap_hydration(
@@ -331,6 +351,38 @@ async fn fetch_pumpswap_hydration(
     let account_pubkeys = pumpswap::hydration_account_pubkeys(observation);
 
     fetch_hydration(rpc_client, 5, account_pubkeys, observation.slot, "PumpSwap").await
+}
+
+fn validate_active_mint_registry(
+    raydium_states: Vec<NormalizedPoolState>,
+    pumpswap_states: Vec<NormalizedPoolState>,
+) -> Result<(), String> {
+    println!("\nRegistry: Active Mint");
+
+    let mut registry = ActiveMintRegistry::new();
+
+    for state in raydium_states.into_iter().chain(pumpswap_states) {
+        registry.upsert(state);
+    }
+
+    let active_mints = registry.active_mints();
+
+    println!("registry_current_pools={}", registry.current_pool_count());
+
+    if active_mints.is_empty() {
+        return Err(
+            "bounded live sample produced no mint represented by two eligible venues".to_owned(),
+        );
+    }
+
+    for active_mint in &active_mints {
+        println!("active_mint: {}", active_mint.summary());
+    }
+
+    println!("READ-ONLY ACTIVE-MINT REGISTRY PASS");
+    println!("READ-ONLY RUNG 8 ACTIVE-MINT DETECTION PASS");
+
+    Ok(())
 }
 
 async fn fetch_hydration<const N: usize>(
