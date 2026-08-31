@@ -146,19 +146,22 @@ async fn observe_raydium_cpmm() -> Result<(), String> {
         observations += 1;
 
         println!(
-            "raydium[{observations}/{MAX_RAYDIUM_OBSERVATIONS}] slot={} pubkey={} owner={} encoded_data_len={}",
+            "raydium[{observations}/{MAX_RAYDIUM_OBSERVATIONS}] slot={} pubkey={} owner={} encoded_data_len={} decoded_data_len={}",
             observation.slot,
             observation.pubkey,
             observation.owner,
-            observation.data_len
+            observation.encoded_data_len,
+            observation.decoded_data_len,
         );
+
+        println!("decoded_pool: {}", observation.pool_state.summary());
     }
 
     if !subscription_confirmed {
         return Err("Raydium CPMM subscription was never confirmed".to_owned());
     }
 
-    println!("READ-ONLY RAYDIUM CPMM ADAPTER PASS");
+    println!("READ-ONLY RAYDIUM CPMM ACCOUNT DECODER PASS");
 
     Ok(())
 }
