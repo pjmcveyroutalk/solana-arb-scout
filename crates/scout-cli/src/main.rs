@@ -16,6 +16,11 @@ async fn main() {
     println!("ARB Scout V0 — READ ONLY");
     println!("No signing. No wallet. No transaction execution.");
 
+    if let Err(error) = install_crypto_provider() {
+        eprintln!("TLS crypto provider initialization failed: {error}");
+        std::process::exit(1);
+    }
+
     if let Err(error) = observe_slots().await {
         eprintln!("Live slot observation failed: {error}");
         std::process::exit(1);
@@ -25,6 +30,12 @@ async fn main() {
         eprintln!("Raydium CPMM observation failed: {error}");
         std::process::exit(1);
     }
+}
+
+fn install_crypto_provider() -> Result<(), String> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| "could not install ring as the process TLS provider".to_owned())
 }
 
 async fn connect() -> Result<
