@@ -515,10 +515,7 @@ mod tests {
 
         let normalized = normalize_observation(&observation, 1_500_000_000, 1_500_000_001);
 
-        assert_eq!(
-            normalized.trading_state,
-            PoolTradingState::NotYetOpen
-        );
+        assert_eq!(normalized.trading_state, PoolTradingState::NotYetOpen);
 
         Ok(())
     }
@@ -530,10 +527,7 @@ mod tests {
 
         let normalized = normalize_observation(&observation, 1_500_000_000, 1_500_000_001);
 
-        assert_eq!(
-            normalized.trading_state,
-            PoolTradingState::SwapDisabled
-        );
+        assert_eq!(normalized.trading_state, PoolTradingState::SwapDisabled);
 
         Ok(())
     }
@@ -565,8 +559,7 @@ mod tests {
 
         data.extend_from_slice(&[
             250, // auth_bump
-            status,
-            9, // lp_mint_decimals
+            status, 9, // lp_mint_decimals
             6, // mint_0_decimals
             6, // mint_1_decimals
         ]);
@@ -586,4 +579,4 @@ mod tests {
 
         data
     }
-        }
+    }
