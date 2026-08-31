@@ -8,11 +8,16 @@ pub const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfX
 
 const PUMPSWAP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 
+const PUMP_FEES_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
+const PUMPSWAP_FEE_CONFIG: &str = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx";
+const PUMPSWAP_FEE_CONFIG_BUMP: u8 = 255;
+
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 const POOL_DISCRIMINATOR: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
 const GLOBAL_CONFIG_DISCRIMINATOR: [u8; 8] = [149, 8, 156, 202, 160, 252, 176, 217];
+const FEE_CONFIG_DISCRIMINATOR: [u8; 8] = [143, 52, 146, 187, 219, 123, 76, 155];
 
 const POOL_BASE_LEN: usize = 211;
 const POOL_BASE_MINT_OFFSET: usize = 43;
@@ -33,8 +38,13 @@ const TOKEN_ACCOUNT_MINT_OFFSET: usize = 0;
 const TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
 
 const MINT_ACCOUNT_BASE_LEN: usize = 82;
+const MINT_SUPPLY_OFFSET: usize = 36;
 const MINT_DECIMALS_OFFSET: usize = 44;
 const MINT_INITIALIZED_OFFSET: usize = 45;
+
+const FEE_CONFIG_FIXED_PREFIX_LEN: usize = 8 + 1 + 32 + 24;
+const FEE_TIER_SERIALIZED_LEN: usize = 16 + 24;
+const MAX_FEE_BPS: u64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PumpSwapPoolState {
@@ -82,6 +92,53 @@ impl PumpSwapPoolState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpSwapFees {
+    pub lp_fee_bps: u64,
+    pub protocol_fee_bps: u64,
+    pub creator_fee_bps: u64,
+}
+
+impl PumpSwapFees {
+    fn summary(&self) -> String {
+        format!(
+            "lp_fee_bps={} protocol_fee_bps={} creator_fee_bps={}",
+            self.lp_fee_bps, self.protocol_fee_bps, self.creator_fee_bps
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpSwapFeeTier {
+    pub market_cap_lamports_threshold: u128,
+    pub fees: PumpSwapFees,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpSwapFeeConfig {
+    pub bump: u8,
+    pub admin: String,
+    pub flat_fees: PumpSwapFees,
+    pub fee_tiers: Vec<PumpSwapFeeTier>,
+    pub stable_fee_tiers: Vec<PumpSwapFeeTier>,
+}
+
+impl PumpSwapFeeConfig {
+    fn summary(&self) -> String {
+        format!(
+            concat!(
+                "bump={} admin={} flat_fees=({}) ",
+                "fee_tier_count={} stable_fee_tier_count={}"
+            ),
+            self.bump,
+            self.admin,
+            self.flat_fees.summary(),
+            self.fee_tiers.len(),
+            self.stable_fee_tiers.len(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PumpSwapAccountObservation {
     pub pubkey: String,
     pub slot: u64,
@@ -98,10 +155,12 @@ pub struct PumpSwapHydrationSnapshot {
     pub base_vault_raw: u64,
     pub quote_vault_raw: u64,
     pub effective_quote_raw: u64,
+    pub base_mint_supply_raw: u64,
     pub base_decimals: u8,
     pub quote_decimals: u8,
     pub disable_flags: u8,
     pub trading_state: PoolTradingState,
+    pub fee_config: PumpSwapFeeConfig,
 }
 
 impl PumpSwapHydrationSnapshot {
@@ -111,17 +170,21 @@ impl PumpSwapHydrationSnapshot {
                 "reserve_slot={} ",
                 "base_vault_raw={} quote_vault_raw={} ",
                 "effective_quote_raw={} ",
+                "base_mint_supply_raw={} ",
                 "base_decimals={} quote_decimals={} ",
-                "disable_flags={} trading_state={:?}"
+                "disable_flags={} trading_state={:?} ",
+                "fee_config=[{}]"
             ),
             self.slot,
             self.base_vault_raw,
             self.quote_vault_raw,
             self.effective_quote_raw,
+            self.base_mint_supply_raw,
             self.base_decimals,
             self.quote_decimals,
             self.disable_flags,
             self.trading_state,
+            self.fee_config.summary(),
         )
     }
 }
@@ -254,7 +317,7 @@ pub fn parse_pair_lookup_response(
     Ok(observations)
 }
 
-pub fn hydration_account_pubkeys(observation: &PumpSwapAccountObservation) -> [String; 6] {
+pub fn hydration_account_pubkeys(observation: &PumpSwapAccountObservation) -> [String; 7] {
     [
         observation.pubkey.clone(),
         observation.pool_state.pool_base_token_account.clone(),
@@ -262,6 +325,7 @@ pub fn hydration_account_pubkeys(observation: &PumpSwapAccountObservation) -> [S
         observation.pool_state.base_mint.clone(),
         observation.pool_state.quote_mint.clone(),
         PUMPSWAP_GLOBAL_CONFIG.to_owned(),
+        PUMPSWAP_FEE_CONFIG.to_owned(),
     ]
 }
 
@@ -352,9 +416,9 @@ pub fn parse_hydration_response(
         .and_then(Value::as_array)
         .ok_or_else(|| "Solana getMultipleAccounts response missing account array".to_owned())?;
 
-    if accounts.len() != 6 {
+    if accounts.len() != 7 {
         return Err(format!(
-            "PumpSwap hydration expected exactly 6 accounts, got {}",
+            "PumpSwap hydration expected exactly 7 accounts, got {}",
             accounts.len()
         ));
     }
@@ -376,6 +440,7 @@ pub fn parse_hydration_response(
 
     let base_decimals = parse_mint_decimals(&base_mint_data, "PumpSwap base mint")?;
     let quote_decimals = parse_mint_decimals(&quote_mint_data, "PumpSwap quote mint")?;
+    let base_mint_supply_raw = parse_mint_supply(&base_mint_data, "PumpSwap base mint")?;
 
     let base_vault_raw = parse_token_vault_account(
         &accounts[1],
@@ -393,6 +458,7 @@ pub fn parse_hydration_response(
 
     let disable_flags = parse_global_config(&accounts[5])?;
     let trading_state = trading_state_from_disable_flags(disable_flags);
+    let fee_config = parse_fee_config(&accounts[6])?;
 
     let effective_quote = i128::from(quote_vault_raw)
         .checked_add(pool_state.virtual_quote_reserves)
@@ -411,10 +477,12 @@ pub fn parse_hydration_response(
         base_vault_raw,
         quote_vault_raw,
         effective_quote_raw,
+        base_mint_supply_raw,
         base_decimals,
         quote_decimals,
         disable_flags,
         trading_state,
+        fee_config,
     })
 }
 
@@ -580,6 +648,176 @@ fn verify_pool_identity(
     Ok(())
 }
 
+fn parse_fee_config(account: &Value) -> Result<PumpSwapFeeConfig, String> {
+    let data = decode_rpc_account_data(account, PUMP_FEES_PROGRAM_ID, "PumpSwap FeeConfig")?;
+
+    decode_fee_config(&data)
+}
+
+fn decode_fee_config(data: &[u8]) -> Result<PumpSwapFeeConfig, String> {
+    let minimum_len = FEE_CONFIG_FIXED_PREFIX_LEN
+        .checked_add(8)
+        .ok_or_else(|| "PumpSwap FeeConfig minimum length overflow".to_owned())?;
+
+    if data.len() < minimum_len {
+        return Err(format!(
+            "PumpSwap FeeConfig shorter than required prefix: expected at least {}, got {}",
+            minimum_len,
+            data.len()
+        ));
+    }
+
+    if data.get(..8) != Some(FEE_CONFIG_DISCRIMINATOR.as_slice()) {
+        return Err("unexpected PumpSwap FeeConfig discriminator".to_owned());
+    }
+
+    let bump = data[8];
+    let admin = pubkey_at(data, 9, "FeeConfig admin")?;
+    let flat_fees = fees_at(data, 41, "FeeConfig flat_fees")?;
+
+    let mut offset = FEE_CONFIG_FIXED_PREFIX_LEN;
+    let fee_tiers = fee_tier_vec(data, &mut offset, "FeeConfig fee_tiers")?;
+    let stable_fee_tiers = fee_tier_vec(data, &mut offset, "FeeConfig stable_fee_tiers")?;
+
+    let fee_config = PumpSwapFeeConfig {
+        bump,
+        admin,
+        flat_fees,
+        fee_tiers,
+        stable_fee_tiers,
+    };
+
+    validate_fee_config(&fee_config)?;
+
+    Ok(fee_config)
+}
+
+fn fee_tier_vec(
+    data: &[u8],
+    offset: &mut usize,
+    label: &str,
+) -> Result<Vec<PumpSwapFeeTier>, String> {
+    let count_bytes = read_array::<4>(data, *offset, label)?;
+    let count = u32::from_le_bytes(count_bytes) as usize;
+
+    *offset = (*offset)
+        .checked_add(4)
+        .ok_or_else(|| format!("PumpSwap {label} vector-length offset overflow"))?;
+
+    let serialized_len = count
+        .checked_mul(FEE_TIER_SERIALIZED_LEN)
+        .ok_or_else(|| format!("PumpSwap {label} serialized length overflow"))?;
+
+    let end = (*offset)
+        .checked_add(serialized_len)
+        .ok_or_else(|| format!("PumpSwap {label} end offset overflow"))?;
+
+    if end > data.len() {
+        return Err(format!(
+            "PumpSwap {label} exceeds account data: count={count} end={end} len={}",
+            data.len()
+        ));
+    }
+
+    let mut tiers = Vec::with_capacity(count);
+
+    for index in 0..count {
+        let threshold = u128::from_le_bytes(read_array::<16>(
+            data,
+            *offset,
+            &format!("{label}[{index}] market_cap_lamports_threshold"),
+        )?);
+
+        *offset = (*offset)
+            .checked_add(16)
+            .ok_or_else(|| format!("PumpSwap {label}[{index}] threshold offset overflow"))?;
+
+        let fees = fees_at(data, *offset, &format!("{label}[{index}] fees"))?;
+
+        *offset = (*offset)
+            .checked_add(24)
+            .ok_or_else(|| format!("PumpSwap {label}[{index}] fees offset overflow"))?;
+
+        tiers.push(PumpSwapFeeTier {
+            market_cap_lamports_threshold: threshold,
+            fees,
+        });
+    }
+
+    Ok(tiers)
+}
+
+fn fees_at(data: &[u8], offset: usize, label: &str) -> Result<PumpSwapFees, String> {
+    let protocol_offset = offset
+        .checked_add(8)
+        .ok_or_else(|| format!("PumpSwap {label} protocol fee offset overflow"))?;
+    let creator_offset = offset
+        .checked_add(16)
+        .ok_or_else(|| format!("PumpSwap {label} creator fee offset overflow"))?;
+
+    Ok(PumpSwapFees {
+        lp_fee_bps: u64::from_le_bytes(read_array::<8>(data, offset, label)?),
+        protocol_fee_bps: u64::from_le_bytes(read_array::<8>(data, protocol_offset, label)?),
+        creator_fee_bps: u64::from_le_bytes(read_array::<8>(data, creator_offset, label)?),
+    })
+}
+
+fn validate_fee_config(fee_config: &PumpSwapFeeConfig) -> Result<(), String> {
+    if fee_config.bump != PUMPSWAP_FEE_CONFIG_BUMP {
+        return Err(format!(
+            "PumpSwap FeeConfig bump mismatch: expected {}, got {}",
+            PUMPSWAP_FEE_CONFIG_BUMP, fee_config.bump
+        ));
+    }
+
+    validate_fees(&fee_config.flat_fees, "FeeConfig flat_fees")?;
+
+    if fee_config.fee_tiers.is_empty() {
+        return Err("PumpSwap FeeConfig has no dynamic fee tiers".to_owned());
+    }
+
+    validate_fee_tiers(&fee_config.fee_tiers, "FeeConfig fee_tiers")?;
+    validate_fee_tiers(&fee_config.stable_fee_tiers, "FeeConfig stable_fee_tiers")?;
+
+    Ok(())
+}
+
+fn validate_fee_tiers(tiers: &[PumpSwapFeeTier], label: &str) -> Result<(), String> {
+    let mut previous_threshold = None;
+
+    for (index, tier) in tiers.iter().enumerate() {
+        validate_fees(&tier.fees, &format!("{label}[{index}] fees"))?;
+
+        if let Some(previous) = previous_threshold {
+            if tier.market_cap_lamports_threshold < previous {
+                return Err(format!(
+                    "PumpSwap {label} thresholds are not ascending at index {index}"
+                ));
+            }
+        }
+
+        previous_threshold = Some(tier.market_cap_lamports_threshold);
+    }
+
+    Ok(())
+}
+
+fn validate_fees(fees: &PumpSwapFees, label: &str) -> Result<(), String> {
+    let total = fees
+        .lp_fee_bps
+        .checked_add(fees.protocol_fee_bps)
+        .and_then(|value| value.checked_add(fees.creator_fee_bps))
+        .ok_or_else(|| format!("PumpSwap {label} total fee overflow"))?;
+
+    if total > MAX_FEE_BPS {
+        return Err(format!(
+            "PumpSwap {label} total fee exceeds {MAX_FEE_BPS} bps: {total}"
+        ));
+    }
+
+    Ok(())
+}
+
 fn parse_global_config(account: &Value) -> Result<u8, String> {
     let data = decode_rpc_account_data(account, PUMPSWAP_PROGRAM_ID, "PumpSwap GlobalConfig")?;
 
@@ -624,6 +862,22 @@ fn decode_supported_mint_account(
     let data = decode_rpc_account_data(account, owner, label)?;
 
     Ok((owner.to_owned(), data))
+}
+
+fn parse_mint_supply(data: &[u8], label: &str) -> Result<u64, String> {
+    if data.len() < MINT_ACCOUNT_BASE_LEN {
+        return Err(format!(
+            "{label} shorter than SPL Mint base layout: expected at least {}, got {}",
+            MINT_ACCOUNT_BASE_LEN,
+            data.len()
+        ));
+    }
+
+    Ok(u64::from_le_bytes(read_array::<8>(
+        data,
+        MINT_SUPPLY_OFFSET,
+        "mint supply",
+    )?))
 }
 
 fn parse_mint_decimals(data: &[u8], label: &str) -> Result<u8, String> {
@@ -789,6 +1043,40 @@ mod tests {
         data
     }
 
+    fn append_fees(data: &mut Vec<u8>, lp: u64, protocol: u64, creator: u64) {
+        data.extend_from_slice(&lp.to_le_bytes());
+        data.extend_from_slice(&protocol.to_le_bytes());
+        data.extend_from_slice(&creator.to_le_bytes());
+    }
+
+    fn append_tier(
+        data: &mut Vec<u8>,
+        threshold: u128,
+        lp: u64,
+        protocol: u64,
+        creator: u64,
+    ) {
+        data.extend_from_slice(&threshold.to_le_bytes());
+        append_fees(data, lp, protocol, creator);
+    }
+
+    fn sample_fee_config_data() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&FEE_CONFIG_DISCRIMINATOR);
+        data.push(PUMPSWAP_FEE_CONFIG_BUMP);
+        data.extend_from_slice(&[9u8; 32]);
+        append_fees(&mut data, 20, 5, 5);
+
+        data.extend_from_slice(&2u32.to_le_bytes());
+        append_tier(&mut data, 0, 30, 10, 5);
+        append_tier(&mut data, 1_000_000, 20, 5, 5);
+
+        data.extend_from_slice(&1u32.to_le_bytes());
+        append_tier(&mut data, 0, 10, 5, 0);
+
+        data
+    }
+
     fn rpc_account(owner: &str, data: &[u8]) -> Value {
         json!({
             "owner": owner,
@@ -801,6 +1089,7 @@ mod tests {
 
     fn initialized_mint(decimals: u8) -> Vec<u8> {
         let mut data = vec![0u8; MINT_ACCOUNT_BASE_LEN];
+        data[MINT_SUPPLY_OFFSET..MINT_SUPPLY_OFFSET + 8].copy_from_slice(&123_456u64.to_le_bytes());
         data[MINT_DECIMALS_OFFSET] = decimals;
         data[MINT_INITIALIZED_OFFSET] = 1;
         data
@@ -890,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn hydration_includes_global_config() -> Result<(), String> {
+    fn hydration_includes_global_and_fee_config() -> Result<(), String> {
         let state = decode_pool_state(&sample_pool_data())?;
 
         let observation = PumpSwapAccountObservation {
@@ -904,8 +1193,117 @@ mod tests {
 
         let accounts = hydration_account_pubkeys(&observation);
 
-        assert_eq!(accounts.len(), 6);
+        assert_eq!(accounts.len(), 7);
         assert_eq!(accounts[5], PUMPSWAP_GLOBAL_CONFIG);
+        assert_eq!(accounts[6], PUMPSWAP_FEE_CONFIG);
+
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_fee_config() -> Result<(), String> {
+        let fee_config = decode_fee_config(&sample_fee_config_data())?;
+
+        assert_eq!(fee_config.bump, PUMPSWAP_FEE_CONFIG_BUMP);
+        assert_eq!(fee_config.flat_fees.lp_fee_bps, 20);
+        assert_eq!(fee_config.flat_fees.protocol_fee_bps, 5);
+        assert_eq!(fee_config.flat_fees.creator_fee_bps, 5);
+        assert_eq!(fee_config.fee_tiers.len(), 2);
+        assert_eq!(fee_config.fee_tiers[1].market_cap_lamports_threshold, 1_000_000);
+        assert_eq!(fee_config.stable_fee_tiers.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wrong_fee_config_discriminator() -> Result<(), String> {
+        let mut data = sample_fee_config_data();
+        data[0] ^= 1;
+
+        let error = match decode_fee_config(&data) {
+            Err(error) => error,
+            Ok(_) => return Err("wrong FeeConfig discriminator unexpectedly decoded".to_owned()),
+        };
+
+        assert_eq!(error, "unexpected PumpSwap FeeConfig discriminator");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wrong_fee_config_bump() -> Result<(), String> {
+        let mut data = sample_fee_config_data();
+        data[8] = PUMPSWAP_FEE_CONFIG_BUMP.saturating_sub(1);
+
+        let error = match decode_fee_config(&data) {
+            Err(error) => error,
+            Ok(_) => return Err("wrong FeeConfig bump unexpectedly decoded".to_owned()),
+        };
+
+        assert!(error.contains("FeeConfig bump mismatch"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_empty_dynamic_fee_tiers() -> Result<(), String> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&FEE_CONFIG_DISCRIMINATOR);
+        data.push(PUMPSWAP_FEE_CONFIG_BUMP);
+        data.extend_from_slice(&[9u8; 32]);
+        append_fees(&mut data, 20, 5, 5);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        let error = match decode_fee_config(&data) {
+            Err(error) => error,
+            Ok(_) => return Err("empty FeeConfig tiers unexpectedly decoded".to_owned()),
+        };
+
+        assert_eq!(error, "PumpSwap FeeConfig has no dynamic fee tiers");
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_unsorted_dynamic_fee_tiers() -> Result<(), String> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&FEE_CONFIG_DISCRIMINATOR);
+        data.push(PUMPSWAP_FEE_CONFIG_BUMP);
+        data.extend_from_slice(&[9u8; 32]);
+        append_fees(&mut data, 20, 5, 5);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        append_tier(&mut data, 100, 20, 5, 5);
+        append_tier(&mut data, 99, 20, 5, 5);
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        let error = match decode_fee_config(&data) {
+            Err(error) => error,
+            Ok(_) => return Err("unsorted FeeConfig tiers unexpectedly decoded".to_owned()),
+        };
+
+        assert!(error.contains("thresholds are not ascending"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_fee_total_above_basis_point_denominator() -> Result<(), String> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&FEE_CONFIG_DISCRIMINATOR);
+        data.push(PUMPSWAP_FEE_CONFIG_BUMP);
+        data.extend_from_slice(&[9u8; 32]);
+        append_fees(&mut data, 9_999, 2, 0);
+        data.extend_from_slice(&1u32.to_le_bytes());
+        append_tier(&mut data, 0, 20, 5, 5);
+        data.extend_from_slice(&0u32.to_le_bytes());
+
+        let error = match decode_fee_config(&data) {
+            Err(error) => error,
+            Ok(_) => return Err("invalid FeeConfig fee total unexpectedly decoded".to_owned()),
+        };
+
+        assert!(error.contains("total fee exceeds 10000 bps"));
 
         Ok(())
     }
@@ -963,6 +1361,16 @@ mod tests {
             trading_state_from_disable_flags(1 << 1),
             PoolTradingState::Tradable
         );
+    }
+
+    #[test]
+    fn initialized_mint_returns_supply() -> Result<(), String> {
+        let data = initialized_mint(9);
+        let supply = parse_mint_supply(&data, "test mint")?;
+
+        assert_eq!(supply, 123_456);
+
+        Ok(())
     }
 
     #[test]
