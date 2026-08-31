@@ -15,6 +15,8 @@ const POOL_DISCRIMINATOR: [u8; 8] = [241, 154, 109, 4, 17, 177, 109, 188];
 const GLOBAL_CONFIG_DISCRIMINATOR: [u8; 8] = [149, 8, 156, 202, 160, 252, 176, 217];
 
 const POOL_BASE_LEN: usize = 211;
+const POOL_BASE_MINT_OFFSET: usize = 43;
+const POOL_QUOTE_MINT_OFFSET: usize = 75;
 const POOL_COIN_CREATOR_END: usize = 243;
 const POOL_MAYHEM_END: usize = 244;
 const POOL_CASHBACK_END: usize = 245;
@@ -145,6 +147,111 @@ pub fn program_subscribe_request() -> Value {
             }
         ]
     })
+}
+
+pub fn pair_lookup_requests(anchor_mint: &str, intermediate_mint: &str) -> [Value; 2] {
+    [
+        pair_lookup_request(7, anchor_mint, intermediate_mint),
+        pair_lookup_request(8, intermediate_mint, anchor_mint),
+    ]
+}
+
+fn pair_lookup_request(request_id: u64, base_mint: &str, quote_mint: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "getProgramAccounts",
+        "params": [
+            PUMPSWAP_PROGRAM_ID,
+            {
+                "commitment": "processed",
+                "encoding": "base64",
+                "withContext": true,
+                "filters": [
+                    {
+                        "memcmp": {
+                            "offset": 0,
+                            "bytes": "hQrXeCntzbV"
+                        }
+                    },
+                    {
+                        "memcmp": {
+                            "offset": POOL_BASE_MINT_OFFSET,
+                            "bytes": base_mint
+                        }
+                    },
+                    {
+                        "memcmp": {
+                            "offset": POOL_QUOTE_MINT_OFFSET,
+                            "bytes": quote_mint
+                        }
+                    }
+                ]
+            }
+        ]
+    })
+}
+
+pub fn parse_pair_lookup_response(
+    payload: &Value,
+) -> Result<Vec<PumpSwapAccountObservation>, String> {
+    if let Some(error) = payload.get("error") {
+        return Err(format!(
+            "PumpSwap getProgramAccounts returned an RPC error: {error}"
+        ));
+    }
+
+    let slot = payload
+        .pointer("/result/context/slot")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "PumpSwap getProgramAccounts response missing context slot".to_owned())?;
+
+    let accounts = payload
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "PumpSwap getProgramAccounts response missing account array".to_owned())?;
+
+    let mut observations = Vec::with_capacity(accounts.len());
+
+    for entry in accounts {
+        let pubkey = entry
+            .get("pubkey")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "PumpSwap getProgramAccounts entry missing pubkey".to_owned())?;
+
+        let account = entry
+            .get("account")
+            .ok_or_else(|| "PumpSwap getProgramAccounts entry missing account".to_owned())?;
+
+        let notification = json!({
+            "method": "programNotification",
+            "params": {
+                "result": {
+                    "context": {
+                        "slot": slot
+                    },
+                    "value": {
+                        "pubkey": pubkey,
+                        "account": account
+                    }
+                }
+            }
+        });
+
+        let observation = parse_program_notification(&notification)?
+            .ok_or_else(|| "PumpSwap pair lookup account did not decode".to_owned())?;
+
+        if observations
+            .iter()
+            .any(|existing: &PumpSwapAccountObservation| existing.pubkey == observation.pubkey)
+        {
+            continue;
+        }
+
+        observations.push(observation);
+    }
+
+    Ok(observations)
 }
 
 pub fn hydration_account_pubkeys(observation: &PumpSwapAccountObservation) -> [String; 6] {
@@ -371,8 +478,8 @@ fn decode_pool_state(data: &[u8]) -> Result<PumpSwapPoolState, String> {
     let pool_bump = data[8];
     let index = u16::from_le_bytes(read_array::<2>(data, 9, "index")?);
     let creator = pubkey_at(data, 11, "creator")?;
-    let base_mint = pubkey_at(data, 43, "base_mint")?;
-    let quote_mint = pubkey_at(data, 75, "quote_mint")?;
+    let base_mint = pubkey_at(data, POOL_BASE_MINT_OFFSET, "base_mint")?;
+    let quote_mint = pubkey_at(data, POOL_QUOTE_MINT_OFFSET, "quote_mint")?;
     let lp_mint = pubkey_at(data, 107, "lp_mint")?;
     let pool_base_token_account = pubkey_at(data, 139, "pool_base_token_account")?;
     let pool_quote_token_account = pubkey_at(data, 171, "pool_quote_token_account")?;
@@ -910,5 +1017,58 @@ mod tests {
             "hQrXeCntzbV"
         );
         assert!(request["params"][1]["filters"][0].get("dataSize").is_none());
+    }
+
+    #[test]
+    fn pair_lookup_requests_cover_both_orientations() {
+        let requests = pair_lookup_requests("anchor", "intermediate");
+
+        assert_eq!(requests[0]["method"], "getProgramAccounts");
+        assert_eq!(requests[0]["params"][0], PUMPSWAP_PROGRAM_ID);
+        assert_eq!(
+            requests[0]["params"][1]["filters"][1]["memcmp"]["offset"],
+            POOL_BASE_MINT_OFFSET
+        );
+        assert_eq!(
+            requests[0]["params"][1]["filters"][1]["memcmp"]["bytes"],
+            "anchor"
+        );
+        assert_eq!(
+            requests[0]["params"][1]["filters"][2]["memcmp"]["bytes"],
+            "intermediate"
+        );
+        assert_eq!(
+            requests[1]["params"][1]["filters"][1]["memcmp"]["bytes"],
+            "intermediate"
+        );
+        assert_eq!(
+            requests[1]["params"][1]["filters"][2]["memcmp"]["bytes"],
+            "anchor"
+        );
+    }
+
+    #[test]
+    fn pair_lookup_response_reuses_pool_decoder() -> Result<(), String> {
+        let payload = json!({
+            "result": {
+                "context": {
+                    "slot": 42
+                },
+                "value": [
+                    {
+                        "pubkey": "pool",
+                        "account": rpc_account(PUMPSWAP_PROGRAM_ID, &sample_pool_data())
+                    }
+                ]
+            }
+        });
+
+        let observations = parse_pair_lookup_response(&payload)?;
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].pubkey, "pool");
+        assert_eq!(observations[0].slot, 42);
+
+        Ok(())
     }
 }
