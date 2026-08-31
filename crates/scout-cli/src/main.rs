@@ -438,6 +438,12 @@ async fn discover_targeted_raydium_overlap(
                 }
                 Ok(None) => {
                     successful_locator_calls += 1;
+                    println!(
+                        "targeted_locator_no_cpmm: anchor={} intermediate={} pumpswap_pool={}",
+                        candidate.anchor_mint,
+                        candidate.intermediate_mint,
+                        candidate.pumpswap_pool_id,
+                    );
                     continue;
                 }
                 Err(error) => {
