@@ -1,10 +1,12 @@
 mod pumpswap;
 mod raydium;
 mod registry;
+mod route;
 
 use futures_util::{SinkExt, StreamExt};
 use registry::ActiveMintRegistry;
 use reqwest::Client;
+use route::generate_two_leg_routes;
 use scout_core::NormalizedPoolState;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,8 +60,8 @@ async fn main() {
         }
     };
 
-    if let Err(error) = validate_active_mint_registry(raydium_states, pumpswap_states) {
-        eprintln!("Active-mint registry validation failed: {error}");
+    if let Err(error) = validate_registry_and_routes(raydium_states, pumpswap_states) {
+        eprintln!("Registry/route validation failed: {error}");
         std::process::exit(1);
     }
 }
@@ -353,7 +355,7 @@ async fn fetch_pumpswap_hydration(
     fetch_hydration(rpc_client, 5, account_pubkeys, observation.slot, "PumpSwap").await
 }
 
-fn validate_active_mint_registry(
+fn validate_registry_and_routes(
     raydium_states: Vec<NormalizedPoolState>,
     pumpswap_states: Vec<NormalizedPoolState>,
 ) -> Result<(), String> {
@@ -381,6 +383,27 @@ fn validate_active_mint_registry(
 
     println!("READ-ONLY ACTIVE-MINT REGISTRY PASS");
     println!("READ-ONLY RUNG 8 ACTIVE-MINT DETECTION PASS");
+
+    println!("\nRoute engine: Two-Leg Circular");
+
+    let eligible_pools = registry.current_eligible_pools();
+    let route_candidates = generate_two_leg_routes(&eligible_pools);
+
+    println!("route_candidate_count={}", route_candidates.len());
+
+    for route_candidate in &route_candidates {
+        println!("route_candidate: {}", route_candidate.summary());
+    }
+
+    if route_candidates.is_empty() {
+        println!(
+            "READ-ONLY RUNG 9 DIAGNOSTIC: no permitted same-pair cross-venue route observed in bounded sample"
+        );
+        return Ok(());
+    }
+
+    println!("READ-ONLY TWO-LEG ROUTE ENGINE PASS");
+    println!("READ-ONLY RUNG 9 ROUTE CANDIDATE PASS");
 
     Ok(())
 }
