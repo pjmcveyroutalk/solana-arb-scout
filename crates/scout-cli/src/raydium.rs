@@ -89,7 +89,12 @@ pub fn program_subscribe_request() -> Value {
             RAYDIUM_CPMM_PROGRAM_ID,
             {
                 "commitment": "processed",
-                "encoding": "base64"
+                "encoding": "base64",
+                "filters": [
+                    {
+                        "dataSize": POOL_STATE_LEN
+                    }
+                ]
             }
         ]
     })
@@ -297,7 +302,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subscription_targets_raydium_cpmm() {
+    fn subscription_targets_raydium_cpmm_pool_state_size() {
         let request = program_subscribe_request();
 
         assert_eq!(
@@ -307,6 +312,12 @@ mod tests {
         assert_eq!(
             request.get("method").and_then(Value::as_str),
             Some("programSubscribe")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/1/filters/0/dataSize")
+                .and_then(Value::as_u64),
+            Some(POOL_STATE_LEN as u64)
         );
     }
 
