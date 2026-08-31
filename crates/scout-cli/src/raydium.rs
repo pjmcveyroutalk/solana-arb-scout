@@ -640,4 +640,649 @@ fn decode_amm_config(data: &[u8]) -> Result<RaydiumAmmConfig, String> {
 
     if offset != data.len() {
         return Err(format!(
-            "Raydium AmmConfig decoder ended at {offset}, account length is {}
+            "Raydium AmmConfig decoder ended at {offset}, account length is {}",
+            data.len()
+        ));
+    }
+
+    Ok(RaydiumAmmConfig {
+        bump,
+        disable_create_pool,
+        index,
+        trade_fee_rate,
+        protocol_fee_rate,
+        fund_fee_rate,
+        create_pool_fee,
+        protocol_owner,
+        fund_owner,
+        creator_fee_rate,
+    })
+}
+
+fn decode_pool_state(data: &[u8]) -> Result<RaydiumCpmmPoolState, String> {
+    if data.len() != POOL_STATE_LEN {
+        return Err(format!(
+            "unexpected Raydium PoolState length: expected {POOL_STATE_LEN}, got {}",
+            data.len()
+        ));
+    }
+
+    let discriminator = data
+        .get(0..POOL_STATE_DISCRIMINATOR.len())
+        .ok_or_else(|| "Raydium PoolState missing discriminator".to_owned())?;
+
+    if discriminator != POOL_STATE_DISCRIMINATOR {
+        return Err("unexpected Raydium PoolState discriminator".to_owned());
+    }
+
+    let mut offset = POOL_STATE_DISCRIMINATOR.len();
+
+    let amm_config = read_pubkey(data, &mut offset)?;
+    let _pool_creator = read_pubkey(data, &mut offset)?;
+    let token_0_vault = read_pubkey(data, &mut offset)?;
+    let token_1_vault = read_pubkey(data, &mut offset)?;
+    let _lp_mint = read_pubkey(data, &mut offset)?;
+    let token_0_mint = read_pubkey(data, &mut offset)?;
+    let token_1_mint = read_pubkey(data, &mut offset)?;
+    let token_0_program = read_pubkey(data, &mut offset)?;
+    let token_1_program = read_pubkey(data, &mut offset)?;
+    let _observation_key = read_pubkey(data, &mut offset)?;
+
+    let _auth_bump = read_u8(data, &mut offset)?;
+    let status = read_u8(data, &mut offset)?;
+    let lp_mint_decimals = read_u8(data, &mut offset)?;
+    let mint_0_decimals = read_u8(data, &mut offset)?;
+    let mint_1_decimals = read_u8(data, &mut offset)?;
+
+    let lp_supply = read_u64(data, &mut offset)?;
+    let protocol_fees_token_0 = read_u64(data, &mut offset)?;
+    let protocol_fees_token_1 = read_u64(data, &mut offset)?;
+    let fund_fees_token_0 = read_u64(data, &mut offset)?;
+    let fund_fees_token_1 = read_u64(data, &mut offset)?;
+    let open_time = read_u64(data, &mut offset)?;
+    let recent_epoch = read_u64(data, &mut offset)?;
+
+    let creator_fee_on = read_u8(data, &mut offset)?;
+    let enable_creator_fee_raw = read_u8(data, &mut offset)?;
+
+    let enable_creator_fee = match enable_creator_fee_raw {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(format!(
+                "invalid Raydium creator-fee boolean value: {other}"
+            ));
+        }
+    };
+
+    skip(data, &mut offset, 6)?;
+
+    let creator_fees_token_0 = read_u64(data, &mut offset)?;
+    let creator_fees_token_1 = read_u64(data, &mut offset)?;
+
+    skip(data, &mut offset, 28 * 8)?;
+
+    if offset != data.len() {
+        return Err(format!(
+            "Raydium PoolState decoder ended at {offset}, account length is {}",
+            data.len()
+        ));
+    }
+
+    Ok(RaydiumCpmmPoolState {
+        amm_config,
+        token_0_vault,
+        token_1_vault,
+        token_0_mint,
+        token_1_mint,
+        token_0_program,
+        token_1_program,
+        status,
+        lp_mint_decimals,
+        mint_0_decimals,
+        mint_1_decimals,
+        lp_supply,
+        protocol_fees_token_0,
+        protocol_fees_token_1,
+        fund_fees_token_0,
+        fund_fees_token_1,
+        open_time,
+        recent_epoch,
+        creator_fee_on,
+        enable_creator_fee,
+        creator_fees_token_0,
+        creator_fees_token_1,
+    })
+}
+
+fn read_pubkey(data: &[u8], offset: &mut usize) -> Result<String, String> {
+    let bytes = take::<32>(data, offset)?;
+    Ok(bs58::encode(bytes).into_string())
+}
+
+fn read_u8(data: &[u8], offset: &mut usize) -> Result<u8, String> {
+    let bytes = take::<1>(data, offset)?;
+    Ok(bytes[0])
+}
+
+fn read_u16(data: &[u8], offset: &mut usize) -> Result<u16, String> {
+    Ok(u16::from_le_bytes(take::<2>(data, offset)?))
+}
+
+fn read_u64(data: &[u8], offset: &mut usize) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(take::<8>(data, offset)?))
+}
+
+fn skip(data: &[u8], offset: &mut usize, len: usize) -> Result<(), String> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| "Raydium account offset overflow".to_owned())?;
+
+    if end > data.len() {
+        return Err("Raydium account ended unexpectedly".to_owned());
+    }
+
+    *offset = end;
+    Ok(())
+}
+
+fn take<const N: usize>(data: &[u8], offset: &mut usize) -> Result<[u8; N], String> {
+    let end = offset
+        .checked_add(N)
+        .ok_or_else(|| "Raydium account offset overflow".to_owned())?;
+
+    let slice = data
+        .get(*offset..end)
+        .ok_or_else(|| "Raydium account ended unexpectedly".to_owned())?;
+
+    let bytes = <[u8; N]>::try_from(slice)
+        .map_err(|_| "Raydium account field had unexpected size".to_owned())?;
+
+    *offset = end;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_targets_raydium_cpmm_pool_state_size() {
+        let request = program_subscribe_request();
+
+        assert_eq!(
+            request.pointer("/params/0").and_then(Value::as_str),
+            Some(RAYDIUM_CPMM_PROGRAM_ID)
+        );
+        assert_eq!(
+            request.get("method").and_then(Value::as_str),
+            Some("programSubscribe")
+        );
+        assert_eq!(
+            request
+                .pointer("/params/1/filters/0/dataSize")
+                .and_then(Value::as_u64),
+            Some(POOL_STATE_LEN as u64)
+        );
+    }
+
+    #[test]
+    fn ignores_non_program_notifications() -> Result<(), String> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "slotNotification"
+        });
+
+        assert_eq!(parse_program_notification(&payload)?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_deterministic_pool_state_fixture() -> Result<(), String> {
+        let data = fixture_pool_state(0, 1_234_567);
+        let state = decode_pool_state(&data)?;
+
+        assert_eq!(data.len(), POOL_STATE_LEN);
+        assert_eq!(state.amm_config, bs58::encode([1u8; 32]).into_string());
+        assert_eq!(state.token_0_vault, bs58::encode([3u8; 32]).into_string());
+        assert_eq!(state.token_1_vault, bs58::encode([4u8; 32]).into_string());
+        assert_eq!(state.token_0_mint, bs58::encode([6u8; 32]).into_string());
+        assert_eq!(state.token_1_mint, bs58::encode([7u8; 32]).into_string());
+        assert_eq!(state.token_0_program, bs58::encode([8u8; 32]).into_string());
+        assert_eq!(state.token_1_program, bs58::encode([9u8; 32]).into_string());
+        assert_eq!(state.status, 0);
+        assert_eq!(state.lp_mint_decimals, 9);
+        assert_eq!(state.mint_0_decimals, 6);
+        assert_eq!(state.mint_1_decimals, 6);
+        assert_eq!(state.lp_supply, 1_000);
+        assert_eq!(state.protocol_fees_token_0, 10);
+        assert_eq!(state.protocol_fees_token_1, 11);
+        assert_eq!(state.fund_fees_token_0, 12);
+        assert_eq!(state.fund_fees_token_1, 13);
+        assert_eq!(state.open_time, 1_234_567);
+        assert_eq!(state.recent_epoch, 500);
+        assert_eq!(state.creator_fee_on, 0);
+        assert!(state.enable_creator_fee);
+        assert_eq!(state.creator_fees_token_0, 14);
+        assert_eq!(state.creator_fees_token_1, 15);
+
+        Ok(())
+    }
+
+    #[test]
+    fn decodes_deterministic_amm_config_fixture() -> Result<(), String> {
+        let data = fixture_amm_config();
+        let config = decode_amm_config(&data)?;
+
+        assert_eq!(data.len(), AMM_CONFIG_LEN);
+        assert_eq!(config.bump, 254);
+        assert!(!config.disable_create_pool);
+        assert_eq!(config.index, 7);
+        assert_eq!(config.trade_fee_rate, 2_500);
+        assert_eq!(config.protocol_fee_rate, 120_000);
+        assert_eq!(config.fund_fee_rate, 40_000);
+        assert_eq!(config.create_pool_fee, 1_000_000);
+        assert_eq!(
+            config.protocol_owner,
+            bs58::encode([21u8; 32]).into_string()
+        );
+        assert_eq!(config.fund_owner, bs58::encode([22u8; 32]).into_string());
+        assert_eq!(config.creator_fee_rate, 500);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wrong_amm_config_discriminator() {
+        let mut data = fixture_amm_config();
+        data[0] ^= 0xff;
+
+        assert!(decode_amm_config(&data).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_pool_state_discriminator() {
+        let mut data = fixture_pool_state(0, 1_234_567);
+        data[0] ^= 0xff;
+
+        assert!(decode_pool_state(&data).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_pool_state_length() {
+        let mut data = fixture_pool_state(0, 1_234_567);
+        let _ = data.pop();
+
+        assert!(decode_pool_state(&data).is_err());
+    }
+
+    #[test]
+    fn parses_and_decodes_read_only_raydium_observation() -> Result<(), String> {
+        let data = fixture_pool_state(0, 1_234_567);
+        let encoded_data = BASE64_STANDARD.encode(&data);
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "programNotification",
+            "params": {
+                "result": {
+                    "context": {
+                        "slot": 123456
+                    },
+                    "value": {
+                        "pubkey": "ExamplePool111111111111111111111111111111111",
+                        "account": {
+                            "data": [
+                                encoded_data,
+                                "base64"
+                            ],
+                            "executable": false,
+                            "lamports": 1,
+                            "owner": RAYDIUM_CPMM_PROGRAM_ID,
+                            "rentEpoch": 0,
+                            "space": POOL_STATE_LEN
+                        }
+                    }
+                },
+                "subscription": 99
+            }
+        });
+
+        let observation = parse_program_notification(&payload)?
+            .ok_or_else(|| "expected Raydium observation".to_owned())?;
+
+        assert_eq!(observation.slot, 123456);
+        assert_eq!(observation.owner, RAYDIUM_CPMM_PROGRAM_ID);
+        assert_eq!(observation.decoded_data_len, POOL_STATE_LEN);
+        assert_eq!(observation.pool_state.lp_supply, 1_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_raydium_pool_without_inventing_reserves() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+
+        let normalized = normalize_observation(&observation, 1_500_000_000, 1_500_000_001);
+
+        assert_eq!(normalized.pool_id, observation.pubkey);
+        assert_eq!(normalized.venue, Venue::RaydiumCpmm);
+        assert_eq!(normalized.program_id, RAYDIUM_CPMM_PROGRAM_ID);
+        assert_eq!(normalized.source_slot, 123_456);
+        assert_eq!(normalized.trading_state, PoolTradingState::Tradable);
+        assert_eq!(normalized.quote_reserves, QuoteReserveState::Unavailable);
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalization_marks_future_open_time() -> Result<(), String> {
+        let observation = fixture_observation(0, 2_000_000)?;
+
+        let normalized = normalize_observation(&observation, 1_500_000_000, 1_500_000_001);
+
+        assert_eq!(normalized.trading_state, PoolTradingState::NotYetOpen);
+
+        Ok(())
+    }
+
+    #[test]
+    fn normalization_marks_swap_disabled_status() -> Result<(), String> {
+        let swap_disabled_status = 1u8 << SWAP_DISABLED_BIT;
+        let observation = fixture_observation(swap_disabled_status, 1_234_567)?;
+
+        let normalized = normalize_observation(&observation, 1_500_000_000, 1_500_000_001);
+
+        assert_eq!(normalized.trading_state, PoolTradingState::SwapDisabled);
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_account_order_includes_amm_config() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+
+        let account_pubkeys = hydration_account_pubkeys(&observation);
+
+        assert_eq!(account_pubkeys[0], observation.pubkey);
+        assert_eq!(account_pubkeys[1], observation.pool_state.amm_config);
+        assert_eq!(account_pubkeys[2], observation.pool_state.token_0_vault);
+        assert_eq!(account_pubkeys[3], observation.pool_state.token_1_vault);
+
+        Ok(())
+    }
+
+    #[test]
+    fn valid_hydration_snapshot_produces_reserves_and_fee_context() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        let snapshot = parse_hydration_response(&observation, &payload)?;
+
+        assert_eq!(snapshot.slot, 123_500);
+        assert_eq!(snapshot.amm_config.trade_fee_rate, 2_500);
+        assert_eq!(snapshot.amm_config.protocol_fee_rate, 120_000);
+        assert_eq!(snapshot.amm_config.fund_fee_rate, 40_000);
+        assert_eq!(snapshot.amm_config.creator_fee_rate, 500);
+        assert_eq!(snapshot.token_0_vault_raw, 10_000);
+        assert_eq!(snapshot.token_1_vault_raw, 20_000);
+        assert_eq!(snapshot.token_0_accrued_fees_raw, 36);
+        assert_eq!(snapshot.token_1_accrued_fees_raw, 39);
+        assert_eq!(snapshot.token_0_effective_raw, 9_964);
+        assert_eq!(snapshot.token_1_effective_raw, 19_961);
+
+        let normalized =
+            hydrate_normalized_observation(&observation, &snapshot, 1_500_000_000, 1_500_000_100)?;
+
+        assert_eq!(
+            normalized.quote_reserves,
+            QuoteReserveState::Available {
+                token_a_raw: 9_964,
+                token_b_raw: 19_961,
+                source_slot: 123_500,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_stale_context_slot() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_455,
+            &observation.pool_state.token_0_program,
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_wrong_amm_config_owner() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let mut payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        payload["result"]["value"][1]["owner"] =
+            Value::String("WrongProgram111111111111111111111111111111".to_owned());
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_wrong_vault_owner_program() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_500,
+            "WrongTokenProgram111111111111111111111111111",
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_wrong_vault_mint() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            42,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_effective_reserve_underflow() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            6,
+            35,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_missing_account() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let mut payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        payload["result"]["value"][3] = Value::Null;
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    fn fixture_observation(
+        status: u8,
+        open_time: u64,
+    ) -> Result<RaydiumCpmmAccountObservation, String> {
+        let pool_state = decode_pool_state(&fixture_pool_state(status, open_time))?;
+
+        Ok(RaydiumCpmmAccountObservation {
+            pubkey: "ExamplePool111111111111111111111111111111111".to_owned(),
+            slot: 123_456,
+            owner: RAYDIUM_CPMM_PROGRAM_ID.to_owned(),
+            encoded_data_len: 852,
+            decoded_data_len: POOL_STATE_LEN,
+            pool_state,
+        })
+    }
+
+    fn fixture_hydration_payload(
+        context_slot: u64,
+        token_0_owner: &str,
+        token_0_mint_seed: u8,
+        token_0_amount: u64,
+        token_1_owner: &str,
+        token_1_mint_seed: u8,
+        token_1_amount: u64,
+    ) -> Value {
+        let pool_data = fixture_pool_state(0, 1_234_567);
+        let amm_config_data = fixture_amm_config();
+        let token_0_data = fixture_token_account(token_0_mint_seed, token_0_amount);
+        let token_1_data = fixture_token_account(token_1_mint_seed, token_1_amount);
+
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "context": {
+                    "slot": context_slot
+                },
+                "value": [
+                    fixture_rpc_account(RAYDIUM_CPMM_PROGRAM_ID, &pool_data),
+                    fixture_rpc_account(RAYDIUM_CPMM_PROGRAM_ID, &amm_config_data),
+                    fixture_rpc_account(token_0_owner, &token_0_data),
+                    fixture_rpc_account(token_1_owner, &token_1_data)
+                ]
+            }
+        })
+    }
+
+    fn fixture_rpc_account(owner: &str, data: &[u8]) -> Value {
+        json!({
+            "data": [
+                BASE64_STANDARD.encode(data),
+                "base64"
+            ],
+            "executable": false,
+            "lamports": 1,
+            "owner": owner,
+            "rentEpoch": 0,
+            "space": data.len()
+        })
+    }
+
+    fn fixture_token_account(mint_seed: u8, amount: u64) -> Vec<u8> {
+        let mut data = vec![0u8; TOKEN_ACCOUNT_BASE_LEN];
+
+        data[0..32].fill(mint_seed);
+        data[TOKEN_ACCOUNT_AMOUNT_OFFSET..TOKEN_ACCOUNT_AMOUNT_OFFSET + 8]
+            .copy_from_slice(&amount.to_le_bytes());
+
+        data
+    }
+
+    fn fixture_amm_config() -> Vec<u8> {
+        let mut data = Vec::with_capacity(AMM_CONFIG_LEN);
+
+        data.extend_from_slice(&AMM_CONFIG_DISCRIMINATOR);
+        data.push(254);
+        data.push(0);
+        data.extend_from_slice(&7u16.to_le_bytes());
+
+        for value in [2_500u64, 120_000, 40_000, 1_000_000] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+
+        data.extend(std::iter::repeat(21u8).take(32));
+        data.extend(std::iter::repeat(22u8).take(32));
+        data.extend_from_slice(&500u64.to_le_bytes());
+        data.extend_from_slice(&[0u8; 15 * 8]);
+
+        data
+    }
+
+    fn fixture_pool_state(status: u8, open_time: u64) -> Vec<u8> {
+        let mut data = Vec::with_capacity(POOL_STATE_LEN);
+
+        data.extend_from_slice(&POOL_STATE_DISCRIMINATOR);
+
+        for seed in 1u8..=10 {
+            data.extend(std::iter::repeat(seed).take(32));
+        }
+
+        data.extend_from_slice(&[250, status, 9, 6, 6]);
+
+        for value in [1_000u64, 10, 11, 12, 13, open_time, 500] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+
+        data.push(0);
+        data.push(1);
+        data.extend_from_slice(&[0u8; 6]);
+
+        data.extend_from_slice(&14u64.to_le_bytes());
+        data.extend_from_slice(&15u64.to_le_bytes());
+
+        data.extend_from_slice(&[0u8; 28 * 8]);
+
+        data
+    }
+}
