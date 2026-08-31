@@ -1049,13 +1049,7 @@ mod tests {
         data.extend_from_slice(&creator.to_le_bytes());
     }
 
-    fn append_tier(
-        data: &mut Vec<u8>,
-        threshold: u128,
-        lp: u64,
-        protocol: u64,
-        creator: u64,
-    ) {
+    fn append_tier(data: &mut Vec<u8>, threshold: u128, lp: u64, protocol: u64, creator: u64) {
         data.extend_from_slice(&threshold.to_le_bytes());
         append_fees(data, lp, protocol, creator);
     }
@@ -1209,7 +1203,10 @@ mod tests {
         assert_eq!(fee_config.flat_fees.protocol_fee_bps, 5);
         assert_eq!(fee_config.flat_fees.creator_fee_bps, 5);
         assert_eq!(fee_config.fee_tiers.len(), 2);
-        assert_eq!(fee_config.fee_tiers[1].market_cap_lamports_threshold, 1_000_000);
+        assert_eq!(
+            fee_config.fee_tiers[1].market_cap_lamports_threshold,
+            1_000_000
+        );
         assert_eq!(fee_config.stable_fee_tiers.len(), 1);
 
         Ok(())
