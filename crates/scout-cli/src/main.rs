@@ -1,14 +1,17 @@
 mod pumpswap;
+mod quote;
 mod raydium;
 mod registry;
 mod route;
 
 use futures_util::{SinkExt, StreamExt};
+use quote::{one_whole_anchor_input_raw, quote_two_leg_exact_input, VenueQuoteContext};
 use registry::ActiveMintRegistry;
 use reqwest::Client;
-use route::{generate_two_leg_routes, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
+use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
 use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -54,30 +57,31 @@ async fn main() {
         }
     };
 
-    let raydium_states = match observe_raydium_cpmm(&rpc_client).await {
-        Ok(states) => states,
+    let (raydium_states, raydium_quote_contexts) = match observe_raydium_cpmm(&rpc_client).await {
+        Ok(result) => result,
         Err(error) => {
             eprintln!("Raydium CPMM observation failed: {error}");
             std::process::exit(1);
         }
     };
 
-    let mut pumpswap_states = match observe_pumpswap(&rpc_client).await {
-        Ok(states) => states,
-        Err(error) => {
-            eprintln!("PumpSwap observation failed: {error}");
-            std::process::exit(1);
-        }
-    };
+    let (mut pumpswap_states, mut pumpswap_quote_contexts) =
+        match observe_pumpswap(&rpc_client).await {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("PumpSwap observation failed: {error}");
+                std::process::exit(1);
+            }
+        };
 
     if !has_current_route(&raydium_states, &pumpswap_states) {
         println!(
             "\nREAD-ONLY RUNG 9 DISCOVERY: bounded live sample contains no same-pair cross-venue route"
         );
 
-        let targeted_states =
+        let (targeted_states, targeted_quote_contexts) =
             match discover_targeted_pumpswap_overlap(&rpc_client, &raydium_states).await {
-                Ok(states) => states,
+                Ok(result) => result,
                 Err(error) => {
                     eprintln!("Rung 9 targeted discovery failed: {error}");
                     std::process::exit(1);
@@ -87,9 +91,15 @@ async fn main() {
         println!("targeted_pumpswap_state_count={}", targeted_states.len());
 
         pumpswap_states.extend(targeted_states);
+        pumpswap_quote_contexts.extend(targeted_quote_contexts);
     }
 
-    if let Err(error) = validate_registry_and_routes(raydium_states, pumpswap_states) {
+    if let Err(error) = validate_registry_and_routes(
+        raydium_states,
+        pumpswap_states,
+        &raydium_quote_contexts,
+        &pumpswap_quote_contexts,
+    ) {
         eprintln!("Registry/route validation failed: {error}");
         std::process::exit(1);
     }
@@ -178,7 +188,15 @@ async fn observe_slots() -> Result<(), String> {
     Ok(())
 }
 
-async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<Vec<NormalizedPoolState>, String> {
+async fn observe_raydium_cpmm(
+    rpc_client: &Client,
+) -> Result<
+    (
+        Vec<NormalizedPoolState>,
+        BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    ),
+    String,
+> {
     println!("DEX adapter: Raydium CPMM");
     println!("Program: {}", raydium::RAYDIUM_CPMM_PROGRAM_ID);
     println!("Hydration boundary: Solana mainnet read-only HTTP RPC");
@@ -196,6 +214,7 @@ async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<Vec<NormalizedPoolS
     let mut subscription_confirmed = false;
     let mut observations = 0usize;
     let mut normalized_states = Vec::with_capacity(MAX_RAYDIUM_OBSERVATIONS);
+    let mut quote_contexts = BTreeMap::new();
 
     while observations < MAX_RAYDIUM_OBSERVATIONS {
         let payload = next_json_message(&mut reader).await?;
@@ -257,6 +276,7 @@ async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<Vec<NormalizedPoolS
         );
         println!("normalized_pool: {}", normalized.summary());
 
+        quote_contexts.insert(normalized.pool_id.clone(), snapshot);
         normalized_states.push(normalized);
     }
 
@@ -269,7 +289,7 @@ async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<Vec<NormalizedPoolS
     println!("READ-ONLY RAYDIUM VAULT HYDRATION PASS");
     println!("READ-ONLY RUNG 6 OBSERVATION COLLECTION PASS");
 
-    Ok(normalized_states)
+    Ok((normalized_states, quote_contexts))
 }
 
 async fn fetch_raydium_hydration(
@@ -281,7 +301,15 @@ async fn fetch_raydium_hydration(
     fetch_hydration(rpc_client, 3, account_pubkeys, observation.slot, "Raydium").await
 }
 
-async fn observe_pumpswap(rpc_client: &Client) -> Result<Vec<NormalizedPoolState>, String> {
+async fn observe_pumpswap(
+    rpc_client: &Client,
+) -> Result<
+    (
+        Vec<NormalizedPoolState>,
+        BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    ),
+    String,
+> {
     println!("\nDEX adapter: PumpSwap");
     println!("Program: {}", pumpswap::PUMPSWAP_PROGRAM_ID);
     println!("Hydration boundary: Solana mainnet read-only HTTP RPC");
@@ -299,6 +327,7 @@ async fn observe_pumpswap(rpc_client: &Client) -> Result<Vec<NormalizedPoolState
     let mut subscription_confirmed = false;
     let mut observations = 0usize;
     let mut normalized_states = Vec::with_capacity(MAX_PUMPSWAP_OBSERVATIONS);
+    let mut quote_contexts = BTreeMap::new();
 
     while observations < MAX_PUMPSWAP_OBSERVATIONS {
         let payload = next_json_message(&mut reader).await?;
@@ -360,6 +389,7 @@ async fn observe_pumpswap(rpc_client: &Client) -> Result<Vec<NormalizedPoolState
         );
         println!("normalized_pool: {}", normalized.summary());
 
+        quote_contexts.insert(normalized.pool_id.clone(), snapshot);
         normalized_states.push(normalized);
     }
 
@@ -372,7 +402,7 @@ async fn observe_pumpswap(rpc_client: &Client) -> Result<Vec<NormalizedPoolState
     println!("READ-ONLY SECOND VENUE NORMALIZATION PASS");
     println!("READ-ONLY RUNG 7 OBSERVATION COLLECTION PASS");
 
-    Ok(normalized_states)
+    Ok((normalized_states, quote_contexts))
 }
 
 async fn fetch_pumpswap_hydration(
@@ -400,7 +430,13 @@ fn has_current_route(
 async fn discover_targeted_pumpswap_overlap(
     rpc_client: &Client,
     raydium_states: &[NormalizedPoolState],
-) -> Result<Vec<NormalizedPoolState>, String> {
+) -> Result<
+    (
+        Vec<NormalizedPoolState>,
+        BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    ),
+    String,
+> {
     println!("\nRung 9 targeted PumpSwap discovery");
     println!("Solana on-chain state remains authoritative.");
 
@@ -409,7 +445,7 @@ async fn discover_targeted_pumpswap_overlap(
     println!("targeted_lookup_pair_count={}", candidates.len());
 
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), BTreeMap::new()));
     }
 
     let mut successful_rpc_responses = 0usize;
@@ -536,7 +572,10 @@ async fn discover_targeted_pumpswap_overlap(
                 println!("targeted_normalized_pool: {}", normalized.summary());
                 println!("READ-ONLY RUNG 9 TARGETED DISCOVERY PASS");
 
-                return Ok(vec![normalized]);
+                let mut quote_contexts = BTreeMap::new();
+                quote_contexts.insert(normalized.pool_id.clone(), snapshot);
+
+                return Ok((vec![normalized], quote_contexts));
             }
         }
 
@@ -553,7 +592,7 @@ async fn discover_targeted_pumpswap_overlap(
         );
     }
 
-    Ok(Vec::new())
+    Ok((Vec::new(), BTreeMap::new()))
 }
 
 async fn fetch_pumpswap_pair_lookup(rpc_client: &Client, request: &Value) -> Result<Value, String> {
@@ -656,6 +695,8 @@ fn normalized_pool_is_eligible(pool: &NormalizedPoolState) -> bool {
 fn validate_registry_and_routes(
     raydium_states: Vec<NormalizedPoolState>,
     pumpswap_states: Vec<NormalizedPoolState>,
+    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
 ) -> Result<(), String> {
     println!("\nRegistry: Active Mint");
 
@@ -704,7 +745,119 @@ fn validate_registry_and_routes(
     println!("READ-ONLY TWO-LEG ROUTE ENGINE PASS");
     println!("READ-ONLY RUNG 9 ROUTE CANDIDATE PASS");
 
+    println!("\nRung 10 raw quote engine: one whole anchor token probe");
+
+    let mut successful_quotes = 0usize;
+
+    for route_candidate in &route_candidates {
+        let leg_1_context = match quote_context_for_leg(
+            route_candidate.leg_1(),
+            raydium_quote_contexts,
+            pumpswap_quote_contexts,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                println!(
+                    "rung10_raw_quote_rejected: route=[{}] reason={error}",
+                    route_candidate.summary()
+                );
+                continue;
+            }
+        };
+
+        let leg_2_context = match quote_context_for_leg(
+            route_candidate.leg_2(),
+            raydium_quote_contexts,
+            pumpswap_quote_contexts,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                println!(
+                    "rung10_raw_quote_rejected: route=[{}] reason={error}",
+                    route_candidate.summary()
+                );
+                continue;
+            }
+        };
+
+        let amount_in_raw = match one_whole_anchor_input_raw(route_candidate, &leg_1_context) {
+            Ok(amount) => amount,
+            Err(error) => {
+                println!(
+                    "rung10_raw_quote_rejected: route=[{}] reason={error}",
+                    route_candidate.summary()
+                );
+                continue;
+            }
+        };
+
+        match quote_two_leg_exact_input(
+            route_candidate,
+            amount_in_raw,
+            &leg_1_context,
+            &leg_2_context,
+        ) {
+            Ok(route_quote) => {
+                successful_quotes += 1;
+                println!("rung10_raw_quote: {}", route_quote.summary());
+            }
+            Err(error) => {
+                println!(
+                    "rung10_raw_quote_rejected: route=[{}] reason={error}",
+                    route_candidate.summary()
+                );
+            }
+        }
+    }
+
+    if successful_quotes == 0 {
+        return Err(
+            "Rung 10 raw quote engine produced no valid two-leg quote from live route state"
+                .to_owned(),
+        );
+    }
+
+    println!("rung10_raw_quote_count={successful_quotes}");
+    println!("READ-ONLY RUNG 10 RAW ROUTE QUOTE ENGINE PASS");
+
     Ok(())
+}
+
+fn quote_context_for_leg<'a>(
+    leg: &RouteLeg,
+    raydium_quote_contexts: &'a BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    pumpswap_quote_contexts: &'a BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+) -> Result<VenueQuoteContext<'a>, String> {
+    match leg.venue() {
+        scout_core::Venue::RaydiumCpmm => raydium_quote_contexts
+            .get(leg.pool_id())
+            .map(|snapshot| VenueQuoteContext::Raydium {
+                pool_id: leg.pool_id().to_owned(),
+                snapshot,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "missing Raydium quote context for route pool {}",
+                    leg.pool_id()
+                )
+            }),
+        scout_core::Venue::PumpSwap => pumpswap_quote_contexts
+            .get(leg.pool_id())
+            .map(|snapshot| VenueQuoteContext::PumpSwap {
+                pool_id: leg.pool_id().to_owned(),
+                snapshot,
+            })
+            .ok_or_else(|| {
+                format!(
+                    "missing PumpSwap quote context for route pool {}",
+                    leg.pool_id()
+                )
+            }),
+        other => Err(format!(
+            "unsupported Rung 10 quote venue {}",
+            other.label()
+        )),
+    }
 }
 
 async fn fetch_hydration<const N: usize>(
