@@ -43,10 +43,7 @@ impl PoolTradingState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuoteReserveState {
     Unavailable,
-    Available {
-        token_a_raw: u64,
-        token_b_raw: u64,
-    },
+    Available { token_a_raw: u64, token_b_raw: u64 },
 }
 
 impl QuoteReserveState {
@@ -386,4 +383,4 @@ mod tests {
 
         assert!(matches!(result, Err(EconomicsError::InvalidCost)));
     }
-}
+            }
