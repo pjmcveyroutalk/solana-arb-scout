@@ -3,7 +3,7 @@ mod raydium;
 mod registry;
 mod route;
 
-use futures_util::{future::join_all, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use registry::ActiveMintRegistry;
 use reqwest::Client;
 use route::{generate_two_leg_routes, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
@@ -17,21 +17,31 @@ const SOLANA_WSS_URL: &str = "wss://api.mainnet-beta.solana.com";
 const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const RAYDIUM_API_POOL_MINT_URL: &str = "https://api-v3.raydium.io/pools/info/mint";
 
+const PUMPSWAP_POOL_DISCRIMINATOR_BASE58: &str = "hQrXeCntzbV";
+const PUMPSWAP_BASE_MINT_OFFSET: usize = 43;
+const PUMPSWAP_QUOTE_MINT_OFFSET: usize = 75;
+
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
-const MAX_TARGETED_ROUTE_LOOKUPS: usize = 15;
-const TARGETED_LOOKUP_BATCH_SIZE: usize = 5;
+
+const RAYDIUM_INVENTORY_PAGE_SIZE: usize = 100;
+const MAX_RAYDIUM_CANDIDATES_PER_ANCHOR: usize = 10;
 
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCATOR_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RouteDiscoveryPair {
+struct RaydiumInventoryCandidate {
     anchor_mint: String,
     intermediate_mint: String,
-    pumpswap_pool_id: String,
+    raydium_pool_id: String,
+}
+
+struct TargetedRouteDiscovery {
+    raydium_state: NormalizedPoolState,
+    pumpswap_state: NormalizedPoolState,
 }
 
 #[tokio::main]
@@ -65,7 +75,7 @@ async fn main() {
         }
     };
 
-    let pumpswap_states = match observe_pumpswap(&rpc_client).await {
+    let mut pumpswap_states = match observe_pumpswap(&rpc_client).await {
         Ok(states) => states,
         Err(error) => {
             eprintln!("PumpSwap observation failed: {error}");
@@ -78,18 +88,28 @@ async fn main() {
             "\nREAD-ONLY RUNG 9 DISCOVERY: bounded live sample contains no same-pair cross-venue route"
         );
 
-        let targeted_states =
-            match discover_targeted_raydium_overlap(&rpc_client, &pumpswap_states).await {
-                Ok(states) => states,
+        let targeted_discovery =
+            match discover_targeted_cross_venue_overlap(&rpc_client).await {
+                Ok(discovery) => discovery,
                 Err(error) => {
                     eprintln!("Rung 9 targeted discovery failed: {error}");
                     std::process::exit(1);
                 }
             };
 
-        println!("targeted_raydium_state_count={}", targeted_states.len());
+        match targeted_discovery {
+            Some(discovery) => {
+                println!("targeted_raydium_state_count=1");
+                println!("targeted_pumpswap_state_count=1");
 
-        raydium_states.extend(targeted_states);
+                raydium_states.push(discovery.raydium_state);
+                pumpswap_states.push(discovery.pumpswap_state);
+            }
+            None => {
+                println!("targeted_raydium_state_count=0");
+                println!("targeted_pumpswap_state_count=0");
+            }
+        }
     }
 
     if let Err(error) = validate_registry_and_routes(raydium_states, pumpswap_states) {
@@ -400,223 +420,327 @@ fn has_current_route(
     !generate_two_leg_routes(&registry.current_eligible_pools()).is_empty()
 }
 
-async fn discover_targeted_raydium_overlap(
+async fn discover_targeted_cross_venue_overlap(
     rpc_client: &Client,
-    pumpswap_states: &[NormalizedPoolState],
-) -> Result<Vec<NormalizedPoolState>, String> {
-    println!("\nRung 9 targeted discovery");
+) -> Result<Option<TargetedRouteDiscovery>, String> {
+    println!("\nRung 9 targeted cross-venue discovery");
     println!("Raydium API is locator-only; Solana on-chain state remains authoritative.");
 
-    let candidates = collect_route_discovery_pairs(pumpswap_states);
+    let candidates = collect_raydium_inventory_candidates(rpc_client).await?;
 
-    println!("targeted_lookup_pair_count={}", candidates.len());
+    println!(
+        "raydium_anchor_inventory_candidate_count={}",
+        candidates.len()
+    );
 
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
-    let mut successful_locator_calls = 0usize;
+    let mut successful_pumpswap_lookup_calls = 0usize;
 
-    for batch in candidates.chunks(TARGETED_LOOKUP_BATCH_SIZE) {
-        let lookup_results = join_all(batch.iter().map(|candidate| async move {
-            let result = fetch_raydium_locator_pool_id(
-                rpc_client,
-                &candidate.anchor_mint,
-                &candidate.intermediate_mint,
-            )
-            .await;
+    for candidate in candidates {
+        let orientations = [
+            (
+                candidate.anchor_mint.as_str(),
+                candidate.intermediate_mint.as_str(),
+            ),
+            (
+                candidate.intermediate_mint.as_str(),
+                candidate.anchor_mint.as_str(),
+            ),
+        ];
 
-            (candidate, result)
-        }))
-        .await;
+        let mut pumpswap_pool_ids = Vec::new();
 
-        for (candidate, lookup_result) in lookup_results {
-            let pool_id = match lookup_result {
-                Ok(Some(pool_id)) => {
-                    successful_locator_calls += 1;
-                    pool_id
+        for (base_mint, quote_mint) in orientations {
+            match fetch_pumpswap_pair_pool_ids(rpc_client, base_mint, quote_mint).await {
+                Ok(pool_ids) => {
+                    successful_pumpswap_lookup_calls += 1;
+
+                    for pool_id in pool_ids {
+                        if !pumpswap_pool_ids.contains(&pool_id) {
+                            pumpswap_pool_ids.push(pool_id);
+                        }
+                    }
                 }
-                Ok(None) => {
-                    successful_locator_calls += 1;
+                Err(error) => {
                     println!(
-                        "targeted_locator_no_cpmm: anchor={} intermediate={} pumpswap_pool={}",
+                        "targeted_pumpswap_locator_rejected: anchor={} intermediate={} base={} quote={} reason={}",
                         candidate.anchor_mint,
                         candidate.intermediate_mint,
-                        candidate.pumpswap_pool_id,
+                        base_mint,
+                        quote_mint,
+                        error,
                     );
-                    continue;
                 }
-                Err(error) => {
-                    println!(
-                        "targeted_locator_rejected: anchor={} intermediate={} reason={}",
-                        candidate.anchor_mint, candidate.intermediate_mint, error
-                    );
-                    continue;
-                }
-            };
+            }
+        }
 
+        if pumpswap_pool_ids.is_empty() {
             println!(
-                "route_locator_candidate: anchor={} intermediate={} pumpswap_pool={} raydium_pool={}",
+                "targeted_pumpswap_no_pair: anchor={} intermediate={} raydium_pool={}",
                 candidate.anchor_mint,
                 candidate.intermediate_mint,
-                candidate.pumpswap_pool_id,
-                pool_id,
+                candidate.raydium_pool_id,
+            );
+            continue;
+        }
+
+        for pumpswap_pool_id in pumpswap_pool_ids {
+            println!(
+                "route_locator_candidate: anchor={} intermediate={} raydium_pool={} pumpswap_pool={}",
+                candidate.anchor_mint,
+                candidate.intermediate_mint,
+                candidate.raydium_pool_id,
+                pumpswap_pool_id,
             );
 
-            let observation = match fetch_raydium_pool_observation(rpc_client, &pool_id).await {
-                Ok(observation) => observation,
-                Err(error) => {
-                    println!(
-                        "targeted_onchain_candidate_rejected: pool={} reason={}",
-                        pool_id, error
-                    );
-                    continue;
-                }
-            };
+            let raydium_observation =
+                match fetch_raydium_pool_observation(rpc_client, &candidate.raydium_pool_id).await {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        println!(
+                            "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
+                            candidate.raydium_pool_id, error
+                        );
+                        continue;
+                    }
+                };
 
             if !raydium_observation_matches_pair(
-                &observation,
+                &raydium_observation,
                 &candidate.anchor_mint,
                 &candidate.intermediate_mint,
             ) {
                 println!(
-                    "targeted_onchain_candidate_rejected: pool={} reason=on-chain mint pair mismatch",
-                    pool_id
+                    "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason=on-chain mint pair mismatch",
+                    candidate.raydium_pool_id
                 );
                 continue;
             }
 
-            let account_update_received_at_unix_ms = unix_time_ms_now()?;
-            let hydration_started_at_unix_ms = unix_time_ms_now()?;
+            let pumpswap_observation =
+                match fetch_pumpswap_pool_observation(rpc_client, &pumpswap_pool_id).await {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        println!(
+                            "targeted_onchain_candidate_rejected: venue=pumpswap pool={} reason={}",
+                            pumpswap_pool_id, error
+                        );
+                        continue;
+                    }
+                };
 
-            let hydration_payload = match fetch_raydium_hydration(rpc_client, &observation).await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    println!(
-                        "targeted_onchain_candidate_rejected: pool={} reason={}",
-                        pool_id, error
-                    );
-                    continue;
-                }
-            };
+            if !pumpswap_observation_matches_pair(
+                &pumpswap_observation,
+                &candidate.anchor_mint,
+                &candidate.intermediate_mint,
+            ) {
+                println!(
+                    "targeted_onchain_candidate_rejected: venue=pumpswap pool={} reason=on-chain mint pair mismatch",
+                    pumpswap_pool_id
+                );
+                continue;
+            }
 
-            let snapshot = match raydium::parse_hydration_response(&observation, &hydration_payload)
-            {
+            let raydium_received_at_unix_ms = unix_time_ms_now()?;
+            let raydium_hydration_started_at_unix_ms = unix_time_ms_now()?;
+
+            let raydium_hydration_payload =
+                match fetch_raydium_hydration(rpc_client, &raydium_observation).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
+                            candidate.raydium_pool_id, error
+                        );
+                        continue;
+                    }
+                };
+
+            let raydium_snapshot = match raydium::parse_hydration_response(
+                &raydium_observation,
+                &raydium_hydration_payload,
+            ) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     println!(
-                        "targeted_onchain_candidate_rejected: pool={} reason={}",
-                        pool_id, error
+                        "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
+                        candidate.raydium_pool_id, error
                     );
                     continue;
                 }
             };
 
-            let hydrated_at_unix_ms = unix_time_ms_now()?;
+            let raydium_hydrated_at_unix_ms = unix_time_ms_now()?;
 
-            let normalized = match raydium::hydrate_normalized_observation(
-                &observation,
-                &snapshot,
-                account_update_received_at_unix_ms,
-                hydrated_at_unix_ms,
+            let raydium_normalized = match raydium::hydrate_normalized_observation(
+                &raydium_observation,
+                &raydium_snapshot,
+                raydium_received_at_unix_ms,
+                raydium_hydrated_at_unix_ms,
             ) {
                 Ok(normalized) => normalized,
                 Err(error) => {
                     println!(
-                        "targeted_onchain_candidate_rejected: pool={} reason={}",
-                        pool_id, error
+                        "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason={}",
+                        candidate.raydium_pool_id, error
                     );
                     continue;
                 }
             };
 
-            if !normalized_pool_is_eligible(&normalized) {
+            if !normalized_pool_is_eligible(&raydium_normalized) {
                 println!(
-                    "targeted_onchain_candidate_rejected: pool={} reason=current normalized state is not registry-eligible",
-                    pool_id
+                    "targeted_onchain_candidate_rejected: venue=raydium_cpmm pool={} reason=current normalized state is not registry-eligible",
+                    candidate.raydium_pool_id
                 );
                 continue;
             }
 
-            let hydration_duration_ms =
-                hydrated_at_unix_ms.saturating_sub(hydration_started_at_unix_ms);
+            let pumpswap_received_at_unix_ms = unix_time_ms_now()?;
+            let pumpswap_hydration_started_at_unix_ms = unix_time_ms_now()?;
+
+            let pumpswap_hydration_payload =
+                match fetch_pumpswap_hydration(rpc_client, &pumpswap_observation).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "targeted_onchain_candidate_rejected: venue=pumpswap pool={} reason={}",
+                            pumpswap_pool_id, error
+                        );
+                        continue;
+                    }
+                };
+
+            let pumpswap_snapshot = match pumpswap::parse_hydration_response(
+                &pumpswap_observation,
+                &pumpswap_hydration_payload,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    println!(
+                        "targeted_onchain_candidate_rejected: venue=pumpswap pool={} reason={}",
+                        pumpswap_pool_id, error
+                    );
+                    continue;
+                }
+            };
+
+            let pumpswap_hydrated_at_unix_ms = unix_time_ms_now()?;
+
+            let pumpswap_normalized = match pumpswap::hydrate_normalized_observation(
+                &pumpswap_observation,
+                &pumpswap_snapshot,
+                pumpswap_received_at_unix_ms,
+                pumpswap_hydrated_at_unix_ms,
+            ) {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    println!(
+                        "targeted_onchain_candidate_rejected: venue=pumpswap pool={} reason={}",
+                        pumpswap_pool_id, error
+                    );
+                    continue;
+                }
+            };
+
+            if !normalized_pool_is_eligible(&pumpswap_normalized) {
+                println!(
+                    "targeted_onchain_candidate_rejected: venue=pumpswap pool={} reason=current normalized state is not registry-eligible",
+                    pumpswap_pool_id
+                );
+                continue;
+            }
+
+            let raydium_hydration_duration_ms = raydium_hydrated_at_unix_ms
+                .saturating_sub(raydium_hydration_started_at_unix_ms);
+            let pumpswap_hydration_duration_ms = pumpswap_hydrated_at_unix_ms
+                .saturating_sub(pumpswap_hydration_started_at_unix_ms);
 
             println!(
                 "targeted_raydium_pool: anchor={} intermediate={} pool={} source_slot={} reserve_slot={} hydration_duration_ms={}",
                 candidate.anchor_mint,
                 candidate.intermediate_mint,
-                normalized.pool_id,
-                normalized.source_slot,
-                snapshot.slot,
-                hydration_duration_ms,
+                raydium_normalized.pool_id,
+                raydium_normalized.source_slot,
+                raydium_snapshot.slot,
+                raydium_hydration_duration_ms,
             );
-            println!("targeted_normalized_pool: {}", normalized.summary());
+
+            println!(
+                "targeted_pumpswap_pool: anchor={} intermediate={} pool={} source_slot={} reserve_slot={} hydration_duration_ms={}",
+                candidate.anchor_mint,
+                candidate.intermediate_mint,
+                pumpswap_normalized.pool_id,
+                pumpswap_normalized.source_slot,
+                pumpswap_snapshot.slot,
+                pumpswap_hydration_duration_ms,
+            );
+
+            println!(
+                "targeted_raydium_normalized_pool: {}",
+                raydium_normalized.summary()
+            );
+            println!(
+                "targeted_pumpswap_normalized_pool: {}",
+                pumpswap_normalized.summary()
+            );
             println!("READ-ONLY RUNG 9 TARGETED DISCOVERY PASS");
 
-            return Ok(vec![normalized]);
+            return Ok(Some(TargetedRouteDiscovery {
+                raydium_state: raydium_normalized,
+                pumpswap_state: pumpswap_normalized,
+            }));
         }
     }
 
-    if successful_locator_calls == 0 {
+    if successful_pumpswap_lookup_calls == 0 {
         return Err(
-            "all bounded Raydium locator requests failed before a response was received".to_owned(),
+            "all bounded PumpSwap exact-pair lookup requests failed before a response was received"
+                .to_owned(),
         );
     }
 
-    Ok(Vec::new())
+    Ok(None)
 }
 
-fn collect_route_discovery_pairs(
-    pumpswap_states: &[NormalizedPoolState],
-) -> Vec<RouteDiscoveryPair> {
-    let mut pairs = Vec::new();
+async fn collect_raydium_inventory_candidates(
+    rpc_client: &Client,
+) -> Result<Vec<RaydiumInventoryCandidate>, String> {
+    let mut candidates = Vec::new();
 
-    for pool in pumpswap_states {
-        let Some((anchor_mint, intermediate_mint)) = route_pair_from_pool(pool) else {
-            continue;
-        };
-
-        if pairs.iter().any(|existing: &RouteDiscoveryPair| {
-            existing.anchor_mint == anchor_mint && existing.intermediate_mint == intermediate_mint
-        }) {
-            continue;
-        }
-
-        pairs.push(RouteDiscoveryPair {
-            anchor_mint,
-            intermediate_mint,
-            pumpswap_pool_id: pool.pool_id.clone(),
-        });
-
-        if pairs.len() >= MAX_TARGETED_ROUTE_LOOKUPS {
-            break;
-        }
-    }
-
-    pairs
-}
-
-fn route_pair_from_pool(pool: &NormalizedPoolState) -> Option<(String, String)> {
     for anchor_mint in [WRAPPED_SOL_MINT, USDC_MINT, USDT_MINT] {
-        if pool.token_a.mint == anchor_mint && pool.token_b.mint != anchor_mint {
-            return Some((anchor_mint.to_owned(), pool.token_b.mint.clone()));
-        }
+        let anchor_candidates =
+            fetch_raydium_anchor_inventory(rpc_client, anchor_mint).await?;
 
-        if pool.token_b.mint == anchor_mint && pool.token_a.mint != anchor_mint {
-            return Some((anchor_mint.to_owned(), pool.token_a.mint.clone()));
+        println!(
+            "raydium_anchor_inventory: anchor={} cpmm_candidate_count={}",
+            anchor_mint,
+            anchor_candidates.len()
+        );
+
+        for candidate in anchor_candidates {
+            if candidates.iter().any(|existing: &RaydiumInventoryCandidate| {
+                existing.raydium_pool_id == candidate.raydium_pool_id
+            }) {
+                continue;
+            }
+
+            candidates.push(candidate);
         }
     }
 
-    None
+    Ok(candidates)
 }
 
-async fn fetch_raydium_locator_pool_id(
+async fn fetch_raydium_anchor_inventory(
     rpc_client: &Client,
     anchor_mint: &str,
-    intermediate_mint: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Vec<RaydiumInventoryCandidate>, String> {
     let url = format!(
-        "{RAYDIUM_API_POOL_MINT_URL}?mint1={anchor_mint}&mint2={intermediate_mint}&poolType=standard&poolSortField=liquidity&sortType=desc&pageSize=20&page=1"
+        "{RAYDIUM_API_POOL_MINT_URL}?mint1={anchor_mint}&poolType=standard&poolSortField=liquidity&sortType=desc&pageSize={RAYDIUM_INVENTORY_PAGE_SIZE}&page=1"
     );
 
     let response = rpc_client
@@ -624,53 +748,206 @@ async fn fetch_raydium_locator_pool_id(
         .timeout(LOCATOR_TIMEOUT)
         .send()
         .await
-        .map_err(|error| format!("Raydium locator request failed: {error}"))?;
+        .map_err(|error| format!("Raydium anchor inventory request failed: {error}"))?;
 
     let status = response.status();
 
     if !status.is_success() {
-        return Err(format!("Raydium locator returned HTTP status {status}"));
+        return Err(format!(
+            "Raydium anchor inventory returned HTTP status {status}"
+        ));
     }
 
     let payload = response
         .json::<Value>()
         .await
-        .map_err(|error| format!("Raydium locator returned invalid JSON: {error}"))?;
+        .map_err(|error| format!("Raydium anchor inventory returned invalid JSON: {error}"))?;
 
-    raydium_locator_pool_id_from_payload(&payload)
+    raydium_anchor_candidates_from_payload(&payload, anchor_mint)
 }
 
-fn raydium_locator_pool_id_from_payload(payload: &Value) -> Result<Option<String>, String> {
+fn raydium_anchor_candidates_from_payload(
+    payload: &Value,
+    anchor_mint: &str,
+) -> Result<Vec<RaydiumInventoryCandidate>, String> {
     if payload.get("success").and_then(Value::as_bool) != Some(true) {
         let message = payload
             .get("msg")
             .and_then(Value::as_str)
             .unwrap_or("unknown Raydium API error");
 
-        return Err(format!("Raydium locator rejected request: {message}"));
+        return Err(format!(
+            "Raydium anchor inventory rejected request: {message}"
+        ));
     }
 
     let pools = payload
         .pointer("/data/data")
         .and_then(Value::as_array)
-        .ok_or_else(|| "Raydium locator response missing pool array".to_owned())?;
+        .ok_or_else(|| "Raydium anchor inventory response missing pool array".to_owned())?;
+
+    let mut candidates = Vec::new();
 
     for pool in pools {
-        let program_id = pool.get("programId").and_then(Value::as_str);
-
-        if program_id != Some(raydium::RAYDIUM_CPMM_PROGRAM_ID) {
+        if pool.get("programId").and_then(Value::as_str)
+            != Some(raydium::RAYDIUM_CPMM_PROGRAM_ID)
+        {
             continue;
         }
 
         let pool_id = pool
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| "Raydium CPMM locator result missing pool id".to_owned())?;
+            .ok_or_else(|| "Raydium CPMM inventory result missing pool id".to_owned())?;
 
-        return Ok(Some(pool_id.to_owned()));
+        let mint_a = pool
+            .pointer("/mintA/address")
+            .and_then(Value::as_str)
+            .or_else(|| pool.pointer("/mint1/address").and_then(Value::as_str))
+            .ok_or_else(|| "Raydium CPMM inventory result missing first mint address".to_owned())?;
+
+        let mint_b = pool
+            .pointer("/mintB/address")
+            .and_then(Value::as_str)
+            .or_else(|| pool.pointer("/mint2/address").and_then(Value::as_str))
+            .ok_or_else(|| "Raydium CPMM inventory result missing second mint address".to_owned())?;
+
+        let intermediate_mint = if mint_a == anchor_mint && mint_b != anchor_mint {
+            mint_b
+        } else if mint_b == anchor_mint && mint_a != anchor_mint {
+            mint_a
+        } else {
+            continue;
+        };
+
+        if candidates
+            .iter()
+            .any(|existing: &RaydiumInventoryCandidate| {
+                existing.intermediate_mint == intermediate_mint
+            })
+        {
+            continue;
+        }
+
+        candidates.push(RaydiumInventoryCandidate {
+            anchor_mint: anchor_mint.to_owned(),
+            intermediate_mint: intermediate_mint.to_owned(),
+            raydium_pool_id: pool_id.to_owned(),
+        });
+
+        if candidates.len() >= MAX_RAYDIUM_CANDIDATES_PER_ANCHOR {
+            break;
+        }
     }
 
-    Ok(None)
+    Ok(candidates)
+}
+
+fn pumpswap_pair_lookup_request(
+    request_id: u64,
+    base_mint: &str,
+    quote_mint: &str,
+) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "getProgramAccounts",
+        "params": [
+            pumpswap::PUMPSWAP_PROGRAM_ID,
+            {
+                "commitment": "processed",
+                "encoding": "base64",
+                "withContext": true,
+                "dataSlice": {
+                    "offset": 0,
+                    "length": 0
+                },
+                "filters": [
+                    {
+                        "memcmp": {
+                            "offset": 0,
+                            "bytes": PUMPSWAP_POOL_DISCRIMINATOR_BASE58
+                        }
+                    },
+                    {
+                        "memcmp": {
+                            "offset": PUMPSWAP_BASE_MINT_OFFSET,
+                            "bytes": base_mint
+                        }
+                    },
+                    {
+                        "memcmp": {
+                            "offset": PUMPSWAP_QUOTE_MINT_OFFSET,
+                            "bytes": quote_mint
+                        }
+                    }
+                ]
+            }
+        ]
+    })
+}
+
+async fn fetch_pumpswap_pair_pool_ids(
+    rpc_client: &Client,
+    base_mint: &str,
+    quote_mint: &str,
+) -> Result<Vec<String>, String> {
+    let request = pumpswap_pair_lookup_request(7, base_mint, quote_mint);
+
+    let response = rpc_client
+        .post(SOLANA_RPC_URL)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| format!("PumpSwap exact-pair RPC request failed: {error}"))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        return Err(format!(
+            "PumpSwap exact-pair RPC returned HTTP status {status}"
+        ));
+    }
+
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("PumpSwap exact-pair RPC returned invalid JSON: {error}"))?;
+
+    if let Some(error) = payload.get("error") {
+        return Err(format!(
+            "PumpSwap exact-pair getProgramAccounts returned an RPC error: {error}"
+        ));
+    }
+
+    pumpswap_pair_pool_ids_from_payload(&payload)
+}
+
+fn pumpswap_pair_pool_ids_from_payload(payload: &Value) -> Result<Vec<String>, String> {
+    let accounts = payload
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("result").and_then(Value::as_array))
+        .ok_or_else(|| {
+            "PumpSwap exact-pair getProgramAccounts response missing account array".to_owned()
+        })?;
+
+    let mut pool_ids = Vec::new();
+
+    for account in accounts {
+        let pool_id = account
+            .get("pubkey")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "PumpSwap exact-pair getProgramAccounts result missing pubkey".to_owned()
+            })?;
+
+        if !pool_ids.iter().any(|existing| existing == pool_id) {
+            pool_ids.push(pool_id.to_owned());
+        }
+    }
+
+    Ok(pool_ids)
 }
 
 async fn fetch_raydium_pool_observation(
@@ -748,6 +1025,81 @@ async fn fetch_raydium_pool_observation(
         .ok_or_else(|| "targeted Raydium pool did not decode as a program observation".to_owned())
 }
 
+async fn fetch_pumpswap_pool_observation(
+    rpc_client: &Client,
+    pool_id: &str,
+) -> Result<pumpswap::PumpSwapAccountObservation, String> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "getAccountInfo",
+        "params": [
+            pool_id,
+            {
+                "commitment": "processed",
+                "encoding": "base64"
+            }
+        ]
+    });
+
+    let response = rpc_client
+        .post(SOLANA_RPC_URL)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| format!("targeted PumpSwap pool RPC request failed: {error}"))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        return Err(format!(
+            "targeted PumpSwap pool RPC returned HTTP status {status}"
+        ));
+    }
+
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("targeted PumpSwap pool RPC returned invalid JSON: {error}"))?;
+
+    if let Some(error) = payload.get("error") {
+        return Err(format!(
+            "targeted PumpSwap getAccountInfo returned an RPC error: {error}"
+        ));
+    }
+
+    let slot = payload
+        .pointer("/result/context/slot")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "targeted PumpSwap getAccountInfo missing context slot".to_owned())?;
+
+    let account = payload
+        .pointer("/result/value")
+        .ok_or_else(|| "targeted PumpSwap getAccountInfo missing account value".to_owned())?;
+
+    if account.is_null() {
+        return Err("targeted PumpSwap pool account does not exist".to_owned());
+    }
+
+    let notification = json!({
+        "method": "programNotification",
+        "params": {
+            "result": {
+                "context": {
+                    "slot": slot
+                },
+                "value": {
+                    "pubkey": pool_id,
+                    "account": account
+                }
+            }
+        }
+    });
+
+    pumpswap::parse_program_notification(&notification)?
+        .ok_or_else(|| "targeted PumpSwap pool did not decode as a program observation".to_owned())
+}
+
 fn raydium_observation_matches_pair(
     observation: &raydium::RaydiumCpmmAccountObservation,
     anchor_mint: &str,
@@ -758,6 +1110,18 @@ fn raydium_observation_matches_pair(
 
     (token_0 == anchor_mint && token_1 == intermediate_mint)
         || (token_1 == anchor_mint && token_0 == intermediate_mint)
+}
+
+fn pumpswap_observation_matches_pair(
+    observation: &pumpswap::PumpSwapAccountObservation,
+    anchor_mint: &str,
+    intermediate_mint: &str,
+) -> bool {
+    let base_mint = observation.pool_state.base_mint.as_str();
+    let quote_mint = observation.pool_state.quote_mint.as_str();
+
+    (base_mint == anchor_mint && quote_mint == intermediate_mint)
+        || (quote_mint == anchor_mint && base_mint == intermediate_mint)
 }
 
 fn normalized_pool_is_eligible(pool: &NormalizedPoolState) -> bool {
@@ -910,43 +1274,145 @@ mod tests {
     use super::*;
 
     #[test]
-    fn locator_selects_only_verified_raydium_cpmm_program() {
+    fn inventory_selects_verified_cpmm_and_derives_counter_mint() {
         let payload = json!({
             "success": true,
             "data": {
                 "data": [
                     {
                         "id": "wrong-program-pool",
-                        "programId": "SomeOtherProgram11111111111111111111111111"
+                        "programId": "SomeOtherProgram11111111111111111111111111",
+                        "mintA": {
+                            "address": WRAPPED_SOL_MINT
+                        },
+                        "mintB": {
+                            "address": "WrongCounterMint111111111111111111111111"
+                        }
                     },
                     {
                         "id": "verified-cpmm-pool",
-                        "programId": raydium::RAYDIUM_CPMM_PROGRAM_ID
+                        "programId": raydium::RAYDIUM_CPMM_PROGRAM_ID,
+                        "mintA": {
+                            "address": WRAPPED_SOL_MINT
+                        },
+                        "mintB": {
+                            "address": "CounterMint1111111111111111111111111111"
+                        }
                     }
                 ]
             }
         });
 
         assert_eq!(
-            raydium_locator_pool_id_from_payload(&payload),
-            Ok(Some("verified-cpmm-pool".to_owned()))
+            raydium_anchor_candidates_from_payload(&payload, WRAPPED_SOL_MINT),
+            Ok(vec![RaydiumInventoryCandidate {
+                anchor_mint: WRAPPED_SOL_MINT.to_owned(),
+                intermediate_mint: "CounterMint1111111111111111111111111111".to_owned(),
+                raydium_pool_id: "verified-cpmm-pool".to_owned(),
+            }])
         );
     }
 
     #[test]
-    fn locator_does_not_accept_unrelated_standard_pool() {
+    fn inventory_accepts_documented_mint1_mint2_shape() {
         let payload = json!({
             "success": true,
             "data": {
                 "data": [
                     {
-                        "id": "wrong-program-pool",
-                        "programId": "SomeOtherProgram11111111111111111111111111"
+                        "id": "verified-cpmm-pool",
+                        "programId": raydium::RAYDIUM_CPMM_PROGRAM_ID,
+                        "mint1": {
+                            "address": "CounterMint1111111111111111111111111111"
+                        },
+                        "mint2": {
+                            "address": WRAPPED_SOL_MINT
+                        }
                     }
                 ]
             }
         });
 
-        assert_eq!(raydium_locator_pool_id_from_payload(&payload), Ok(None));
+        assert_eq!(
+            raydium_anchor_candidates_from_payload(&payload, WRAPPED_SOL_MINT),
+            Ok(vec![RaydiumInventoryCandidate {
+                anchor_mint: WRAPPED_SOL_MINT.to_owned(),
+                intermediate_mint: "CounterMint1111111111111111111111111111".to_owned(),
+                raydium_pool_id: "verified-cpmm-pool".to_owned(),
+            }])
+        );
+    }
+
+    #[test]
+    fn pumpswap_pair_lookup_uses_exact_layout_offsets() {
+        let request = pumpswap_pair_lookup_request(7, "base-mint", "quote-mint");
+
+        assert_eq!(
+            request
+                .pointer("/params/1/filters/0/memcmp/offset")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+
+        assert_eq!(
+            request
+                .pointer("/params/1/filters/0/memcmp/bytes")
+                .and_then(Value::as_str),
+            Some(PUMPSWAP_POOL_DISCRIMINATOR_BASE58)
+        );
+
+        assert_eq!(
+            request
+                .pointer("/params/1/filters/1/memcmp/offset")
+                .and_then(Value::as_u64),
+            Some(PUMPSWAP_BASE_MINT_OFFSET as u64)
+        );
+
+        assert_eq!(
+            request
+                .pointer("/params/1/filters/1/memcmp/bytes")
+                .and_then(Value::as_str),
+            Some("base-mint")
+        );
+
+        assert_eq!(
+            request
+                .pointer("/params/1/filters/2/memcmp/offset")
+                .and_then(Value::as_u64),
+            Some(PUMPSWAP_QUOTE_MINT_OFFSET as u64)
+        );
+
+        assert_eq!(
+            request
+                .pointer("/params/1/filters/2/memcmp/bytes")
+                .and_then(Value::as_str),
+            Some("quote-mint")
+        );
+    }
+
+    #[test]
+    fn pumpswap_pair_lookup_parser_extracts_pool_ids() {
+        let payload = json!({
+            "result": {
+                "context": {
+                    "slot": 123
+                },
+                "value": [
+                    {
+                        "pubkey": "pool-one",
+                        "account": {}
+                    },
+                    {
+                        "pubkey": "pool-two",
+                        "account": {}
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            pumpswap_pair_pool_ids_from_payload(&payload),
+            Ok(vec!["pool-one".to_owned(), "pool-two".to_owned()])
+        );
     }
 }
