@@ -17,6 +17,8 @@ pub struct RaydiumCpmmPoolState {
     pub token_1_vault: String,
     pub token_0_mint: String,
     pub token_1_mint: String,
+    pub token_0_program: String,
+    pub token_1_program: String,
     pub status: u8,
     pub lp_mint_decimals: u8,
     pub mint_0_decimals: u8,
@@ -41,6 +43,7 @@ impl RaydiumCpmmPoolState {
                 "amm_config={} ",
                 "mint0={} mint1={} ",
                 "vault0={} vault1={} ",
+                "token0_program={} token1_program={} ",
                 "status={} ",
                 "lp_decimals={} mint0_decimals={} mint1_decimals={} ",
                 "lp_supply={} ",
@@ -55,6 +58,8 @@ impl RaydiumCpmmPoolState {
             self.token_1_mint,
             self.token_0_vault,
             self.token_1_vault,
+            self.token_0_program,
+            self.token_1_program,
             self.status,
             self.lp_mint_decimals,
             self.mint_0_decimals,
@@ -242,8 +247,8 @@ fn decode_pool_state(data: &[u8]) -> Result<RaydiumCpmmPoolState, String> {
     let _lp_mint = read_pubkey(data, &mut offset)?;
     let token_0_mint = read_pubkey(data, &mut offset)?;
     let token_1_mint = read_pubkey(data, &mut offset)?;
-    let _token_0_program = read_pubkey(data, &mut offset)?;
-    let _token_1_program = read_pubkey(data, &mut offset)?;
+    let token_0_program = read_pubkey(data, &mut offset)?;
+    let token_1_program = read_pubkey(data, &mut offset)?;
     let _observation_key = read_pubkey(data, &mut offset)?;
 
     let _auth_bump = read_u8(data, &mut offset)?;
@@ -293,6 +298,8 @@ fn decode_pool_state(data: &[u8]) -> Result<RaydiumCpmmPoolState, String> {
         token_1_vault,
         token_0_mint,
         token_1_mint,
+        token_0_program,
+        token_1_program,
         status,
         lp_mint_decimals,
         mint_0_decimals,
@@ -401,6 +408,14 @@ mod tests {
         assert_eq!(state.token_1_vault, bs58::encode([4u8; 32]).into_string());
         assert_eq!(state.token_0_mint, bs58::encode([6u8; 32]).into_string());
         assert_eq!(state.token_1_mint, bs58::encode([7u8; 32]).into_string());
+        assert_eq!(
+            state.token_0_program,
+            bs58::encode([8u8; 32]).into_string()
+        );
+        assert_eq!(
+            state.token_1_program,
+            bs58::encode([9u8; 32]).into_string()
+        );
         assert_eq!(state.status, 0);
         assert_eq!(state.lp_mint_decimals, 9);
         assert_eq!(state.mint_0_decimals, 6);
@@ -475,6 +490,14 @@ mod tests {
         assert_eq!(observation.owner, RAYDIUM_CPMM_PROGRAM_ID);
         assert_eq!(observation.decoded_data_len, POOL_STATE_LEN);
         assert_eq!(observation.pool_state.lp_supply, 1_000);
+        assert_eq!(
+            observation.pool_state.token_0_program,
+            bs58::encode([8u8; 32]).into_string()
+        );
+        assert_eq!(
+            observation.pool_state.token_1_program,
+            bs58::encode([9u8; 32]).into_string()
+        );
 
         Ok(())
     }
@@ -503,7 +526,10 @@ mod tests {
         assert_eq!(normalized.token_b.decimals, 6);
         assert_eq!(normalized.trading_state, PoolTradingState::Tradable);
         assert_eq!(normalized.quote_reserves, QuoteReserveState::Unavailable);
-        assert_eq!(normalized.account_update_received_at_unix_ms, 1_500_000_000);
+        assert_eq!(
+            normalized.account_update_received_at_unix_ms,
+            1_500_000_000
+        );
         assert_eq!(normalized.normalized_at_unix_ms, 1_500_000_001);
 
         Ok(())
@@ -559,7 +585,8 @@ mod tests {
 
         data.extend_from_slice(&[
             250, // auth_bump
-            status, 9, // lp_mint_decimals
+            status,
+            9, // lp_mint_decimals
             6, // mint_0_decimals
             6, // mint_1_decimals
         ]);
@@ -579,4 +606,4 @@ mod tests {
 
         data
     }
-}
+    }
