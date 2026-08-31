@@ -921,9 +921,10 @@ mod tests {
             }
         });
 
-        let selected = raydium_locator_pool_id_from_payload(&payload).unwrap();
-
-        assert_eq!(selected.as_deref(), Some("verified-cpmm-pool"));
+        assert_eq!(
+            raydium_locator_pool_id_from_payload(&payload),
+            Ok(Some("verified-cpmm-pool".to_owned()))
+        );
     }
 
     #[test]
@@ -940,8 +941,6 @@ mod tests {
             }
         });
 
-        let selected = raydium_locator_pool_id_from_payload(&payload).unwrap();
-
-        assert!(selected.is_none());
+        assert_eq!(raydium_locator_pool_id_from_payload(&payload), Ok(None));
     }
 }
