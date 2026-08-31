@@ -8,6 +8,9 @@ pub const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQ
 
 const POOL_STATE_LEN: usize = 637;
 const POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
+const TOKEN_ACCOUNT_BASE_LEN: usize = 165;
+const TOKEN_ACCOUNT_MINT_OFFSET: usize = 0;
+const TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
 const SWAP_DISABLED_BIT: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +92,38 @@ pub struct RaydiumCpmmAccountObservation {
     pub pool_state: RaydiumCpmmPoolState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaydiumHydrationSnapshot {
+    pub slot: u64,
+    pub pool_state: RaydiumCpmmPoolState,
+    pub token_0_vault_raw: u64,
+    pub token_1_vault_raw: u64,
+    pub token_0_accrued_fees_raw: u64,
+    pub token_1_accrued_fees_raw: u64,
+    pub token_0_effective_raw: u64,
+    pub token_1_effective_raw: u64,
+}
+
+impl RaydiumHydrationSnapshot {
+    pub fn summary(&self) -> String {
+        format!(
+            concat!(
+                "reserve_slot={} ",
+                "vault0_raw={} vault1_raw={} ",
+                "fees0_raw={} fees1_raw={} ",
+                "effective0_raw={} effective1_raw={}"
+            ),
+            self.slot,
+            self.token_0_vault_raw,
+            self.token_1_vault_raw,
+            self.token_0_accrued_fees_raw,
+            self.token_1_accrued_fees_raw,
+            self.token_0_effective_raw,
+            self.token_1_effective_raw,
+        )
+    }
+}
+
 pub fn program_subscribe_request() -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -107,6 +142,16 @@ pub fn program_subscribe_request() -> Value {
             }
         ]
     })
+}
+
+pub fn hydration_account_pubkeys(
+    observation: &RaydiumCpmmAccountObservation,
+) -> [String; 3] {
+    [
+        observation.pubkey.clone(),
+        observation.pool_state.token_0_vault.clone(),
+        observation.pool_state.token_1_vault.clone(),
+    ]
 }
 
 pub fn parse_program_notification(
@@ -169,6 +214,147 @@ pub fn parse_program_notification(
     }))
 }
 
+pub fn parse_hydration_response(
+    observation: &RaydiumCpmmAccountObservation,
+    payload: &Value,
+) -> Result<RaydiumHydrationSnapshot, String> {
+    if let Some(error) = payload.get("error") {
+        return Err(format!(
+            "Solana getMultipleAccounts returned an RPC error: {error}"
+        ));
+    }
+
+    let slot = payload
+        .pointer("/result/context/slot")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Solana getMultipleAccounts response missing context slot".to_owned())?;
+
+    if slot < observation.slot {
+        return Err(format!(
+            "stale Raydium hydration snapshot: trigger_slot={} reserve_slot={slot}",
+            observation.slot
+        ));
+    }
+
+    let accounts = payload
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Solana getMultipleAccounts response missing account array".to_owned())?;
+
+    if accounts.len() != 3 {
+        return Err(format!(
+            "Raydium hydration expected exactly 3 accounts, got {}",
+            accounts.len()
+        ));
+    }
+
+    if accounts.iter().any(Value::is_null) {
+        return Err("Raydium hydration response contained a missing account".to_owned());
+    }
+
+    let pool_data = decode_rpc_account_data(
+        &accounts[0],
+        RAYDIUM_CPMM_PROGRAM_ID,
+        "Raydium pool snapshot",
+    )?;
+    let pool_state = decode_pool_state(&pool_data)?;
+
+    verify_pool_identity(&observation.pool_state, &pool_state)?;
+
+    let token_0_vault_raw = parse_token_vault_account(
+        &accounts[1],
+        &pool_state.token_0_program,
+        &pool_state.token_0_mint,
+        "token_0_vault",
+    )?;
+
+    let token_1_vault_raw = parse_token_vault_account(
+        &accounts[2],
+        &pool_state.token_1_program,
+        &pool_state.token_1_mint,
+        "token_1_vault",
+    )?;
+
+    let token_0_accrued_fees_raw = checked_accrued_fees(
+        pool_state.protocol_fees_token_0,
+        pool_state.fund_fees_token_0,
+        pool_state.creator_fees_token_0,
+        "token_0",
+    )?;
+
+    let token_1_accrued_fees_raw = checked_accrued_fees(
+        pool_state.protocol_fees_token_1,
+        pool_state.fund_fees_token_1,
+        pool_state.creator_fees_token_1,
+        "token_1",
+    )?;
+
+    let token_0_effective_raw = token_0_vault_raw
+        .checked_sub(token_0_accrued_fees_raw)
+        .ok_or_else(|| {
+            format!(
+                "Raydium token_0 effective reserve underflow: vault={} accrued_fees={}",
+                token_0_vault_raw, token_0_accrued_fees_raw
+            )
+        })?;
+
+    let token_1_effective_raw = token_1_vault_raw
+        .checked_sub(token_1_accrued_fees_raw)
+        .ok_or_else(|| {
+            format!(
+                "Raydium token_1 effective reserve underflow: vault={} accrued_fees={}",
+                token_1_vault_raw, token_1_accrued_fees_raw
+            )
+        })?;
+
+    Ok(RaydiumHydrationSnapshot {
+        slot,
+        pool_state,
+        token_0_vault_raw,
+        token_1_vault_raw,
+        token_0_accrued_fees_raw,
+        token_1_accrued_fees_raw,
+        token_0_effective_raw,
+        token_1_effective_raw,
+    })
+}
+
+pub fn hydrate_normalized_observation(
+    observation: &RaydiumCpmmAccountObservation,
+    snapshot: &RaydiumHydrationSnapshot,
+    account_update_received_at_unix_ms: u64,
+    hydrated_at_unix_ms: u64,
+) -> Result<NormalizedPoolState, String> {
+    if snapshot.slot < observation.slot {
+        return Err(format!(
+            "stale Raydium hydration snapshot: trigger_slot={} reserve_slot={}",
+            observation.slot, snapshot.slot
+        ));
+    }
+
+    verify_pool_identity(&observation.pool_state, &snapshot.pool_state)?;
+
+    let mut normalized = normalize_observation(
+        observation,
+        account_update_received_at_unix_ms,
+        hydrated_at_unix_ms,
+    );
+
+    normalized.trading_state = trading_state(
+        snapshot.pool_state.status,
+        snapshot.pool_state.open_time,
+        hydrated_at_unix_ms,
+    );
+
+    normalized.quote_reserves = QuoteReserveState::Available {
+        token_a_raw: snapshot.token_0_effective_raw,
+        token_b_raw: snapshot.token_1_effective_raw,
+        source_slot: snapshot.slot,
+    };
+
+    Ok(normalized)
+}
+
 pub fn normalize_observation(
     observation: &RaydiumCpmmAccountObservation,
     account_update_received_at_unix_ms: u64,
@@ -200,6 +386,144 @@ pub fn normalize_observation(
         account_update_received_at_unix_ms,
         normalized_at_unix_ms,
     }
+}
+
+fn verify_pool_identity(
+    trigger: &RaydiumCpmmPoolState,
+    snapshot: &RaydiumCpmmPoolState,
+) -> Result<(), String> {
+    if trigger.amm_config != snapshot.amm_config {
+        return Err("Raydium hydration pool amm_config changed".to_owned());
+    }
+
+    if trigger.token_0_vault != snapshot.token_0_vault {
+        return Err("Raydium hydration token_0_vault changed".to_owned());
+    }
+
+    if trigger.token_1_vault != snapshot.token_1_vault {
+        return Err("Raydium hydration token_1_vault changed".to_owned());
+    }
+
+    if trigger.token_0_mint != snapshot.token_0_mint {
+        return Err("Raydium hydration token_0_mint changed".to_owned());
+    }
+
+    if trigger.token_1_mint != snapshot.token_1_mint {
+        return Err("Raydium hydration token_1_mint changed".to_owned());
+    }
+
+    if trigger.token_0_program != snapshot.token_0_program {
+        return Err("Raydium hydration token_0_program changed".to_owned());
+    }
+
+    if trigger.token_1_program != snapshot.token_1_program {
+        return Err("Raydium hydration token_1_program changed".to_owned());
+    }
+
+    if trigger.mint_0_decimals != snapshot.mint_0_decimals {
+        return Err("Raydium hydration mint_0_decimals changed".to_owned());
+    }
+
+    if trigger.mint_1_decimals != snapshot.mint_1_decimals {
+        return Err("Raydium hydration mint_1_decimals changed".to_owned());
+    }
+
+    Ok(())
+}
+
+fn decode_rpc_account_data(
+    account: &Value,
+    expected_owner: &str,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let owner = account
+        .get("owner")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label} missing owner"))?;
+
+    if owner != expected_owner {
+        return Err(format!(
+            "{label} owner mismatch: expected {expected_owner}, got {owner}"
+        ));
+    }
+
+    let executable = account
+        .get("executable")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("{label} missing executable flag"))?;
+
+    if executable {
+        return Err(format!("{label} unexpectedly executable"));
+    }
+
+    let encoded_data = account
+        .pointer("/data/0")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label} missing base64 account data"))?;
+
+    let encoding = account
+        .pointer("/data/1")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label} missing account-data encoding"))?;
+
+    if encoding != "base64" {
+        return Err(format!(
+            "{label} had unexpected account-data encoding: {encoding}"
+        ));
+    }
+
+    BASE64_STANDARD
+        .decode(encoded_data)
+        .map_err(|error| format!("{label} contained invalid base64 data: {error}"))
+}
+
+fn parse_token_vault_account(
+    account: &Value,
+    expected_program: &str,
+    expected_mint: &str,
+    label: &str,
+) -> Result<u64, String> {
+    let data = decode_rpc_account_data(account, expected_program, label)?;
+
+    if data.len() < TOKEN_ACCOUNT_BASE_LEN {
+        return Err(format!(
+            "{label} account data too short: expected at least {TOKEN_ACCOUNT_BASE_LEN}, got {}",
+            data.len()
+        ));
+    }
+
+    let mint_end = TOKEN_ACCOUNT_MINT_OFFSET + 32;
+    let mint_bytes = data
+        .get(TOKEN_ACCOUNT_MINT_OFFSET..mint_end)
+        .ok_or_else(|| format!("{label} missing token mint bytes"))?;
+    let mint = bs58::encode(mint_bytes).into_string();
+
+    if mint != expected_mint {
+        return Err(format!(
+            "{label} mint mismatch: expected {expected_mint}, got {mint}"
+        ));
+    }
+
+    let amount_end = TOKEN_ACCOUNT_AMOUNT_OFFSET + 8;
+    let amount_bytes = data
+        .get(TOKEN_ACCOUNT_AMOUNT_OFFSET..amount_end)
+        .ok_or_else(|| format!("{label} missing token amount bytes"))?;
+    let amount_array = <[u8; 8]>::try_from(amount_bytes)
+        .map_err(|_| format!("{label} token amount had unexpected size"))?;
+
+    Ok(u64::from_le_bytes(amount_array))
+}
+
+fn checked_accrued_fees(
+    protocol_fees: u64,
+    fund_fees: u64,
+    creator_fees: u64,
+    label: &str,
+) -> Result<u64, String> {
+    protocol_fees
+        .checked_add(fund_fees)
+        .and_then(|fees| fees.checked_add(creator_fees))
+        .ok_or_else(|| format!("Raydium {label} accrued-fee overflow"))
 }
 
 fn trading_state(
@@ -549,6 +873,157 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn hydration_account_order_is_pool_then_two_vaults() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+
+        let account_pubkeys = hydration_account_pubkeys(&observation);
+
+        assert_eq!(account_pubkeys[0], observation.pubkey);
+        assert_eq!(
+            account_pubkeys[1],
+            observation.pool_state.token_0_vault
+        );
+        assert_eq!(
+            account_pubkeys[2],
+            observation.pool_state.token_1_vault
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn valid_hydration_snapshot_produces_effective_reserves() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        let snapshot = parse_hydration_response(&observation, &payload)?;
+
+        assert_eq!(snapshot.slot, 123_500);
+        assert_eq!(snapshot.token_0_vault_raw, 10_000);
+        assert_eq!(snapshot.token_1_vault_raw, 20_000);
+        assert_eq!(snapshot.token_0_accrued_fees_raw, 36);
+        assert_eq!(snapshot.token_1_accrued_fees_raw, 39);
+        assert_eq!(snapshot.token_0_effective_raw, 9_964);
+        assert_eq!(snapshot.token_1_effective_raw, 19_961);
+
+        let normalized =
+            hydrate_normalized_observation(&observation, &snapshot, 1_500_000_000, 1_500_000_100)?;
+
+        assert_eq!(normalized.source_slot, 123_456);
+        assert_eq!(
+            normalized.quote_reserves,
+            QuoteReserveState::Available {
+                token_a_raw: 9_964,
+                token_b_raw: 19_961,
+                source_slot: 123_500,
+            }
+        );
+        assert_eq!(normalized.normalized_at_unix_ms, 1_500_000_100);
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_stale_context_slot() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_455,
+            &observation.pool_state.token_0_program,
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_wrong_vault_owner_program() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_500,
+            "WrongTokenProgram111111111111111111111111111",
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_wrong_vault_mint() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            42,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_effective_reserve_underflow() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            6,
+            35,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_missing_account() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let mut payload = fixture_hydration_payload(
+            123_500,
+            &observation.pool_state.token_0_program,
+            6,
+            10_000,
+            &observation.pool_state.token_1_program,
+            7,
+            20_000,
+        );
+
+        payload["result"]["value"][2] = Value::Null;
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
     fn fixture_observation(
         status: u8,
         open_time: u64,
@@ -563,6 +1038,59 @@ mod tests {
             decoded_data_len: POOL_STATE_LEN,
             pool_state,
         })
+    }
+
+    fn fixture_hydration_payload(
+        context_slot: u64,
+        token_0_owner: &str,
+        token_0_mint_seed: u8,
+        token_0_amount: u64,
+        token_1_owner: &str,
+        token_1_mint_seed: u8,
+        token_1_amount: u64,
+    ) -> Value {
+        let pool_data = fixture_pool_state(0, 1_234_567);
+        let token_0_data = fixture_token_account(token_0_mint_seed, token_0_amount);
+        let token_1_data = fixture_token_account(token_1_mint_seed, token_1_amount);
+
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "context": {
+                    "slot": context_slot
+                },
+                "value": [
+                    fixture_rpc_account(RAYDIUM_CPMM_PROGRAM_ID, &pool_data),
+                    fixture_rpc_account(token_0_owner, &token_0_data),
+                    fixture_rpc_account(token_1_owner, &token_1_data)
+                ]
+            }
+        })
+    }
+
+    fn fixture_rpc_account(owner: &str, data: &[u8]) -> Value {
+        json!({
+            "data": [
+                BASE64_STANDARD.encode(data),
+                "base64"
+            ],
+            "executable": false,
+            "lamports": 1,
+            "owner": owner,
+            "rentEpoch": 0,
+            "space": data.len()
+        })
+    }
+
+    fn fixture_token_account(mint_seed: u8, amount: u64) -> Vec<u8> {
+        let mut data = vec![0u8; TOKEN_ACCOUNT_BASE_LEN];
+
+        data[0..32].fill(mint_seed);
+        data[TOKEN_ACCOUNT_AMOUNT_OFFSET..TOKEN_ACCOUNT_AMOUNT_OFFSET + 8]
+            .copy_from_slice(&amount.to_le_bytes());
+
+        data
     }
 
     fn fixture_pool_state(status: u8, open_time: u64) -> Vec<u8> {
