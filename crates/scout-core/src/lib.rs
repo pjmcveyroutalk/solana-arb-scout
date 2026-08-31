@@ -383,4 +383,4 @@ mod tests {
 
         assert!(matches!(result, Err(EconomicsError::InvalidCost)));
     }
-            }
+        }
