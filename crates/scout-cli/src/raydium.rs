@@ -408,14 +408,8 @@ mod tests {
         assert_eq!(state.token_1_vault, bs58::encode([4u8; 32]).into_string());
         assert_eq!(state.token_0_mint, bs58::encode([6u8; 32]).into_string());
         assert_eq!(state.token_1_mint, bs58::encode([7u8; 32]).into_string());
-        assert_eq!(
-            state.token_0_program,
-            bs58::encode([8u8; 32]).into_string()
-        );
-        assert_eq!(
-            state.token_1_program,
-            bs58::encode([9u8; 32]).into_string()
-        );
+        assert_eq!(state.token_0_program, bs58::encode([8u8; 32]).into_string());
+        assert_eq!(state.token_1_program, bs58::encode([9u8; 32]).into_string());
         assert_eq!(state.status, 0);
         assert_eq!(state.lp_mint_decimals, 9);
         assert_eq!(state.mint_0_decimals, 6);
@@ -526,10 +520,7 @@ mod tests {
         assert_eq!(normalized.token_b.decimals, 6);
         assert_eq!(normalized.trading_state, PoolTradingState::Tradable);
         assert_eq!(normalized.quote_reserves, QuoteReserveState::Unavailable);
-        assert_eq!(
-            normalized.account_update_received_at_unix_ms,
-            1_500_000_000
-        );
+        assert_eq!(normalized.account_update_received_at_unix_ms, 1_500_000_000);
         assert_eq!(normalized.normalized_at_unix_ms, 1_500_000_001);
 
         Ok(())
@@ -585,8 +576,7 @@ mod tests {
 
         data.extend_from_slice(&[
             250, // auth_bump
-            status,
-            9, // lp_mint_decimals
+            status, 9, // lp_mint_decimals
             6, // mint_0_decimals
             6, // mint_1_decimals
         ]);
@@ -606,4 +596,4 @@ mod tests {
 
         data
     }
-    }
+}
