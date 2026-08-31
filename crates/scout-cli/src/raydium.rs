@@ -144,9 +144,7 @@ pub fn program_subscribe_request() -> Value {
     })
 }
 
-pub fn hydration_account_pubkeys(
-    observation: &RaydiumCpmmAccountObservation,
-) -> [String; 3] {
+pub fn hydration_account_pubkeys(observation: &RaydiumCpmmAccountObservation) -> [String; 3] {
     [
         observation.pubkey.clone(),
         observation.pool_state.token_0_vault.clone(),
@@ -880,14 +878,8 @@ mod tests {
         let account_pubkeys = hydration_account_pubkeys(&observation);
 
         assert_eq!(account_pubkeys[0], observation.pubkey);
-        assert_eq!(
-            account_pubkeys[1],
-            observation.pool_state.token_0_vault
-        );
-        assert_eq!(
-            account_pubkeys[2],
-            observation.pool_state.token_1_vault
-        );
+        assert_eq!(account_pubkeys[1], observation.pool_state.token_0_vault);
+        assert_eq!(account_pubkeys[2], observation.pool_state.token_1_vault);
 
         Ok(())
     }
