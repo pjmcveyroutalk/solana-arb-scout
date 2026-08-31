@@ -1,0 +1,49 @@
+name: Scout V0 Live Smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/live-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  live-read-only:
+    name: Live Solana Read-Only Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.80
+        run: |
+          rustup toolchain install 1.80.0 --profile minimal
+          rustup default 1.80.0
+
+      - name: Verify read-only capability
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -RniE \
+            --include='*.rs' \
+            'Keypair|seed phrase|private.?key|send_transaction|sendTransaction|send_bundle|sendBundle|tpu.?client|jito.?searcher' \
+            crates/
+          then
+            echo "Forbidden execution/signing capability marker detected."
+            exit 1
+          fi
+
+          echo "Read-only capability verified."
+
+      - name: Run live Solana stream
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 60s cargo run --locked -p scout-cli
