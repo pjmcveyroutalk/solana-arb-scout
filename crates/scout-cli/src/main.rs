@@ -28,9 +28,7 @@ async fn main() {
 }
 
 async fn connect() -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     String,
 > {
     let (socket, _) = connect_async(SOLANA_WSS_URL)
@@ -156,12 +154,7 @@ async fn observe_raydium_cpmm() -> Result<(), String> {
 
 async fn next_json_message<S>(reader: &mut S) -> Result<Value, String>
 where
-    S: StreamExt<
-            Item = Result<
-                Message,
-                tokio_tungstenite::tungstenite::Error,
-            >,
-        > + Unpin,
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     loop {
         let next_message = timeout(OBSERVATION_TIMEOUT, reader.next())
@@ -178,7 +171,6 @@ where
             .into_text()
             .map_err(|error| format!("invalid text frame: {error}"))?;
 
-        return serde_json::from_str(&text)
-            .map_err(|error| format!("invalid JSON: {error}"));
+        return serde_json::from_str(&text).map_err(|error| format!("invalid JSON: {error}"));
     }
 }
