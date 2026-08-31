@@ -87,10 +87,7 @@ async fn main() {
                 }
             };
 
-        println!(
-            "targeted_raydium_state_count={}",
-            targeted_states.len()
-        );
+        println!("targeted_raydium_state_count={}", targeted_states.len());
 
         raydium_states.extend(targeted_states);
     }
@@ -486,22 +483,19 @@ async fn discover_targeted_raydium_overlap(
             let account_update_received_at_unix_ms = unix_time_ms_now()?;
             let hydration_started_at_unix_ms = unix_time_ms_now()?;
 
-            let hydration_payload =
-                match fetch_raydium_hydration(rpc_client, &observation).await {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        println!(
-                            "targeted_onchain_candidate_rejected: pool={} reason={}",
-                            pool_id, error
-                        );
-                        continue;
-                    }
-                };
+            let hydration_payload = match fetch_raydium_hydration(rpc_client, &observation).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!(
+                        "targeted_onchain_candidate_rejected: pool={} reason={}",
+                        pool_id, error
+                    );
+                    continue;
+                }
+            };
 
-            let snapshot = match raydium::parse_hydration_response(
-                &observation,
-                &hydration_payload,
-            ) {
+            let snapshot = match raydium::parse_hydration_response(&observation, &hydration_payload)
+            {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     println!(
@@ -577,8 +571,7 @@ fn collect_route_discovery_pairs(
         };
 
         if pairs.iter().any(|existing: &RouteDiscoveryPair| {
-            existing.anchor_mint == anchor_mint
-                && existing.intermediate_mint == intermediate_mint
+            existing.anchor_mint == anchor_mint && existing.intermediate_mint == intermediate_mint
         }) {
             continue;
         }
@@ -630,9 +623,7 @@ async fn fetch_raydium_locator_pool_id(
     let status = response.status();
 
     if !status.is_success() {
-        return Err(format!(
-            "Raydium locator returned HTTP status {status}"
-        ));
+        return Err(format!("Raydium locator returned HTTP status {status}"));
     }
 
     let payload = response
@@ -795,9 +786,7 @@ fn validate_registry_and_routes(
     println!("registry_current_pools={}", registry.current_pool_count());
 
     if active_mints.is_empty() {
-        return Err(
-            "live state produced no mint represented by two eligible venues".to_owned(),
-        );
+        return Err("live state produced no mint represented by two eligible venues".to_owned());
     }
 
     for active_mint in &active_mints {
