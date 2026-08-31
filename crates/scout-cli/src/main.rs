@@ -412,7 +412,7 @@ async fn discover_targeted_pumpswap_overlap(
         return Ok(Vec::new());
     }
 
-    let mut successful_lookup_calls = 0usize;
+    let mut successful_rpc_responses = 0usize;
 
     for candidate in candidates {
         let requests =
@@ -420,10 +420,7 @@ async fn discover_targeted_pumpswap_overlap(
 
         for request in requests {
             let payload = match fetch_pumpswap_pair_lookup(rpc_client, &request).await {
-                Ok(payload) => {
-                    successful_lookup_calls += 1;
-                    payload
-                }
+                Ok(payload) => payload,
                 Err(error) => {
                     println!(
                         "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} raydium_pool={} reason={}",
@@ -437,7 +434,10 @@ async fn discover_targeted_pumpswap_overlap(
             };
 
             let observations = match pumpswap::parse_pair_lookup_response(&payload) {
-                Ok(observations) => observations,
+                Ok(observations) => {
+                    successful_rpc_responses += 1;
+                    observations
+                }
                 Err(error) => {
                     println!(
                         "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} raydium_pool={} reason={}",
@@ -546,9 +546,9 @@ async fn discover_targeted_pumpswap_overlap(
         );
     }
 
-    if successful_lookup_calls == 0 {
+    if successful_rpc_responses == 0 {
         return Err(
-            "all bounded PumpSwap pair lookup requests failed before a response was received"
+            "all bounded PumpSwap pair lookup requests failed before a valid RPC response was parsed"
                 .to_owned(),
         );
     }
@@ -556,10 +556,7 @@ async fn discover_targeted_pumpswap_overlap(
     Ok(Vec::new())
 }
 
-async fn fetch_pumpswap_pair_lookup(
-    rpc_client: &Client,
-    request: &Value,
-) -> Result<Value, String> {
+async fn fetch_pumpswap_pair_lookup(rpc_client: &Client, request: &Value) -> Result<Value, String> {
     let response = rpc_client
         .post(SOLANA_RPC_URL)
         .json(request)
@@ -587,6 +584,10 @@ fn collect_route_discovery_pairs(
     let mut pairs = Vec::new();
 
     for pool in raydium_states {
+        if !normalized_pool_is_eligible(pool) {
+            continue;
+        }
+
         let Some((anchor_mint, intermediate_mint)) = route_pair_from_pool(pool) else {
             continue;
         };
