@@ -1,15 +1,18 @@
 mod raydium;
 
 use futures_util::{SinkExt, StreamExt};
+use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const SOLANA_WSS_URL: &str = "wss://api.mainnet-beta.solana.com";
+const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const MAX_SLOT_OBSERVATIONS: usize = 5;
-const MAX_RAYDIUM_OBSERVATIONS: usize = 1;
+const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() {
@@ -26,7 +29,15 @@ async fn main() {
         std::process::exit(1);
     }
 
-    if let Err(error) = observe_raydium_cpmm().await {
+    let rpc_client = match build_rpc_client() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("Solana HTTP RPC client initialization failed: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(error) = observe_raydium_cpmm(&rpc_client).await {
         eprintln!("Raydium CPMM observation failed: {error}");
         std::process::exit(1);
     }
@@ -36,6 +47,13 @@ fn install_crypto_provider() -> Result<(), String> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| "could not install ring as the process TLS provider".to_owned())
+}
+
+fn build_rpc_client() -> Result<Client, String> {
+    Client::builder()
+        .timeout(RPC_TIMEOUT)
+        .build()
+        .map_err(|error| format!("could not build HTTP RPC client: {error}"))
 }
 
 async fn connect() -> Result<
@@ -108,12 +126,12 @@ async fn observe_slots() -> Result<(), String> {
     Ok(())
 }
 
-async fn observe_raydium_cpmm() -> Result<(), String> {
+async fn observe_raydium_cpmm(rpc_client: &Client) -> Result<(), String> {
     println!("DEX adapter: Raydium CPMM");
     println!("Program: {}", raydium::RAYDIUM_CPMM_PROGRAM_ID);
+    println!("Hydration boundary: Solana mainnet read-only HTTP RPC");
 
     let socket = connect().await?;
-
     let (mut writer, mut reader) = socket.split();
 
     writer
@@ -145,19 +163,29 @@ async fn observe_raydium_cpmm() -> Result<(), String> {
             continue;
         };
 
-        let normalized_at_unix_ms = unix_time_ms_now()?;
+        let hydration_started_at_unix_ms = unix_time_ms_now()?;
+        let hydration_payload = fetch_raydium_hydration(rpc_client, &observation).await?;
+        let snapshot = raydium::parse_hydration_response(&observation, &hydration_payload)?;
+        let hydrated_at_unix_ms = unix_time_ms_now()?;
 
-        let normalized = raydium::normalize_observation(
+        let normalized = raydium::hydrate_normalized_observation(
             &observation,
+            &snapshot,
             account_update_received_at_unix_ms,
-            normalized_at_unix_ms,
-        );
+            hydrated_at_unix_ms,
+        )?;
 
         observations += 1;
 
+        let hydration_duration_ms =
+            hydrated_at_unix_ms.saturating_sub(hydration_started_at_unix_ms);
+        let total_observation_duration_ms =
+            hydrated_at_unix_ms.saturating_sub(account_update_received_at_unix_ms);
+
         println!(
-            "raydium[{observations}/{MAX_RAYDIUM_OBSERVATIONS}] slot={} pubkey={} owner={} encoded_data_len={} decoded_data_len={}",
+            "raydium[{observations}/{MAX_RAYDIUM_OBSERVATIONS}] slot={} reserve_slot={} pubkey={} owner={} encoded_data_len={} decoded_data_len={}",
             observation.slot,
+            snapshot.slot,
             observation.pubkey,
             observation.owner,
             observation.encoded_data_len,
@@ -165,6 +193,15 @@ async fn observe_raydium_cpmm() -> Result<(), String> {
         );
 
         println!("decoded_pool: {}", observation.pool_state.summary());
+        println!("hydrated_reserves: {}", snapshot.summary());
+        println!(
+            "timing: received_at_ms={} hydration_started_at_ms={} hydrated_at_ms={} hydration_duration_ms={} total_observation_duration_ms={}",
+            account_update_received_at_unix_ms,
+            hydration_started_at_unix_ms,
+            hydrated_at_unix_ms,
+            hydration_duration_ms,
+            total_observation_duration_ms,
+        );
         println!("normalized_pool: {}", normalized.summary());
     }
 
@@ -174,8 +211,51 @@ async fn observe_raydium_cpmm() -> Result<(), String> {
 
     println!("READ-ONLY RAYDIUM CPMM ACCOUNT DECODER PASS");
     println!("READ-ONLY NORMALIZED POOL STATE PASS");
+    println!("READ-ONLY RAYDIUM VAULT HYDRATION PASS");
+    println!("READ-ONLY RUNG 6 OBSERVATION COLLECTION PASS");
 
     Ok(())
+}
+
+async fn fetch_raydium_hydration(
+    rpc_client: &Client,
+    observation: &raydium::RaydiumCpmmAccountObservation,
+) -> Result<Value, String> {
+    let account_pubkeys = raydium::hydration_account_pubkeys(observation);
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "getMultipleAccounts",
+        "params": [
+            account_pubkeys,
+            {
+                "commitment": "processed",
+                "encoding": "base64",
+                "minContextSlot": observation.slot
+            }
+        ]
+    });
+
+    let response = rpc_client
+        .post(SOLANA_RPC_URL)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| format!("Raydium hydration RPC request failed: {error}"))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        return Err(format!(
+            "Raydium hydration RPC returned HTTP status {status}"
+        ));
+    }
+
+    response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Raydium hydration RPC returned invalid JSON: {error}"))
 }
 
 fn unix_time_ms_now() -> Result<u64, String> {
