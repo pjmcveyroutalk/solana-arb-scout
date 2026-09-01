@@ -1,4 +1,3 @@
-mod costs;
 mod discovery;
 pub mod economics;
 mod pumpswap;
@@ -8,16 +7,10 @@ mod registry;
 mod route;
 mod sizing;
 
-use costs::{
-    economics_cost_model, localized_priority_fee_request,
-    parse_localized_priority_fee_response, route_contention_footprint,
-    DeterministicVenueContentionFootprint, PriorityFeeObservation, PriorityObservationState,
-};
 use discovery::{
     parse_raydium_anchor_lookup_response, raydium_anchor_lookup_requests,
     route_candidate_from_observation,
 };
-use economics::{evaluate_expected_net_for_mode, FundingMode};
 use futures_util::{SinkExt, StreamExt};
 use quote::{quote_two_leg_exact_input, VenueQuoteContext};
 use registry::ActiveMintRegistry;
@@ -160,14 +153,12 @@ async fn main() -> Result<(), String> {
     let sol_usd_price = fetch_sol_usd_price(&rpc_client).await?;
 
     validate_registry_routes_and_sizes(
-        &rpc_client,
         raydium_states,
         pumpswap_states,
         &raydium_quote_contexts,
         &pumpswap_quote_contexts,
         &sol_usd_price,
     )
-    .await
 }
 
 async fn observe_slots<S>(reader: &mut S) -> Result<(), String>
@@ -578,4 +569,25 @@ async fn discover_deterministic_cross_venue_overlap(
                     rpc_client,
                     &pumpswap_request,
                     &label,
-      
+                )
+                .await
+                {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            discovery_candidate.anchor_mint,
+                            discovery_candidate.intermediate_mint
+                        );
+                        continue;
+                    }
+                };
+
+                let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
+                    &pumpswap_payload,
+                ) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        println!(
+                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            discovery_can
