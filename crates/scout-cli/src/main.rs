@@ -1,31 +1,41 @@
+mod discovery;
 mod pumpswap;
 mod quote;
 mod raydium;
 mod registry;
 mod route;
+mod sizing;
 
+use discovery::{
+    parse_raydium_anchor_lookup_response, raydium_anchor_lookup_requests,
+    route_candidate_from_observation,
+};
 use futures_util::{SinkExt, StreamExt};
-use quote::{one_whole_anchor_input_raw, quote_two_leg_exact_input, VenueQuoteContext};
+use quote::{quote_two_leg_exact_input, VenueQuoteContext};
 use registry::ActiveMintRegistry;
 use reqwest::Client;
 use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
-use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use sizing::{
+    parse_sol_usd_price, sol_usd_price_request, usd_dollars_to_anchor_raw, SolUsdPrice,
+    USD_SIZE_GRID,
+};
+use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{timeout, Duration};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
+};
 
-const SOLANA_WSS_URL: &str = "wss://api.mainnet-beta.solana.com";
 const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-
+const SOLANA_WS_URL: &str = "wss://api.mainnet-beta.solana.com";
+const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
 const MAX_TARGETED_ROUTE_LOOKUPS: usize = 15;
-
-const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
-const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RouteDiscoveryPair {
@@ -35,135 +45,113 @@ struct RouteDiscoveryPair {
 }
 
 #[tokio::main]
-async fn main() {
-    println!("ARB Scout V0 — READ ONLY");
-    println!("No signing. No wallet. No transaction execution.");
+async fn main() -> Result<(), String> {
+    let rpc_client = Client::new();
 
-    if let Err(error) = install_crypto_provider() {
-        eprintln!("TLS crypto provider initialization failed: {error}");
-        std::process::exit(1);
-    }
+    let request = SOLANA_WS_URL
+        .into_client_request()
+        .map_err(|error| format!("invalid Solana WebSocket request: {error}"))?;
 
-    if let Err(error) = observe_slots().await {
-        eprintln!("Live slot observation failed: {error}");
-        std::process::exit(1);
-    }
+    let (websocket, _) = connect_async(request)
+        .await
+        .map_err(|error| format!("could not connect to Solana WebSocket: {error}"))?;
 
-    let rpc_client = match build_rpc_client() {
-        Ok(client) => client,
-        Err(error) => {
-            eprintln!("Solana HTTP RPC client initialization failed: {error}");
-            std::process::exit(1);
-        }
-    };
+    let (mut writer, mut reader) = websocket.split();
 
-    let (raydium_states, raydium_quote_contexts) = match observe_raydium_cpmm(&rpc_client).await {
-        Ok(result) => result,
-        Err(error) => {
-            eprintln!("Raydium CPMM observation failed: {error}");
-            std::process::exit(1);
-        }
-    };
+    writer
+        .send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "slotSubscribe"
+            })
+            .to_string(),
+        ))
+        .await
+        .map_err(|error| format!("could not subscribe to Solana slots: {error}"))?;
+
+    wait_for_subscription_confirmation(&mut reader, 1, "slot")?;
+
+    println!("Scout V0 live read-only Solana stream");
+    println!("No signing, transaction construction, submission, or execution capability.");
+
+    observe_slots(&mut reader).await?;
+
+    writer
+        .send(Message::Text(raydium::program_subscribe_request().to_string()))
+        .await
+        .map_err(|error| format!("could not subscribe to Raydium CPMM: {error}"))?;
+
+    wait_for_subscription_confirmation(&mut reader, 2, "Raydium CPMM")?;
+
+    let (mut raydium_states, mut raydium_quote_contexts) =
+        observe_raydium(&rpc_client, &mut reader).await?;
+
+    writer
+        .send(Message::Text(pumpswap::program_subscribe_request().to_string()))
+        .await
+        .map_err(|error| format!("could not subscribe to PumpSwap: {error}"))?;
+
+    wait_for_subscription_confirmation(&mut reader, 4, "PumpSwap")?;
 
     let (mut pumpswap_states, mut pumpswap_quote_contexts) =
-        match observe_pumpswap(&rpc_client).await {
-            Ok(result) => result,
-            Err(error) => {
-                eprintln!("PumpSwap observation failed: {error}");
-                std::process::exit(1);
-            }
-        };
+        observe_pumpswap(&rpc_client, &mut reader).await?;
 
-    if !has_current_route(&raydium_states, &pumpswap_states) {
-        println!(
-            "\nREAD-ONLY RUNG 9 DISCOVERY: bounded live sample contains no same-pair cross-venue route"
+    let initial_routes = {
+        let mut registry = ActiveMintRegistry::new();
+        for state in raydium_states
+            .iter()
+            .cloned()
+            .chain(pumpswap_states.iter().cloned())
+        {
+            registry.upsert(state);
+        }
+        generate_two_leg_routes(&registry.current_eligible_pools())
+    };
+
+    if initial_routes.is_empty() {
+        println!("\nRung 9 deterministic anchor-filtered route reacquisition");
+
+        let (
+            discovered_raydium_states,
+            discovered_raydium_contexts,
+            discovered_pumpswap_states,
+            discovered_pumpswap_contexts,
+        ) = discover_deterministic_cross_venue_overlap(&rpc_client).await?;
+
+        merge_normalized_states(&mut raydium_states, discovered_raydium_states);
+        merge_quote_contexts(
+            &mut raydium_quote_contexts,
+            discovered_raydium_contexts,
         );
-
-        let (targeted_states, targeted_quote_contexts) =
-            match discover_targeted_pumpswap_overlap(&rpc_client, &raydium_states).await {
-                Ok(result) => result,
-                Err(error) => {
-                    eprintln!("Rung 9 targeted discovery failed: {error}");
-                    std::process::exit(1);
-                }
-            };
-
-        println!("targeted_pumpswap_state_count={}", targeted_states.len());
-
-        pumpswap_states.extend(targeted_states);
-        pumpswap_quote_contexts.extend(targeted_quote_contexts);
+        merge_normalized_states(&mut pumpswap_states, discovered_pumpswap_states);
+        merge_quote_contexts(
+            &mut pumpswap_quote_contexts,
+            discovered_pumpswap_contexts,
+        );
     }
 
-    if let Err(error) = validate_registry_and_routes(
+    let sol_usd_price = fetch_sol_usd_price(&rpc_client).await?;
+
+    validate_registry_routes_and_sizes(
         raydium_states,
         pumpswap_states,
         &raydium_quote_contexts,
         &pumpswap_quote_contexts,
-    ) {
-        eprintln!("Registry/route validation failed: {error}");
-        std::process::exit(1);
-    }
+        &sol_usd_price,
+    )
 }
 
-fn install_crypto_provider() -> Result<(), String> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| "could not install ring as the process TLS provider".to_owned())
-}
+async fn observe_slots<S>(reader: &mut S) -> Result<(), String>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    println!("\nTransport: live slots");
 
-fn build_rpc_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(RPC_TIMEOUT)
-        .build()
-        .map_err(|error| format!("could not build HTTP RPC client: {error}"))
-}
+    let mut observed = 0usize;
 
-async fn connect() -> Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-    String,
-> {
-    let (socket, _) = connect_async(SOLANA_WSS_URL)
-        .await
-        .map_err(|error| format!("WebSocket connection error: {error}"))?;
-
-    Ok(socket)
-}
-
-async fn observe_slots() -> Result<(), String> {
-    println!("Live boundary: Solana mainnet slotSubscribe\n");
-
-    let socket = connect().await?;
-
-    println!("Connected: {SOLANA_WSS_URL}");
-
-    let (mut writer, mut reader) = socket.split();
-
-    let subscription = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "slotSubscribe"
-    });
-
-    writer
-        .send(Message::Text(subscription.to_string()))
-        .await
-        .map_err(|error| format!("subscription send error: {error}"))?;
-
-    let mut subscription_confirmed = false;
-    let mut observed_slots = 0usize;
-
-    while observed_slots < MAX_SLOT_OBSERVATIONS {
-        let payload = next_json_message(&mut reader).await?;
-
-        if payload.get("id") == Some(&Value::from(1)) {
-            if let Some(subscription_id) = payload.get("result").and_then(Value::as_u64) {
-                println!("Subscription confirmed: {subscription_id}");
-                subscription_confirmed = true;
-                continue;
-            }
-
-            return Err(format!("subscription rejected: {payload}"));
-        }
+    while observed < MAX_SLOT_OBSERVATIONS {
+        let payload = next_json_message(reader).await?;
 
         if payload.get("method").and_then(Value::as_str) != Some("slotNotification") {
             continue;
@@ -172,497 +160,489 @@ async fn observe_slots() -> Result<(), String> {
         let slot = payload
             .pointer("/params/result/slot")
             .and_then(Value::as_u64)
-            .ok_or_else(|| format!("slot notification missing slot: {payload}"))?;
+            .ok_or_else(|| "slot notification missing slot".to_owned())?;
 
-        observed_slots += 1;
-        println!("slot[{observed_slots}/{MAX_SLOT_OBSERVATIONS}] = {slot}");
+        observed += 1;
+        println!("slot_observation: slot={slot}");
     }
 
-    if !subscription_confirmed {
-        return Err("slot subscription was never confirmed".to_owned());
-    }
-
-    println!("\nREAD-ONLY LIVE STREAM PASS");
-    println!("Observed {observed_slots} Solana mainnet slot updates.\n");
-
+    println!("READ-ONLY LIVE SLOT PASS");
     Ok(())
 }
 
-async fn observe_raydium_cpmm(
+async fn observe_raydium<S>(
     rpc_client: &Client,
+    reader: &mut S,
 ) -> Result<
     (
         Vec<NormalizedPoolState>,
         BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
     ),
     String,
-> {
-    println!("DEX adapter: Raydium CPMM");
-    println!("Program: {}", raydium::RAYDIUM_CPMM_PROGRAM_ID);
-    println!("Hydration boundary: Solana mainnet read-only HTTP RPC");
+>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    println!("\nVenue adapter: Raydium CPMM");
 
-    let socket = connect().await?;
-    let (mut writer, mut reader) = socket.split();
-
-    writer
-        .send(Message::Text(
-            raydium::program_subscribe_request().to_string(),
-        ))
-        .await
-        .map_err(|error| format!("Raydium subscription send error: {error}"))?;
-
-    let mut subscription_confirmed = false;
-    let mut observations = 0usize;
-    let mut normalized_states = Vec::with_capacity(MAX_RAYDIUM_OBSERVATIONS);
+    let mut states = Vec::new();
     let mut quote_contexts = BTreeMap::new();
+    let mut observed = 0usize;
 
-    while observations < MAX_RAYDIUM_OBSERVATIONS {
-        let payload = next_json_message(&mut reader).await?;
+    while observed < MAX_RAYDIUM_OBSERVATIONS {
+        let payload = next_json_message(reader).await?;
 
-        if payload.get("id") == Some(&Value::from(2)) {
-            if let Some(subscription_id) = payload.get("result").and_then(Value::as_u64) {
-                println!("Raydium subscription confirmed: {subscription_id}");
-                subscription_confirmed = true;
+        let observation = match raydium::parse_program_notification(&payload) {
+            Ok(Some(observation)) => observation,
+            Ok(None) => continue,
+            Err(error) => {
+                println!("raydium_observation_rejected: {error}");
                 continue;
             }
-
-            return Err(format!("Raydium subscription rejected: {payload}"));
-        }
-
-        let account_update_received_at_unix_ms = unix_time_ms_now()?;
-
-        let Some(observation) = raydium::parse_program_notification(&payload)? else {
-            continue;
         };
 
-        let hydration_started_at_unix_ms = unix_time_ms_now()?;
-        let hydration_payload = fetch_raydium_hydration(rpc_client, &observation).await?;
-        let snapshot = raydium::parse_hydration_response(&observation, &hydration_payload)?;
-        let hydrated_at_unix_ms = unix_time_ms_now()?;
-
-        let normalized = raydium::hydrate_normalized_observation(
-            &observation,
-            &snapshot,
-            account_update_received_at_unix_ms,
-            hydrated_at_unix_ms,
-        )?;
-
-        observations += 1;
-
-        let hydration_duration_ms =
-            hydrated_at_unix_ms.saturating_sub(hydration_started_at_unix_ms);
-        let total_observation_duration_ms =
-            hydrated_at_unix_ms.saturating_sub(account_update_received_at_unix_ms);
+        observed += 1;
 
         println!(
-            "raydium[{observations}/{MAX_RAYDIUM_OBSERVATIONS}] slot={} reserve_slot={} pubkey={} owner={} encoded_data_len={} decoded_data_len={}",
-            observation.slot,
-            snapshot.slot,
+            "raydium_observation: pool={} slot={} {}",
             observation.pubkey,
-            observation.owner,
-            observation.encoded_data_len,
-            observation.decoded_data_len,
+            observation.slot,
+            observation.pool_state.summary()
         );
 
-        println!("decoded_pool: {}", observation.pool_state.summary());
-        println!("hydrated_reserves: {}", snapshot.summary());
-        println!(
-            "timing: received_at_ms={} hydration_started_at_ms={} hydrated_at_ms={} hydration_duration_ms={} total_observation_duration_ms={}",
-            account_update_received_at_unix_ms,
-            hydration_started_at_unix_ms,
-            hydrated_at_unix_ms,
-            hydration_duration_ms,
-            total_observation_duration_ms,
-        );
-        println!("normalized_pool: {}", normalized.summary());
+        match hydrate_raydium_observation(rpc_client, &observation).await {
+            Ok((normalized, snapshot)) => {
+                println!("raydium_hydration: {}", snapshot.summary());
+                println!("raydium_normalized_pool: {}", normalized.summary());
 
-        quote_contexts.insert(normalized.pool_id.clone(), snapshot);
-        normalized_states.push(normalized);
+                if normalized_pool_is_eligible(&normalized) {
+                    quote_contexts.insert(normalized.pool_id.clone(), snapshot);
+                    states.push(normalized);
+                }
+            }
+            Err(error) => {
+                println!(
+                    "raydium_hydration_rejected: pool={} reason={error}",
+                    observation.pubkey
+                );
+            }
+        }
     }
 
-    if !subscription_confirmed {
-        return Err("Raydium CPMM subscription was never confirmed".to_owned());
-    }
+    println!("raydium_live_observation_count={observed}");
+    println!("raydium_live_eligible_count={}", states.len());
+    println!("READ-ONLY RAYDIUM CPMM OBSERVATION PASS");
 
-    println!("READ-ONLY RAYDIUM CPMM ACCOUNT DECODER PASS");
-    println!("READ-ONLY NORMALIZED POOL STATE PASS");
-    println!("READ-ONLY RAYDIUM VAULT HYDRATION PASS");
-    println!("READ-ONLY RUNG 6 OBSERVATION COLLECTION PASS");
-
-    Ok((normalized_states, quote_contexts))
+    Ok((states, quote_contexts))
 }
 
-async fn fetch_raydium_hydration(
+async fn observe_pumpswap<S>(
     rpc_client: &Client,
-    observation: &raydium::RaydiumCpmmAccountObservation,
-) -> Result<Value, String> {
-    let account_pubkeys = raydium::hydration_account_pubkeys(observation);
-
-    fetch_hydration(rpc_client, 3, account_pubkeys, observation.slot, "Raydium").await
-}
-
-async fn observe_pumpswap(
-    rpc_client: &Client,
+    reader: &mut S,
 ) -> Result<
     (
         Vec<NormalizedPoolState>,
         BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
     ),
     String,
-> {
-    println!("\nDEX adapter: PumpSwap");
-    println!("Program: {}", pumpswap::PUMPSWAP_PROGRAM_ID);
-    println!("Hydration boundary: Solana mainnet read-only HTTP RPC");
+>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    println!("\nVenue adapter: PumpSwap");
 
-    let socket = connect().await?;
-    let (mut writer, mut reader) = socket.split();
-
-    writer
-        .send(Message::Text(
-            pumpswap::program_subscribe_request().to_string(),
-        ))
-        .await
-        .map_err(|error| format!("PumpSwap subscription send error: {error}"))?;
-
-    let mut subscription_confirmed = false;
-    let mut observations = 0usize;
-    let mut normalized_states = Vec::with_capacity(MAX_PUMPSWAP_OBSERVATIONS);
+    let mut states = Vec::new();
     let mut quote_contexts = BTreeMap::new();
+    let mut observed = 0usize;
 
-    while observations < MAX_PUMPSWAP_OBSERVATIONS {
-        let payload = next_json_message(&mut reader).await?;
+    while observed < MAX_PUMPSWAP_OBSERVATIONS {
+        let payload = next_json_message(reader).await?;
 
-        if payload.get("id") == Some(&Value::from(4)) {
-            if let Some(subscription_id) = payload.get("result").and_then(Value::as_u64) {
-                println!("PumpSwap subscription confirmed: {subscription_id}");
-                subscription_confirmed = true;
+        let observation = match pumpswap::parse_program_notification(&payload) {
+            Ok(Some(observation)) => observation,
+            Ok(None) => continue,
+            Err(error) => {
+                println!("pumpswap_observation_rejected: {error}");
                 continue;
             }
-
-            return Err(format!("PumpSwap subscription rejected: {payload}"));
-        }
-
-        let account_update_received_at_unix_ms = unix_time_ms_now()?;
-
-        let Some(observation) = pumpswap::parse_program_notification(&payload)? else {
-            continue;
         };
 
-        let hydration_started_at_unix_ms = unix_time_ms_now()?;
-        let hydration_payload = fetch_pumpswap_hydration(rpc_client, &observation).await?;
-        let snapshot = pumpswap::parse_hydration_response(&observation, &hydration_payload)?;
-        let hydrated_at_unix_ms = unix_time_ms_now()?;
-
-        let normalized = pumpswap::hydrate_normalized_observation(
-            &observation,
-            &snapshot,
-            account_update_received_at_unix_ms,
-            hydrated_at_unix_ms,
-        )?;
-
-        observations += 1;
-
-        let hydration_duration_ms =
-            hydrated_at_unix_ms.saturating_sub(hydration_started_at_unix_ms);
-        let total_observation_duration_ms =
-            hydrated_at_unix_ms.saturating_sub(account_update_received_at_unix_ms);
+        observed += 1;
 
         println!(
-            "pumpswap[{observations}/{MAX_PUMPSWAP_OBSERVATIONS}] slot={} reserve_slot={} pubkey={} owner={} encoded_data_len={} decoded_data_len={}",
-            observation.slot,
-            snapshot.slot,
+            "pumpswap_observation: pool={} slot={} {}",
             observation.pubkey,
-            observation.owner,
-            observation.encoded_data_len,
-            observation.decoded_data_len,
+            observation.slot,
+            observation.pool_state.summary()
         );
 
-        println!("decoded_pool: {}", observation.pool_state.summary());
-        println!("hydrated_reserves: {}", snapshot.summary());
-        println!(
-            "timing: received_at_ms={} hydration_started_at_ms={} hydrated_at_ms={} hydration_duration_ms={} total_observation_duration_ms={}",
-            account_update_received_at_unix_ms,
-            hydration_started_at_unix_ms,
-            hydrated_at_unix_ms,
-            hydration_duration_ms,
-            total_observation_duration_ms,
-        );
-        println!("normalized_pool: {}", normalized.summary());
+        match hydrate_pumpswap_observation(rpc_client, &observation).await {
+            Ok((normalized, snapshot)) => {
+                println!("pumpswap_hydration: {}", snapshot.summary());
+                println!("pumpswap_normalized_pool: {}", normalized.summary());
 
-        quote_contexts.insert(normalized.pool_id.clone(), snapshot);
-        normalized_states.push(normalized);
+                if normalized_pool_is_eligible(&normalized) {
+                    quote_contexts.insert(normalized.pool_id.clone(), snapshot);
+                    states.push(normalized);
+                }
+            }
+            Err(error) => {
+                println!(
+                    "pumpswap_hydration_rejected: pool={} reason={error}",
+                    observation.pubkey
+                );
+            }
+        }
     }
 
-    if !subscription_confirmed {
-        return Err("PumpSwap subscription was never confirmed".to_owned());
-    }
+    println!("pumpswap_live_observation_count={observed}");
+    println!("pumpswap_live_eligible_count={}", states.len());
+    println!("READ-ONLY PUMPSWAP OBSERVATION PASS");
 
-    println!("READ-ONLY PUMPSWAP ACCOUNT DECODER PASS");
-    println!("READ-ONLY PUMPSWAP SNAPSHOT HYDRATION PASS");
-    println!("READ-ONLY SECOND VENUE NORMALIZATION PASS");
-    println!("READ-ONLY RUNG 7 OBSERVATION COLLECTION PASS");
-
-    Ok((normalized_states, quote_contexts))
+    Ok((states, quote_contexts))
 }
 
-async fn fetch_pumpswap_hydration(
+async fn discover_deterministic_cross_venue_overlap(
     rpc_client: &Client,
-    observation: &pumpswap::PumpSwapAccountObservation,
-) -> Result<Value, String> {
-    let account_pubkeys = pumpswap::hydration_account_pubkeys(observation);
-
-    fetch_hydration(rpc_client, 5, account_pubkeys, observation.slot, "PumpSwap").await
-}
-
-fn has_current_route(
-    raydium_states: &[NormalizedPoolState],
-    pumpswap_states: &[NormalizedPoolState],
-) -> bool {
-    let mut registry = ActiveMintRegistry::new();
-
-    for state in raydium_states.iter().chain(pumpswap_states).cloned() {
-        registry.upsert(state);
-    }
-
-    !generate_two_leg_routes(&registry.current_eligible_pools()).is_empty()
-}
-
-async fn discover_targeted_pumpswap_overlap(
-    rpc_client: &Client,
-    raydium_states: &[NormalizedPoolState],
 ) -> Result<
     (
+        Vec<NormalizedPoolState>,
+        BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
         Vec<NormalizedPoolState>,
         BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
     ),
     String,
 > {
-    println!("\nRung 9 targeted PumpSwap discovery");
     println!("Solana on-chain state remains authoritative.");
 
-    let candidates = collect_route_discovery_pairs(raydium_states);
+    let mut seen_raydium_pools = BTreeSet::new();
+    let mut pair_count = 0usize;
+    let mut successful_anchor_responses = 0usize;
 
-    println!("targeted_lookup_pair_count={}", candidates.len());
+    for request in raydium_anchor_lookup_requests() {
+        let payload = match fetch_program_accounts(
+            rpc_client,
+            &request,
+            "Raydium anchor lookup",
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                println!("raydium_anchor_lookup_rejected: {error}");
+                continue;
+            }
+        };
 
-    if candidates.is_empty() {
-        return Ok((Vec::new(), BTreeMap::new()));
-    }
+        let observations = match parse_raydium_anchor_lookup_response(&payload) {
+            Ok(observations) => {
+                successful_anchor_responses += 1;
+                observations
+            }
+            Err(error) => {
+                println!("raydium_anchor_lookup_rejected: {error}");
+                continue;
+            }
+        };
 
-    let mut successful_rpc_responses = 0usize;
-
-    for candidate in candidates {
-        let requests =
-            pumpswap::pair_lookup_requests(&candidate.anchor_mint, &candidate.intermediate_mint);
-
-        for request in requests {
-            let payload = match fetch_pumpswap_pair_lookup(rpc_client, &request).await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    println!(
-                        "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} raydium_pool={} reason={}",
-                        candidate.anchor_mint,
-                        candidate.intermediate_mint,
-                        candidate.raydium_pool_id,
-                        error,
-                    );
-                    continue;
-                }
-            };
-
-            let observations = match pumpswap::parse_pair_lookup_response(&payload) {
-                Ok(observations) => {
-                    successful_rpc_responses += 1;
-                    observations
-                }
-                Err(error) => {
-                    println!(
-                        "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} raydium_pool={} reason={}",
-                        candidate.anchor_mint,
-                        candidate.intermediate_mint,
-                        candidate.raydium_pool_id,
-                        error,
-                    );
-                    continue;
-                }
-            };
-
-            if observations.is_empty() {
+        for observation in observations {
+            if !seen_raydium_pools.insert(observation.pubkey.clone()) {
                 continue;
             }
 
-            for observation in observations {
-                if !pumpswap_observation_matches_pair(
-                    &observation,
-                    &candidate.anchor_mint,
-                    &candidate.intermediate_mint,
-                ) {
-                    println!(
-                        "targeted_pumpswap_candidate_rejected: pool={} reason=on-chain mint pair mismatch",
-                        observation.pubkey
-                    );
-                    continue;
-                }
+            let Some(discovery_candidate) = route_candidate_from_observation(observation) else {
+                continue;
+            };
 
-                let account_update_received_at_unix_ms = unix_time_ms_now()?;
-                let hydration_started_at_unix_ms = unix_time_ms_now()?;
+            pair_count += 1;
 
-                let hydration_payload =
-                    match fetch_pumpswap_hydration(rpc_client, &observation).await {
-                        Ok(payload) => payload,
-                        Err(error) => {
-                            println!(
-                                "targeted_pumpswap_candidate_rejected: pool={} reason={}",
-                                observation.pubkey, error
-                            );
-                            continue;
-                        }
-                    };
+            if pair_count > MAX_TARGETED_ROUTE_LOOKUPS {
+                break;
+            }
 
-                let snapshot =
-                    match pumpswap::parse_hydration_response(&observation, &hydration_payload) {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            println!(
-                                "targeted_pumpswap_candidate_rejected: pool={} reason={}",
-                                observation.pubkey, error
-                            );
-                            continue;
-                        }
-                    };
-
-                let hydrated_at_unix_ms = unix_time_ms_now()?;
-
-                let normalized = match pumpswap::hydrate_normalized_observation(
-                    &observation,
-                    &snapshot,
-                    account_update_received_at_unix_ms,
-                    hydrated_at_unix_ms,
-                ) {
-                    Ok(normalized) => normalized,
+            let (raydium_normalized, raydium_snapshot) =
+                match hydrate_raydium_observation(
+                    rpc_client,
+                    &discovery_candidate.observation,
+                )
+                .await
+                {
+                    Ok(result) => result,
                     Err(error) => {
                         println!(
-                            "targeted_pumpswap_candidate_rejected: pool={} reason={}",
-                            observation.pubkey, error
+                            "targeted_raydium_candidate_rejected: pool={} reason={error}",
+                            discovery_candidate.observation.pubkey
                         );
                         continue;
                     }
                 };
 
-                if !normalized_pool_is_eligible(&normalized) {
+            if !normalized_pool_is_eligible(&raydium_normalized) {
+                continue;
+            }
+
+            let pumpswap_requests = pumpswap::pair_lookup_requests(
+                &discovery_candidate.anchor_mint,
+                &discovery_candidate.intermediate_mint,
+            );
+
+            for pumpswap_request in pumpswap_requests {
+                let pumpswap_payload = match fetch_program_accounts(
+                    rpc_client,
+                    &pumpswap_request,
+                    "PumpSwap pair lookup",
+                )
+                .await
+                {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            discovery_candidate.anchor_mint,
+                            discovery_candidate.intermediate_mint
+                        );
+                        continue;
+                    }
+                };
+
+                let pumpswap_observations =
+                    match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
+                        Ok(observations) => observations,
+                        Err(error) => {
+                            println!(
+                                "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                                discovery_candidate.anchor_mint,
+                                discovery_candidate.intermediate_mint
+                            );
+                            continue;
+                        }
+                    };
+
+                for pumpswap_observation in pumpswap_observations {
+                    if !pumpswap_observation_matches_pair(
+                        &pumpswap_observation,
+                        &discovery_candidate.anchor_mint,
+                        &discovery_candidate.intermediate_mint,
+                    ) {
+                        continue;
+                    }
+
+                    let (pumpswap_normalized, pumpswap_snapshot) =
+                        match hydrate_pumpswap_observation(
+                            rpc_client,
+                            &pumpswap_observation,
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                println!(
+                                    "targeted_pumpswap_candidate_rejected: pool={} reason={error}",
+                                    pumpswap_observation.pubkey
+                                );
+                                continue;
+                            }
+                        };
+
+                    if !normalized_pool_is_eligible(&pumpswap_normalized) {
+                        continue;
+                    }
+
                     println!(
-                        "targeted_pumpswap_candidate_rejected: pool={} reason=current normalized state is not registry-eligible",
-                        observation.pubkey
+                        concat!(
+                            "deterministic_cross_venue_overlap: anchor={} intermediate={} ",
+                            "raydium_pool={} pumpswap_pool={}"
+                        ),
+                        discovery_candidate.anchor_mint,
+                        discovery_candidate.intermediate_mint,
+                        raydium_normalized.pool_id,
+                        pumpswap_normalized.pool_id,
                     );
-                    continue;
+                    println!("READ-ONLY RUNG 9 DETERMINISTIC DISCOVERY PASS");
+
+                    let mut raydium_contexts = BTreeMap::new();
+                    raydium_contexts
+                        .insert(raydium_normalized.pool_id.clone(), raydium_snapshot);
+
+                    let mut pumpswap_contexts = BTreeMap::new();
+                    pumpswap_contexts
+                        .insert(pumpswap_normalized.pool_id.clone(), pumpswap_snapshot);
+
+                    return Ok((
+                        vec![raydium_normalized],
+                        raydium_contexts,
+                        vec![pumpswap_normalized],
+                        pumpswap_contexts,
+                    ));
                 }
-
-                let hydration_duration_ms =
-                    hydrated_at_unix_ms.saturating_sub(hydration_started_at_unix_ms);
-
-                println!(
-                    "targeted_pumpswap_pool: anchor={} intermediate={} raydium_pool={} pumpswap_pool={} source_slot={} reserve_slot={} hydration_duration_ms={}",
-                    candidate.anchor_mint,
-                    candidate.intermediate_mint,
-                    candidate.raydium_pool_id,
-                    normalized.pool_id,
-                    normalized.source_slot,
-                    snapshot.slot,
-                    hydration_duration_ms,
-                );
-                println!("targeted_normalized_pool: {}", normalized.summary());
-                println!("READ-ONLY RUNG 9 TARGETED DISCOVERY PASS");
-
-                let mut quote_contexts = BTreeMap::new();
-                quote_contexts.insert(normalized.pool_id.clone(), snapshot);
-
-                return Ok((vec![normalized], quote_contexts));
             }
         }
 
-        println!(
-            "targeted_pumpswap_no_pair: anchor={} intermediate={} raydium_pool={}",
-            candidate.anchor_mint, candidate.intermediate_mint, candidate.raydium_pool_id
-        );
+        if pair_count >= MAX_TARGETED_ROUTE_LOOKUPS {
+            break;
+        }
     }
 
-    if successful_rpc_responses == 0 {
+    if successful_anchor_responses == 0 {
         return Err(
-            "all bounded PumpSwap pair lookup requests failed before a valid RPC response was parsed"
+            "all bounded Raydium anchor lookup requests failed before a valid RPC response was parsed"
                 .to_owned(),
         );
     }
 
-    Ok((Vec::new(), BTreeMap::new()))
+    Err(
+        "Rung 9 deterministic discovery found no live Raydium-PumpSwap same-pair overlap"
+            .to_owned(),
+    )
 }
 
-async fn fetch_pumpswap_pair_lookup(rpc_client: &Client, request: &Value) -> Result<Value, String> {
+async fn hydrate_raydium_observation(
+    rpc_client: &Client,
+    observation: &raydium::RaydiumCpmmAccountObservation,
+) -> Result<
+    (
+        NormalizedPoolState,
+        raydium::RaydiumHydrationSnapshot,
+    ),
+    String,
+> {
+    let received_at = unix_time_ms_now()?;
+    let request_accounts = raydium::hydration_account_pubkeys(observation);
+    let payload = fetch_hydration(
+        rpc_client,
+        3,
+        request_accounts,
+        observation.slot,
+        "Raydium CPMM",
+    )
+    .await?;
+    let snapshot = raydium::parse_hydration_response(observation, &payload)?;
+    let hydrated_at = unix_time_ms_now()?;
+    let normalized = raydium::hydrate_normalized_observation(
+        observation,
+        &snapshot,
+        received_at,
+        hydrated_at,
+    )?;
+
+    Ok((normalized, snapshot))
+}
+
+async fn hydrate_pumpswap_observation(
+    rpc_client: &Client,
+    observation: &pumpswap::PumpSwapAccountObservation,
+) -> Result<
+    (
+        NormalizedPoolState,
+        pumpswap::PumpSwapHydrationSnapshot,
+    ),
+    String,
+> {
+    let received_at = unix_time_ms_now()?;
+    let request_accounts = pumpswap::hydration_account_pubkeys(observation);
+    let payload = fetch_hydration(
+        rpc_client,
+        5,
+        request_accounts,
+        observation.slot,
+        "PumpSwap",
+    )
+    .await?;
+    let snapshot = pumpswap::parse_hydration_response(observation, &payload)?;
+    let hydrated_at = unix_time_ms_now()?;
+    let normalized = pumpswap::hydrate_normalized_observation(
+        observation,
+        &snapshot,
+        received_at,
+        hydrated_at,
+    )?;
+
+    Ok((normalized, snapshot))
+}
+
+async fn fetch_program_accounts(
+    rpc_client: &Client,
+    request: &Value,
+    label: &str,
+) -> Result<Value, String> {
     let response = rpc_client
         .post(SOLANA_RPC_URL)
         .json(request)
         .send()
         .await
-        .map_err(|error| format!("PumpSwap pair lookup RPC request failed: {error}"))?;
+        .map_err(|error| format!("{label} RPC request failed: {error}"))?;
 
     let status = response.status();
 
     if !status.is_success() {
-        return Err(format!(
-            "PumpSwap pair lookup RPC returned HTTP status {status}"
-        ));
+        return Err(format!("{label} RPC returned HTTP status {status}"));
     }
 
     response
         .json::<Value>()
         .await
-        .map_err(|error| format!("PumpSwap pair lookup RPC returned invalid JSON: {error}"))
+        .map_err(|error| format!("{label} RPC returned invalid JSON: {error}"))
 }
 
-fn collect_route_discovery_pairs(
-    raydium_states: &[NormalizedPoolState],
-) -> Vec<RouteDiscoveryPair> {
-    let mut pairs = Vec::new();
+async fn fetch_sol_usd_price(rpc_client: &Client) -> Result<SolUsdPrice, String> {
+    println!("\nRung 10 sizing oracle: Pyth SOL/USD");
 
-    for pool in raydium_states {
-        if !normalized_pool_is_eligible(pool) {
-            continue;
-        }
+    let request = sol_usd_price_request();
 
-        let Some((anchor_mint, intermediate_mint)) = route_pair_from_pool(pool) else {
-            continue;
-        };
+    let response = rpc_client
+        .post(SOLANA_RPC_URL)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| format!("Pyth SOL/USD RPC request failed: {error}"))?;
 
-        if pairs.iter().any(|existing: &RouteDiscoveryPair| {
-            existing.anchor_mint == anchor_mint && existing.intermediate_mint == intermediate_mint
-        }) {
-            continue;
-        }
+    let status = response.status();
 
-        pairs.push(RouteDiscoveryPair {
-            anchor_mint,
-            intermediate_mint,
-            raydium_pool_id: pool.pool_id.clone(),
-        });
-
-        if pairs.len() >= MAX_TARGETED_ROUTE_LOOKUPS {
-            break;
-        }
+    if !status.is_success() {
+        return Err(format!(
+            "Pyth SOL/USD RPC returned HTTP status {status}"
+        ));
     }
 
-    pairs
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Pyth SOL/USD RPC returned invalid JSON: {error}"))?;
+
+    let now = unix_time_seconds_now()?;
+    let price = parse_sol_usd_price(&payload, now)?;
+
+    println!("sol_usd_price: {}", price.summary());
+    println!("READ-ONLY PYTH SOL/USD VALIDATION PASS");
+
+    Ok(price)
 }
 
-fn route_pair_from_pool(pool: &NormalizedPoolState) -> Option<(String, String)> {
-    for anchor_mint in [WRAPPED_SOL_MINT, USDC_MINT, USDT_MINT] {
-        if pool.token_a.mint == anchor_mint && pool.token_b.mint != anchor_mint {
-            return Some((anchor_mint.to_owned(), pool.token_b.mint.clone()));
-        }
-
-        if pool.token_b.mint == anchor_mint && pool.token_a.mint != anchor_mint {
-            return Some((anchor_mint.to_owned(), pool.token_a.mint.clone()));
+fn merge_normalized_states(
+    destination: &mut Vec<NormalizedPoolState>,
+    additions: Vec<NormalizedPoolState>,
+) {
+    for state in additions {
+        if let Some(existing) = destination
+            .iter_mut()
+            .find(|existing| existing.pool_id == state.pool_id)
+        {
+            if state.source_slot >= existing.source_slot {
+                *existing = state;
+            }
+        } else {
+            destination.push(state);
         }
     }
+}
 
-    None
+fn merge_quote_contexts<T>(
+    destination: &mut BTreeMap<String, T>,
+    additions: BTreeMap<String, T>,
+) {
+    for (pool_id, context) in additions {
+        destination.insert(pool_id, context);
+    }
 }
 
 fn pumpswap_observation_matches_pair(
@@ -692,11 +672,12 @@ fn normalized_pool_is_eligible(pool: &NormalizedPoolState) -> bool {
     )
 }
 
-fn validate_registry_and_routes(
+fn validate_registry_routes_and_sizes(
     raydium_states: Vec<NormalizedPoolState>,
     pumpswap_states: Vec<NormalizedPoolState>,
     raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    sol_usd_price: &SolUsdPrice,
 ) -> Result<(), String> {
     println!("\nRegistry: Active Mint");
 
@@ -733,10 +714,6 @@ fn validate_registry_and_routes(
     }
 
     if route_candidates.is_empty() {
-        println!(
-            "READ-ONLY RUNG 9 DIAGNOSTIC: no permitted same-pair cross-venue route observed after targeted discovery"
-        );
-
         return Err(
             "Rung 9 Gate C requires at least one real same-pair cross-venue route".to_owned(),
         );
@@ -745,9 +722,10 @@ fn validate_registry_and_routes(
     println!("READ-ONLY TWO-LEG ROUTE ENGINE PASS");
     println!("READ-ONLY RUNG 9 ROUTE CANDIDATE PASS");
 
-    println!("\nRung 10 raw quote engine: one whole anchor token probe");
+    println!("\nRung 10 deterministic USD size-grid quote engine");
 
-    let mut successful_quotes = 0usize;
+    let mut successful_routes = 0usize;
+    let mut successful_grid_quotes = 0usize;
 
     for route_candidate in &route_candidates {
         let leg_1_context = match quote_context_for_leg(
@@ -758,7 +736,7 @@ fn validate_registry_and_routes(
             Ok(context) => context,
             Err(error) => {
                 println!(
-                    "rung10_raw_quote_rejected: route=[{}] reason={error}",
+                    "rung10_route_rejected: route=[{}] reason={error}",
                     route_candidate.summary()
                 );
                 continue;
@@ -773,52 +751,86 @@ fn validate_registry_and_routes(
             Ok(context) => context,
             Err(error) => {
                 println!(
-                    "rung10_raw_quote_rejected: route=[{}] reason={error}",
+                    "rung10_route_rejected: route=[{}] reason={error}",
                     route_candidate.summary()
                 );
                 continue;
             }
         };
 
-        let amount_in_raw = match one_whole_anchor_input_raw(route_candidate, &leg_1_context) {
-            Ok(amount) => amount,
-            Err(error) => {
-                println!(
-                    "rung10_raw_quote_rejected: route=[{}] reason={error}",
-                    route_candidate.summary()
-                );
-                continue;
-            }
-        };
+        let anchor_decimals =
+            match context_mint_decimals(&leg_1_context, route_candidate.anchor_mint()) {
+                Ok(decimals) => decimals,
+                Err(error) => {
+                    println!(
+                        "rung10_route_rejected: route=[{}] reason={error}",
+                        route_candidate.summary()
+                    );
+                    continue;
+                }
+            };
 
-        match quote_two_leg_exact_input(
-            route_candidate,
-            amount_in_raw,
-            &leg_1_context,
-            &leg_2_context,
-        ) {
-            Ok(route_quote) => {
-                successful_quotes += 1;
-                println!("rung10_raw_quote: {}", route_quote.summary());
+        let mut route_grid_quotes = 0usize;
+
+        for dollars in USD_SIZE_GRID {
+            let amount_in_raw = match usd_dollars_to_anchor_raw(
+                dollars,
+                route_candidate.anchor_mint(),
+                anchor_decimals,
+                Some(sol_usd_price),
+            ) {
+                Ok(amount) => amount,
+                Err(error) => {
+                    println!(
+                        "rung10_size_rejected: route=[{}] usd=${dollars} reason={error}",
+                        route_candidate.summary()
+                    );
+                    continue;
+                }
+            };
+
+            match quote_two_leg_exact_input(
+                route_candidate,
+                amount_in_raw,
+                &leg_1_context,
+                &leg_2_context,
+            ) {
+                Ok(route_quote) => {
+                    route_grid_quotes += 1;
+                    successful_grid_quotes += 1;
+                    println!(
+                        "rung10_grid_quote: usd=${dollars} {}",
+                        route_quote.summary()
+                    );
+                }
+                Err(error) => {
+                    println!(
+                        "rung10_grid_quote_rejected: route=[{}] usd=${dollars} amount_in_raw={amount_in_raw} reason={error}",
+                        route_candidate.summary()
+                    );
+                }
             }
-            Err(error) => {
-                println!(
-                    "rung10_raw_quote_rejected: route=[{}] reason={error}",
-                    route_candidate.summary()
-                );
-            }
+        }
+
+        if route_grid_quotes == USD_SIZE_GRID.len() {
+            successful_routes += 1;
+            println!(
+                "rung10_complete_grid_route: {}",
+                route_candidate.summary()
+            );
         }
     }
 
-    if successful_quotes == 0 {
+    if successful_routes == 0 {
         return Err(
-            "Rung 10 raw quote engine produced no valid two-leg quote from live route state"
+            "Rung 10 produced no route with the complete $1-$1,000 deterministic quote grid"
                 .to_owned(),
         );
     }
 
-    println!("rung10_raw_quote_count={successful_quotes}");
-    println!("READ-ONLY RUNG 10 RAW ROUTE QUOTE ENGINE PASS");
+    println!("rung10_complete_grid_route_count={successful_routes}");
+    println!("rung10_successful_grid_quote_count={successful_grid_quotes}");
+    println!("READ-ONLY RUNG 10 SIZE + QUOTE ENGINE PASS");
 
     Ok(())
 }
@@ -854,6 +866,32 @@ fn quote_context_for_leg<'a>(
                 )
             }),
         other => Err(format!("unsupported Rung 10 quote venue {}", other.label())),
+    }
+}
+
+fn context_mint_decimals(
+    context: &VenueQuoteContext<'_>,
+    mint: &str,
+) -> Result<u8, String> {
+    match context {
+        VenueQuoteContext::Raydium { snapshot, .. } => {
+            if snapshot.pool_state.token_0_mint == mint {
+                Ok(snapshot.token_0_decimals)
+            } else if snapshot.pool_state.token_1_mint == mint {
+                Ok(snapshot.token_1_decimals)
+            } else {
+                Err(format!("mint {mint} is not in Raydium quote context"))
+            }
+        }
+        VenueQuoteContext::PumpSwap { snapshot, .. } => {
+            if snapshot.pool_state.base_mint == mint {
+                Ok(snapshot.base_decimals)
+            } else if snapshot.pool_state.quote_mint == mint {
+                Ok(snapshot.quote_decimals)
+            } else {
+                Err(format!("mint {mint} is not in PumpSwap quote context"))
+            }
+        }
     }
 }
 
@@ -908,6 +946,44 @@ fn unix_time_ms_now() -> Result<u64, String> {
 
     u64::try_from(duration.as_millis())
         .map_err(|_| "Unix timestamp milliseconds exceeded u64".to_owned())
+}
+
+fn unix_time_seconds_now() -> Result<i64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("system clock before Unix epoch: {error}"))?;
+
+    i64::try_from(duration.as_secs())
+        .map_err(|_| "Unix timestamp seconds exceeded i64".to_owned())
+}
+
+async fn wait_for_subscription_confirmation<S>(
+    reader: &mut S,
+    request_id: u64,
+    label: &str,
+) -> Result<(), String>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    loop {
+        let payload = next_json_message(reader).await?;
+
+        if payload.get("id").and_then(Value::as_u64) != Some(request_id) {
+            continue;
+        }
+
+        if let Some(error) = payload.get("error") {
+            return Err(format!("{label} subscription rejected: {error}"));
+        }
+
+        let subscription_id = payload
+            .get("result")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("{label} subscription response missing id"))?;
+
+        println!("{label}_subscription_id={subscription_id}");
+        return Ok(());
+    }
 }
 
 async fn next_json_message<S>(reader: &mut S) -> Result<Value, String>
