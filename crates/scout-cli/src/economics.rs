@@ -15,14 +15,34 @@ impl FundingMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostProvenanceKind {
+    Observed,
+    ModeledAssumption,
+}
+
+impl CostProvenanceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Observed => "observed",
+            Self::ModeledAssumption => "modeled_assumption",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplicitCost {
     amount_anchor_raw: u64,
+    provenance_kind: CostProvenanceKind,
     provenance: String,
 }
 
 impl ExplicitCost {
-    pub fn new(amount_anchor_raw: u64, provenance: impl Into<String>) -> Result<Self, String> {
+    pub fn new(
+        amount_anchor_raw: u64,
+        provenance_kind: CostProvenanceKind,
+        provenance: impl Into<String>,
+    ) -> Result<Self, String> {
         let provenance = provenance.into();
 
         if provenance.trim().is_empty() {
@@ -31,6 +51,7 @@ impl ExplicitCost {
 
         Ok(Self {
             amount_anchor_raw,
+            provenance_kind,
             provenance,
         })
     }
@@ -39,28 +60,84 @@ impl ExplicitCost {
         self.amount_anchor_raw
     }
 
+    pub fn provenance_kind(&self) -> CostProvenanceKind {
+        self.provenance_kind
+    }
+
     pub fn provenance(&self) -> &str {
         &self.provenance
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequiredCost {
+    Known(ExplicitCost),
+    Unknown {
+        provenance_kind: CostProvenanceKind,
+        reason: String,
+    },
+}
+
+impl RequiredCost {
+    pub fn known(
+        amount_anchor_raw: u64,
+        provenance_kind: CostProvenanceKind,
+        provenance: impl Into<String>,
+    ) -> Result<Self, String> {
+        Ok(Self::Known(ExplicitCost::new(
+            amount_anchor_raw,
+            provenance_kind,
+            provenance,
+        )?))
+    }
+
+    pub fn unknown(
+        provenance_kind: CostProvenanceKind,
+        reason: impl Into<String>,
+    ) -> Result<Self, String> {
+        let reason = reason.into();
+
+        if reason.trim().is_empty() {
+            return Err("economics unknown-cost reason must not be empty".to_owned());
+        }
+
+        Ok(Self::Unknown {
+            provenance_kind,
+            reason,
+        })
+    }
+
+    pub fn resolve(&self, cost_name: &str) -> Result<&ExplicitCost, String> {
+        match self {
+            Self::Known(cost) => Ok(cost),
+            Self::Unknown {
+                provenance_kind,
+                reason,
+            } => Err(format!(
+                "economics required cost unknown: cost={cost_name} kind={} reason={reason}",
+                provenance_kind.label()
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommonEconomicsCosts {
-    pub base_fee: ExplicitCost,
-    pub priority_fee: ExplicitCost,
-    pub submission_cost: ExplicitCost,
-    pub expected_failure_cost: ExplicitCost,
-    pub safety_reserve: ExplicitCost,
+    pub base_fee: RequiredCost,
+    pub priority_fee: RequiredCost,
+    pub submission_cost: RequiredCost,
+    pub expected_failure_cost: RequiredCost,
+    pub safety_reserve: RequiredCost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreasuryFundingCosts {
-    pub capital_cost: ExplicitCost,
+    pub capital_cost: RequiredCost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlashFundingCosts {
-    pub borrowing_cost: ExplicitCost,
+    pub borrowing_cost: RequiredCost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,40 +225,65 @@ pub fn evaluate_expected_net(
     quote: &TwoLegRouteQuote,
     costs: &EconomicsCostModel,
 ) -> Result<RouteEconomics, String> {
+    let treasury = evaluate_expected_net_for_mode(quote, costs, FundingMode::Treasury)?;
+    let flash = evaluate_expected_net_for_mode(quote, costs, FundingMode::Flash)?;
+
+    Ok(RouteEconomics { treasury, flash })
+}
+
+pub fn evaluate_expected_net_for_mode(
+    quote: &TwoLegRouteQuote,
+    costs: &EconomicsCostModel,
+    funding_mode: FundingMode,
+) -> Result<ExpectedNetEconomics, String> {
     if quote.anchor_input_requested_raw == 0 {
         return Err("economics requires non-zero anchor input".to_owned());
     }
 
-    let common_cost_raw = checked_sum_costs([
-        &costs.common.base_fee,
-        &costs.common.priority_fee,
-        &costs.common.submission_cost,
-        &costs.common.expected_failure_cost,
-        &costs.common.safety_reserve,
-    ])?;
-
+    let common_cost_raw = resolved_common_cost_raw(costs)?;
     let gross_delta_raw =
         i128::from(quote.anchor_output_raw) - i128::from(quote.anchor_input_requested_raw);
 
-    let treasury = evaluate_funding_mode(
+    let funding_cost_raw = match funding_mode {
+        FundingMode::Treasury => costs
+            .treasury
+            .capital_cost
+            .resolve("treasury_capital_cost")?
+            .amount_anchor_raw(),
+        FundingMode::Flash => costs
+            .flash
+            .borrowing_cost
+            .resolve("flash_borrowing_cost")?
+            .amount_anchor_raw(),
+    };
+
+    evaluate_funding_mode(
         quote,
         costs,
-        FundingMode::Treasury,
+        funding_mode,
         gross_delta_raw,
         common_cost_raw,
-        costs.treasury.capital_cost.amount_anchor_raw(),
-    )?;
+        funding_cost_raw,
+    )
+}
 
-    let flash = evaluate_funding_mode(
-        quote,
-        costs,
-        FundingMode::Flash,
-        gross_delta_raw,
-        common_cost_raw,
-        costs.flash.borrowing_cost.amount_anchor_raw(),
-    )?;
+fn resolved_common_cost_raw(costs: &EconomicsCostModel) -> Result<u64, String> {
+    let base_fee = costs.common.base_fee.resolve("base_fee")?;
+    let priority_fee = costs.common.priority_fee.resolve("priority_fee")?;
+    let submission_cost = costs.common.submission_cost.resolve("submission_cost")?;
+    let expected_failure_cost = costs
+        .common
+        .expected_failure_cost
+        .resolve("expected_failure_cost")?;
+    let safety_reserve = costs.common.safety_reserve.resolve("safety_reserve")?;
 
-    Ok(RouteEconomics { treasury, flash })
+    checked_sum_costs([
+        base_fee,
+        priority_fee,
+        submission_cost,
+        expected_failure_cost,
+        safety_reserve,
+    ])
 }
 
 fn evaluate_funding_mode(
@@ -231,25 +333,33 @@ mod tests {
     const ANCHOR_MINT: &str = "So11111111111111111111111111111111111111112";
     const INTERMEDIATE_MINT: &str = "Intermediate1111111111111111111111111111111";
 
-    fn explicit_cost(amount_anchor_raw: u64, label: &str) -> Result<ExplicitCost, String> {
-        ExplicitCost::new(amount_anchor_raw, label)
+    fn observed_cost(amount_anchor_raw: u64, label: &str) -> Result<RequiredCost, String> {
+        RequiredCost::known(amount_anchor_raw, CostProvenanceKind::Observed, label)
+    }
+
+    fn modeled_cost(amount_anchor_raw: u64, label: &str) -> Result<RequiredCost, String> {
+        RequiredCost::known(
+            amount_anchor_raw,
+            CostProvenanceKind::ModeledAssumption,
+            label,
+        )
     }
 
     fn cost_model() -> Result<EconomicsCostModel, String> {
         EconomicsCostModel::new(
-            "test-cost-basis-v1",
+            "test-cost-basis-v2",
             CommonEconomicsCosts {
-                base_fee: explicit_cost(5, "fixture base fee")?,
-                priority_fee: explicit_cost(7, "fixture priority fee")?,
-                submission_cost: explicit_cost(11, "fixture submission cost")?,
-                expected_failure_cost: explicit_cost(13, "fixture expected failure cost")?,
-                safety_reserve: explicit_cost(17, "fixture safety reserve")?,
+                base_fee: observed_cost(5, "fixture observed base fee")?,
+                priority_fee: observed_cost(7, "fixture observed priority fee")?,
+                submission_cost: observed_cost(11, "fixture observed submission cost")?,
+                expected_failure_cost: modeled_cost(13, "fixture modeled failure cost")?,
+                safety_reserve: modeled_cost(17, "fixture modeled safety reserve")?,
             },
             TreasuryFundingCosts {
-                capital_cost: explicit_cost(19, "fixture treasury capital cost")?,
+                capital_cost: modeled_cost(19, "fixture modeled treasury capital cost")?,
             },
             FlashFundingCosts {
-                borrowing_cost: explicit_cost(23, "fixture flash borrowing cost")?,
+                borrowing_cost: modeled_cost(23, "fixture modeled flash borrowing cost")?,
             },
         )
     }
@@ -346,6 +456,73 @@ mod tests {
     }
 
     #[test]
+    fn one_funding_mode_can_evaluate_when_the_other_is_unknown() -> Result<(), String> {
+        let quote = route_quote(1_000, 1_200)?;
+        let mut costs = cost_model()?;
+        costs.treasury.capital_cost = RequiredCost::unknown(
+            CostProvenanceKind::ModeledAssumption,
+            "treasury capital policy not defined",
+        )?;
+
+        let treasury = evaluate_expected_net_for_mode(&quote, &costs, FundingMode::Treasury);
+        let flash = evaluate_expected_net_for_mode(&quote, &costs, FundingMode::Flash)?;
+
+        assert_eq!(
+            treasury,
+            Err(
+                "economics required cost unknown: cost=treasury_capital_cost kind=modeled_assumption reason=treasury capital policy not defined"
+                    .to_owned()
+            )
+        );
+        assert_eq!(flash.expected_net_raw, 124);
+
+        Ok(())
+    }
+
+    #[test]
+    fn observed_and_modeled_costs_preserve_distinct_provenance() -> Result<(), String> {
+        let costs = cost_model()?;
+
+        let base_fee = costs.common.base_fee.resolve("base_fee")?;
+        let safety_reserve = costs.common.safety_reserve.resolve("safety_reserve")?;
+
+        assert_eq!(base_fee.provenance_kind(), CostProvenanceKind::Observed);
+        assert_eq!(
+            safety_reserve.provenance_kind(),
+            CostProvenanceKind::ModeledAssumption
+        );
+        assert_eq!(base_fee.provenance(), "fixture observed base fee");
+        assert_eq!(
+            safety_reserve.provenance(),
+            "fixture modeled safety reserve"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_common_cost_fails_closed() -> Result<(), String> {
+        let quote = route_quote(1_000, 1_200)?;
+        let mut costs = cost_model()?;
+        costs.common.priority_fee = RequiredCost::unknown(
+            CostProvenanceKind::Observed,
+            "priority fee observation unavailable",
+        )?;
+
+        let result = evaluate_expected_net_for_mode(&quote, &costs, FundingMode::Flash);
+
+        assert_eq!(
+            result,
+            Err(
+                "economics required cost unknown: cost=priority_fee kind=observed reason=priority fee observation unavailable"
+                    .to_owned()
+            )
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn negative_gross_route_remains_negative_after_costs() -> Result<(), String> {
         let quote = route_quote(1_000, 900)?;
         let costs = cost_model()?;
@@ -390,7 +567,7 @@ mod tests {
 
     #[test]
     fn empty_cost_provenance_is_rejected() {
-        let result = ExplicitCost::new(1, "   ");
+        let result = ExplicitCost::new(1, CostProvenanceKind::Observed, "   ");
 
         assert_eq!(
             result,
@@ -399,21 +576,31 @@ mod tests {
     }
 
     #[test]
+    fn empty_unknown_cost_reason_is_rejected() {
+        let result = RequiredCost::unknown(CostProvenanceKind::Observed, "   ");
+
+        assert_eq!(
+            result,
+            Err("economics unknown-cost reason must not be empty".to_owned())
+        );
+    }
+
+    #[test]
     fn empty_cost_basis_id_is_rejected() -> Result<(), String> {
         let result = EconomicsCostModel::new(
             "",
             CommonEconomicsCosts {
-                base_fee: explicit_cost(1, "base")?,
-                priority_fee: explicit_cost(1, "priority")?,
-                submission_cost: explicit_cost(1, "submission")?,
-                expected_failure_cost: explicit_cost(1, "failure")?,
-                safety_reserve: explicit_cost(1, "reserve")?,
+                base_fee: observed_cost(1, "base")?,
+                priority_fee: observed_cost(1, "priority")?,
+                submission_cost: observed_cost(1, "submission")?,
+                expected_failure_cost: modeled_cost(1, "failure")?,
+                safety_reserve: modeled_cost(1, "reserve")?,
             },
             TreasuryFundingCosts {
-                capital_cost: explicit_cost(1, "treasury")?,
+                capital_cost: modeled_cost(1, "treasury")?,
             },
             FlashFundingCosts {
-                borrowing_cost: explicit_cost(1, "flash")?,
+                borrowing_cost: modeled_cost(1, "flash")?,
             },
         );
 
@@ -432,17 +619,17 @@ mod tests {
         let costs = EconomicsCostModel::new(
             "overflow-test",
             CommonEconomicsCosts {
-                base_fee: explicit_cost(u64::MAX, "base")?,
-                priority_fee: explicit_cost(1, "priority")?,
-                submission_cost: explicit_cost(0, "submission")?,
-                expected_failure_cost: explicit_cost(0, "failure")?,
-                safety_reserve: explicit_cost(0, "reserve")?,
+                base_fee: observed_cost(u64::MAX, "base")?,
+                priority_fee: observed_cost(1, "priority")?,
+                submission_cost: observed_cost(0, "submission")?,
+                expected_failure_cost: modeled_cost(0, "failure")?,
+                safety_reserve: modeled_cost(0, "reserve")?,
             },
             TreasuryFundingCosts {
-                capital_cost: explicit_cost(0, "treasury")?,
+                capital_cost: modeled_cost(0, "treasury")?,
             },
             FlashFundingCosts {
-                borrowing_cost: explicit_cost(0, "flash")?,
+                borrowing_cost: modeled_cost(0, "flash")?,
             },
         )?;
 
@@ -460,17 +647,17 @@ mod tests {
         let costs = EconomicsCostModel::new(
             "funding-overflow-test",
             CommonEconomicsCosts {
-                base_fee: explicit_cost(u64::MAX, "base")?,
-                priority_fee: explicit_cost(0, "priority")?,
-                submission_cost: explicit_cost(0, "submission")?,
-                expected_failure_cost: explicit_cost(0, "failure")?,
-                safety_reserve: explicit_cost(0, "reserve")?,
+                base_fee: observed_cost(u64::MAX, "base")?,
+                priority_fee: observed_cost(0, "priority")?,
+                submission_cost: observed_cost(0, "submission")?,
+                expected_failure_cost: modeled_cost(0, "failure")?,
+                safety_reserve: modeled_cost(0, "reserve")?,
             },
             TreasuryFundingCosts {
-                capital_cost: explicit_cost(1, "treasury")?,
+                capital_cost: modeled_cost(1, "treasury")?,
             },
             FlashFundingCosts {
-                borrowing_cost: explicit_cost(0, "flash")?,
+                borrowing_cost: modeled_cost(0, "flash")?,
             },
         )?;
 
