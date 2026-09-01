@@ -192,14 +192,8 @@ pub fn quote_exact_input(
         return Err("Raydium quote input must be greater than zero".to_owned());
     }
 
-    ensure_legacy_token_program(
-        &snapshot.pool_state.token_0_program,
-        "Raydium token_0",
-    )?;
-    ensure_legacy_token_program(
-        &snapshot.pool_state.token_1_program,
-        "Raydium token_1",
-    )?;
+    ensure_legacy_token_program(&snapshot.pool_state.token_0_program, "Raydium token_0")?;
+    ensure_legacy_token_program(&snapshot.pool_state.token_1_program, "Raydium token_1")?;
 
     let zero_for_one = if input_mint == snapshot.pool_state.token_0_mint {
         true
@@ -312,11 +306,7 @@ pub fn quote_exact_input(
     let (amount_out_raw, creator_fee_raw) = if creator_fee_on_input {
         (curve_output_raw, creator_fee_raw)
     } else {
-        let creator_fee = fee_ceil(
-            curve_output_raw,
-            creator_fee_rate,
-            FEE_RATE_DENOMINATOR,
-        )?;
+        let creator_fee = fee_ceil(curve_output_raw, creator_fee_rate, FEE_RATE_DENOMINATOR)?;
         let amount_out = curve_output_raw
             .checked_sub(creator_fee)
             .ok_or_else(|| "Raydium creator fee exceeds quote output".to_owned())?;
