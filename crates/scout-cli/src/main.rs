@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use quote::{quote_two_leg_exact_input, VenueQuoteContext};
 use registry::ActiveMintRegistry;
 use reqwest::Client;
-use route::{generate_two_leg_routes, RouteLeg};
+use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
 use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
 use serde_json::{json, Value};
 use sizing::{
@@ -22,7 +22,7 @@ use sizing::{
     USD_SIZE_GRID,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{
     connect_async,
@@ -32,6 +32,9 @@ use tokio_tungstenite::{
 const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const SOLANA_WS_URL: &str = "wss://api.mainnet-beta.solana.com";
 const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const DETERMINISTIC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(210);
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
@@ -43,7 +46,11 @@ async fn main() -> Result<(), String> {
         .install_default()
         .map_err(|_| "could not install rustls ring crypto provider".to_owned())?;
 
-    let rpc_client = Client::new();
+    let rpc_client = Client::builder()
+        .connect_timeout(RPC_CONNECT_TIMEOUT)
+        .timeout(RPC_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| format!("could not build bounded Solana RPC client: {error}"))?;
 
     let request = SOLANA_WS_URL
         .into_client_request()
@@ -118,7 +125,21 @@ async fn main() -> Result<(), String> {
             discovered_raydium_contexts,
             discovered_pumpswap_states,
             discovered_pumpswap_contexts,
-        ) = discover_deterministic_cross_venue_overlap(&rpc_client).await?;
+        ) = timeout(
+            DETERMINISTIC_DISCOVERY_TIMEOUT,
+            discover_deterministic_cross_venue_overlap(
+                &rpc_client,
+                &raydium_states,
+                &raydium_quote_contexts,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "Rung 9 deterministic discovery exceeded {} seconds",
+                DETERMINISTIC_DISCOVERY_TIMEOUT.as_secs()
+            )
+        })??;
 
         merge_normalized_states(&mut raydium_states, discovered_raydium_states);
         merge_quote_contexts(&mut raydium_quote_contexts, discovered_raydium_contexts);
@@ -299,6 +320,8 @@ where
 
 async fn discover_deterministic_cross_venue_overlap(
     rpc_client: &Client,
+    live_raydium_states: &[NormalizedPoolState],
+    live_raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
 ) -> Result<
     (
         Vec<NormalizedPoolState>,
@@ -310,16 +333,155 @@ async fn discover_deterministic_cross_venue_overlap(
 > {
     println!("Solana on-chain state remains authoritative.");
 
+    let mut seen_live_pairs = BTreeSet::new();
+    let mut exact_pair_count = 0usize;
+
+    for raydium_normalized in live_raydium_states {
+        let Some((anchor_mint, intermediate_mint)) = anchor_pair_from_pool(raydium_normalized) else {
+            continue;
+        };
+
+        if !seen_live_pairs.insert((anchor_mint.clone(), intermediate_mint.clone())) {
+            continue;
+        }
+
+        exact_pair_count += 1;
+
+        if exact_pair_count > MAX_TARGETED_ROUTE_LOOKUPS {
+            break;
+        }
+
+        let Some(raydium_snapshot) =
+            live_raydium_quote_contexts.get(&raydium_normalized.pool_id)
+        else {
+            println!(
+                "deterministic_exact_pair_probe_rejected: raydium_pool={} reason=missing live quote context",
+                raydium_normalized.pool_id
+            );
+            continue;
+        };
+
+        println!(
+            concat!(
+                "deterministic_exact_pair_probe_start: anchor={} intermediate={} ",
+                "raydium_pool={}"
+            ),
+            anchor_mint, intermediate_mint, raydium_normalized.pool_id
+        );
+
+        for pumpswap_request in
+            pumpswap::pair_lookup_requests(&anchor_mint, &intermediate_mint)
+        {
+            let label = format!(
+                "PumpSwap exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
+            );
+
+            let pumpswap_payload =
+                match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        continue;
+                    }
+                };
+
+            let pumpswap_observations =
+                match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        continue;
+                    }
+                };
+
+            println!(
+                "deterministic_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
+                anchor_mint,
+                intermediate_mint,
+                pumpswap_observations.len()
+            );
+
+            for pumpswap_observation in pumpswap_observations {
+                if !pumpswap_observation_matches_pair(
+                    &pumpswap_observation,
+                    &anchor_mint,
+                    &intermediate_mint,
+                ) {
+                    continue;
+                }
+
+                let (pumpswap_normalized, pumpswap_snapshot) =
+                    match hydrate_pumpswap_observation(rpc_client, &pumpswap_observation).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            println!(
+                                "deterministic_exact_pair_candidate_rejected: pool={} reason={error}",
+                                pumpswap_observation.pubkey
+                            );
+                            continue;
+                        }
+                    };
+
+                if !normalized_pool_is_eligible(&pumpswap_normalized) {
+                    continue;
+                }
+
+                println!(
+                    concat!(
+                        "deterministic_cross_venue_overlap: anchor={} intermediate={} ",
+                        "raydium_pool={} pumpswap_pool={} source=live-exact-pair"
+                    ),
+                    anchor_mint,
+                    intermediate_mint,
+                    raydium_normalized.pool_id,
+                    pumpswap_normalized.pool_id,
+                );
+                println!("READ-ONLY RUNG 9 DETERMINISTIC DISCOVERY PASS");
+
+                let mut raydium_contexts = BTreeMap::new();
+                raydium_contexts.insert(
+                    raydium_normalized.pool_id.clone(),
+                    raydium_snapshot.clone(),
+                );
+
+                let mut pumpswap_contexts = BTreeMap::new();
+                pumpswap_contexts
+                    .insert(pumpswap_normalized.pool_id.clone(), pumpswap_snapshot);
+
+                return Ok((
+                    vec![raydium_normalized.clone()],
+                    raydium_contexts,
+                    vec![pumpswap_normalized],
+                    pumpswap_contexts,
+                ));
+            }
+        }
+    }
+
+    println!(
+        "deterministic_exact_pair_probe_exhausted: unique_pairs={}",
+        seen_live_pairs.len()
+    );
+    println!("deterministic_broad_anchor_fallback_start");
+
     let mut seen_raydium_pools = BTreeSet::new();
     let mut pair_count = 0usize;
     let mut successful_anchor_responses = 0usize;
 
     for request in raydium_anchor_lookup_requests() {
+        let request_id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+
         let payload =
             match fetch_program_accounts(rpc_client, &request, "Raydium anchor lookup").await {
                 Ok(payload) => payload,
                 Err(error) => {
-                    println!("raydium_anchor_lookup_rejected: {error}");
+                    println!("raydium_anchor_lookup_rejected: id={request_id} reason={error}");
                     continue;
                 }
             };
@@ -330,10 +492,16 @@ async fn discover_deterministic_cross_venue_overlap(
                 observations
             }
             Err(error) => {
-                println!("raydium_anchor_lookup_rejected: {error}");
+                println!("raydium_anchor_lookup_rejected: id={request_id} reason={error}");
                 continue;
             }
         };
+
+        println!(
+            "raydium_anchor_lookup_parsed: id={} observation_count={}",
+            request_id,
+            observations.len()
+        );
 
         for observation in observations {
             if !seen_raydium_pools.insert(observation.pubkey.clone()) {
@@ -349,6 +517,18 @@ async fn discover_deterministic_cross_venue_overlap(
             if pair_count > MAX_TARGETED_ROUTE_LOOKUPS {
                 break;
             }
+
+            println!(
+                concat!(
+                    "targeted_raydium_candidate_start: anchor={} intermediate={} ",
+                    "pool={} candidate={}/{}"
+                ),
+                discovery_candidate.anchor_mint,
+                discovery_candidate.intermediate_mint,
+                discovery_candidate.observation.pubkey,
+                pair_count,
+                MAX_TARGETED_ROUTE_LOOKUPS
+            );
 
             let (raydium_normalized, raydium_snapshot) =
                 match hydrate_raydium_observation(rpc_client, &discovery_candidate.observation)
@@ -374,37 +554,43 @@ async fn discover_deterministic_cross_venue_overlap(
             );
 
             for pumpswap_request in pumpswap_requests {
-                let pumpswap_payload = match fetch_program_accounts(
-                    rpc_client,
-                    &pumpswap_request,
-                    "PumpSwap pair lookup",
-                )
-                .await
-                {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        println!(
-                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            discovery_candidate.anchor_mint,
-                            discovery_candidate.intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+                let label = format!(
+                    "PumpSwap pair lookup anchor={} intermediate={}",
+                    discovery_candidate.anchor_mint, discovery_candidate.intermediate_mint
+                );
 
-                let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
-                    &pumpswap_payload,
-                ) {
-                    Ok(observations) => observations,
-                    Err(error) => {
-                        println!(
-                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            discovery_candidate.anchor_mint,
-                            discovery_candidate.intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+                let pumpswap_payload =
+                    match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            println!(
+                                "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                                discovery_candidate.anchor_mint,
+                                discovery_candidate.intermediate_mint
+                            );
+                            continue;
+                        }
+                    };
+
+                let pumpswap_observations =
+                    match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
+                        Ok(observations) => observations,
+                        Err(error) => {
+                            println!(
+                                "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                                discovery_candidate.anchor_mint,
+                                discovery_candidate.intermediate_mint
+                            );
+                            continue;
+                        }
+                    };
+
+                println!(
+                    "targeted_pumpswap_lookup_parsed: anchor={} intermediate={} observation_count={}",
+                    discovery_candidate.anchor_mint,
+                    discovery_candidate.intermediate_mint,
+                    pumpswap_observations.len()
+                );
 
                 for pumpswap_observation in pumpswap_observations {
                     if !pumpswap_observation_matches_pair(
@@ -435,7 +621,7 @@ async fn discover_deterministic_cross_venue_overlap(
                     println!(
                         concat!(
                             "deterministic_cross_venue_overlap: anchor={} intermediate={} ",
-                            "raydium_pool={} pumpswap_pool={}"
+                            "raydium_pool={} pumpswap_pool={} source=broad-anchor-fallback"
                         ),
                         discovery_candidate.anchor_mint,
                         discovery_candidate.intermediate_mint,
@@ -528,47 +714,110 @@ async fn fetch_program_accounts(
     request: &Value,
     label: &str,
 ) -> Result<Value, String> {
+    let request_id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+    let started_at = Instant::now();
+
+    println!(
+        "rpc_request_start: label={label} id={request_id} method=getProgramAccounts"
+    );
+
     let response = rpc_client
         .post(SOLANA_RPC_URL)
         .json(request)
         .send()
         .await
-        .map_err(|error| format!("{label} RPC request failed: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "{label} RPC request failed after {} ms: {error}",
+                started_at.elapsed().as_millis()
+            )
+        })?;
 
     let status = response.status();
 
     if !status.is_success() {
-        return Err(format!("{label} RPC returned HTTP status {status}"));
+        return Err(format!(
+            "{label} RPC returned HTTP status {status} after {} ms",
+            started_at.elapsed().as_millis()
+        ));
     }
 
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("{label} RPC returned invalid JSON: {error}"))
+    let payload = response.json::<Value>().await.map_err(|error| {
+        format!(
+            "{label} RPC returned invalid JSON after {} ms: {error}",
+            started_at.elapsed().as_millis()
+        )
+    })?;
+
+    let result_count = payload
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+
+    println!(
+        concat!(
+            "rpc_request_finish: label={} id={} status={} elapsed_ms={} ",
+            "result_count={} rpc_error={}"
+        ),
+        label,
+        request_id,
+        status,
+        started_at.elapsed().as_millis(),
+        result_count,
+        payload.get("error").is_some()
+    );
+
+    Ok(payload)
 }
 
 async fn fetch_sol_usd_price(rpc_client: &Client) -> Result<SolUsdPrice, String> {
     println!("\nRung 10 sizing oracle: Pyth SOL/USD");
 
     let request = sol_usd_price_request();
+    let request_id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let started_at = Instant::now();
+
+    println!("rpc_request_start: label=Pyth SOL/USD id={request_id} method={method}");
 
     let response = rpc_client
         .post(SOLANA_RPC_URL)
         .json(&request)
         .send()
         .await
-        .map_err(|error| format!("Pyth SOL/USD RPC request failed: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Pyth SOL/USD RPC request failed after {} ms: {error}",
+                started_at.elapsed().as_millis()
+            )
+        })?;
 
     let status = response.status();
 
     if !status.is_success() {
-        return Err(format!("Pyth SOL/USD RPC returned HTTP status {status}"));
+        return Err(format!(
+            "Pyth SOL/USD RPC returned HTTP status {status} after {} ms",
+            started_at.elapsed().as_millis()
+        ));
     }
 
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Pyth SOL/USD RPC returned invalid JSON: {error}"))?;
+    let payload = response.json::<Value>().await.map_err(|error| {
+        format!(
+            "Pyth SOL/USD RPC returned invalid JSON after {} ms: {error}",
+            started_at.elapsed().as_millis()
+        )
+    })?;
+
+    println!(
+        "rpc_request_finish: label=Pyth SOL/USD id={} status={} elapsed_ms={} rpc_error={}",
+        request_id,
+        status,
+        started_at.elapsed().as_millis(),
+        payload.get("error").is_some()
+    );
 
     let now = unix_time_seconds_now()?;
     let price = parse_sol_usd_price(&payload, now)?;
@@ -601,6 +850,20 @@ fn merge_quote_contexts<T>(destination: &mut BTreeMap<String, T>, additions: BTr
     for (pool_id, context) in additions {
         destination.insert(pool_id, context);
     }
+}
+
+fn anchor_pair_from_pool(pool: &NormalizedPoolState) -> Option<(String, String)> {
+    for anchor_mint in [WRAPPED_SOL_MINT, USDC_MINT, USDT_MINT] {
+        if pool.token_a.mint == anchor_mint && pool.token_b.mint != anchor_mint {
+            return Some((anchor_mint.to_owned(), pool.token_b.mint.clone()));
+        }
+
+        if pool.token_b.mint == anchor_mint && pool.token_a.mint != anchor_mint {
+            return Some((anchor_mint.to_owned(), pool.token_a.mint.clone()));
+        }
+    }
+
+    None
 }
 
 fn pumpswap_observation_matches_pair(
@@ -870,25 +1133,54 @@ async fn fetch_hydration<const N: usize>(
         ]
     });
 
+    let started_at = Instant::now();
+
+    println!(
+        "rpc_request_start: label={} hydration id={} method=getMultipleAccounts account_count={}",
+        venue, request_id, N
+    );
+
     let response = rpc_client
         .post(SOLANA_RPC_URL)
         .json(&request)
         .send()
         .await
-        .map_err(|error| format!("{venue} hydration RPC request failed: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "{venue} hydration RPC request failed after {} ms: {error}",
+                started_at.elapsed().as_millis()
+            )
+        })?;
 
     let status = response.status();
 
     if !status.is_success() {
         return Err(format!(
-            "{venue} hydration RPC returned HTTP status {status}"
+            "{venue} hydration RPC returned HTTP status {status} after {} ms",
+            started_at.elapsed().as_millis()
         ));
     }
 
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("{venue} hydration RPC returned invalid JSON: {error}"))
+    let payload = response.json::<Value>().await.map_err(|error| {
+        format!(
+            "{venue} hydration RPC returned invalid JSON after {} ms: {error}",
+            started_at.elapsed().as_millis()
+        )
+    })?;
+
+    println!(
+        concat!(
+            "rpc_request_finish: label={} hydration id={} status={} ",
+            "elapsed_ms={} rpc_error={}"
+        ),
+        venue,
+        request_id,
+        status,
+        started_at.elapsed().as_millis(),
+        payload.get("error").is_some()
+    );
+
+    Ok(payload)
 }
 
 fn unix_time_ms_now() -> Result<u64, String> {
