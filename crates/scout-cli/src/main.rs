@@ -422,17 +422,19 @@ async fn discover_deterministic_cross_venue_overlap(
                     continue;
                 }
 
-                let (pumpswap_normalized, pumpswap_snapshot) =
-                    match hydrate_pumpswap_observation(rpc_client, &pumpswap_observation).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            println!(
-                                "deterministic_exact_pair_candidate_rejected: pool={} reason={error}",
-                                pumpswap_observation.pubkey
-                            );
-                            continue;
-                        }
-                    };
+                let pumpswap_hydration_result =
+                    hydrate_pumpswap_observation(rpc_client, &pumpswap_observation).await;
+
+                let (pumpswap_normalized, pumpswap_snapshot) = match pumpswap_hydration_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_candidate_rejected: pool={} reason={error}",
+                            pumpswap_observation.pubkey
+                        );
+                        continue;
+                    }
+                };
 
                 if !normalized_pool_is_eligible(&pumpswap_normalized) {
                     continue;
