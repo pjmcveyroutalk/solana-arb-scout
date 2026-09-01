@@ -1,4 +1,5 @@
 mod discovery;
+pub mod economics;
 mod pumpswap;
 mod quote;
 mod raydium;
