@@ -362,8 +362,8 @@ mod tests {
     }
 
     #[test]
-    fn route_quote_output_is_the_gross_basis_without_dex_fee_double_counting(
-    ) -> Result<(), String> {
+    fn route_quote_output_is_the_gross_basis_without_dex_fee_double_counting() -> Result<(), String>
+    {
         let quote = route_quote(1_000, 1_050)?;
         let costs = cost_model()?;
         let result = evaluate_expected_net(&quote, &costs)?;
@@ -483,4 +483,4 @@ mod tests {
 
         Ok(())
     }
-                }
+}
