@@ -14,13 +14,13 @@ use futures_util::{SinkExt, StreamExt};
 use quote::{quote_two_leg_exact_input, VenueQuoteContext};
 use registry::ActiveMintRegistry;
 use reqwest::Client;
-use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
+use route::{generate_two_leg_routes, RouteLeg};
+use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
 use serde_json::{json, Value};
 use sizing::{
     parse_sol_usd_price, sol_usd_price_request, usd_dollars_to_anchor_raw, SolUsdPrice,
     USD_SIZE_GRID,
 };
-use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{timeout, Duration};
@@ -70,7 +70,7 @@ async fn main() -> Result<(), String> {
         .await
         .map_err(|error| format!("could not subscribe to Solana slots: {error}"))?;
 
-    wait_for_subscription_confirmation(&mut reader, 1, "slot")?;
+    wait_for_subscription_confirmation(&mut reader, 1, "slot").await?;
 
     println!("Scout V0 live read-only Solana stream");
     println!("No signing, transaction construction, submission, or execution capability.");
@@ -78,21 +78,25 @@ async fn main() -> Result<(), String> {
     observe_slots(&mut reader).await?;
 
     writer
-        .send(Message::Text(raydium::program_subscribe_request().to_string()))
+        .send(Message::Text(
+            raydium::program_subscribe_request().to_string(),
+        ))
         .await
         .map_err(|error| format!("could not subscribe to Raydium CPMM: {error}"))?;
 
-    wait_for_subscription_confirmation(&mut reader, 2, "Raydium CPMM")?;
+    wait_for_subscription_confirmation(&mut reader, 2, "Raydium CPMM").await?;
 
     let (mut raydium_states, mut raydium_quote_contexts) =
         observe_raydium(&rpc_client, &mut reader).await?;
 
     writer
-        .send(Message::Text(pumpswap::program_subscribe_request().to_string()))
+        .send(Message::Text(
+            pumpswap::program_subscribe_request().to_string(),
+        ))
         .await
         .map_err(|error| format!("could not subscribe to PumpSwap: {error}"))?;
 
-    wait_for_subscription_confirmation(&mut reader, 4, "PumpSwap")?;
+    wait_for_subscription_confirmation(&mut reader, 4, "PumpSwap").await?;
 
     let (mut pumpswap_states, mut pumpswap_quote_contexts) =
         observe_pumpswap(&rpc_client, &mut reader).await?;
@@ -120,15 +124,9 @@ async fn main() -> Result<(), String> {
         ) = discover_deterministic_cross_venue_overlap(&rpc_client).await?;
 
         merge_normalized_states(&mut raydium_states, discovered_raydium_states);
-        merge_quote_contexts(
-            &mut raydium_quote_contexts,
-            discovered_raydium_contexts,
-        );
+        merge_quote_contexts(&mut raydium_quote_contexts, discovered_raydium_contexts);
         merge_normalized_states(&mut pumpswap_states, discovered_pumpswap_states);
-        merge_quote_contexts(
-            &mut pumpswap_quote_contexts,
-            discovered_pumpswap_contexts,
-        );
+        merge_quote_contexts(&mut pumpswap_quote_contexts, discovered_pumpswap_contexts);
     }
 
     let sol_usd_price = fetch_sol_usd_price(&rpc_client).await?;
@@ -320,19 +318,14 @@ async fn discover_deterministic_cross_venue_overlap(
     let mut successful_anchor_responses = 0usize;
 
     for request in raydium_anchor_lookup_requests() {
-        let payload = match fetch_program_accounts(
-            rpc_client,
-            &request,
-            "Raydium anchor lookup",
-        )
-        .await
-        {
-            Ok(payload) => payload,
-            Err(error) => {
-                println!("raydium_anchor_lookup_rejected: {error}");
-                continue;
-            }
-        };
+        let payload =
+            match fetch_program_accounts(rpc_client, &request, "Raydium anchor lookup").await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!("raydium_anchor_lookup_rejected: {error}");
+                    continue;
+                }
+            };
 
         let observations = match parse_raydium_anchor_lookup_response(&payload) {
             Ok(observations) => {
@@ -361,11 +354,8 @@ async fn discover_deterministic_cross_venue_overlap(
             }
 
             let (raydium_normalized, raydium_snapshot) =
-                match hydrate_raydium_observation(
-                    rpc_client,
-                    &discovery_candidate.observation,
-                )
-                .await
+                match hydrate_raydium_observation(rpc_client, &discovery_candidate.observation)
+                    .await
                 {
                     Ok(result) => result,
                     Err(error) => {
@@ -428,12 +418,7 @@ async fn discover_deterministic_cross_venue_overlap(
                     }
 
                     let (pumpswap_normalized, pumpswap_snapshot) =
-                        match hydrate_pumpswap_observation(
-                            rpc_client,
-                            &pumpswap_observation,
-                        )
-                        .await
-                        {
+                        match hydrate_pumpswap_observation(rpc_client, &pumpswap_observation).await {
                             Ok(result) => result,
                             Err(error) => {
                                 println!(
@@ -461,8 +446,7 @@ async fn discover_deterministic_cross_venue_overlap(
                     println!("READ-ONLY RUNG 9 DETERMINISTIC DISCOVERY PASS");
 
                     let mut raydium_contexts = BTreeMap::new();
-                    raydium_contexts
-                        .insert(raydium_normalized.pool_id.clone(), raydium_snapshot);
+                    raydium_contexts.insert(raydium_normalized.pool_id.clone(), raydium_snapshot);
 
                     let mut pumpswap_contexts = BTreeMap::new();
                     pumpswap_contexts
@@ -499,13 +483,7 @@ async fn discover_deterministic_cross_venue_overlap(
 async fn hydrate_raydium_observation(
     rpc_client: &Client,
     observation: &raydium::RaydiumCpmmAccountObservation,
-) -> Result<
-    (
-        NormalizedPoolState,
-        raydium::RaydiumHydrationSnapshot,
-    ),
-    String,
-> {
+) -> Result<(NormalizedPoolState, raydium::RaydiumHydrationSnapshot), String> {
     let received_at = unix_time_ms_now()?;
     let request_accounts = raydium::hydration_account_pubkeys(observation);
     let payload = fetch_hydration(
@@ -518,12 +496,8 @@ async fn hydrate_raydium_observation(
     .await?;
     let snapshot = raydium::parse_hydration_response(observation, &payload)?;
     let hydrated_at = unix_time_ms_now()?;
-    let normalized = raydium::hydrate_normalized_observation(
-        observation,
-        &snapshot,
-        received_at,
-        hydrated_at,
-    )?;
+    let normalized =
+        raydium::hydrate_normalized_observation(observation, &snapshot, received_at, hydrated_at)?;
 
     Ok((normalized, snapshot))
 }
@@ -531,13 +505,7 @@ async fn hydrate_raydium_observation(
 async fn hydrate_pumpswap_observation(
     rpc_client: &Client,
     observation: &pumpswap::PumpSwapAccountObservation,
-) -> Result<
-    (
-        NormalizedPoolState,
-        pumpswap::PumpSwapHydrationSnapshot,
-    ),
-    String,
-> {
+) -> Result<(NormalizedPoolState, pumpswap::PumpSwapHydrationSnapshot), String> {
     let received_at = unix_time_ms_now()?;
     let request_accounts = pumpswap::hydration_account_pubkeys(observation);
     let payload = fetch_hydration(
@@ -550,12 +518,8 @@ async fn hydrate_pumpswap_observation(
     .await?;
     let snapshot = pumpswap::parse_hydration_response(observation, &payload)?;
     let hydrated_at = unix_time_ms_now()?;
-    let normalized = pumpswap::hydrate_normalized_observation(
-        observation,
-        &snapshot,
-        received_at,
-        hydrated_at,
-    )?;
+    let normalized =
+        pumpswap::hydrate_normalized_observation(observation, &snapshot, received_at, hydrated_at)?;
 
     Ok((normalized, snapshot))
 }
@@ -599,9 +563,7 @@ async fn fetch_sol_usd_price(rpc_client: &Client) -> Result<SolUsdPrice, String>
     let status = response.status();
 
     if !status.is_success() {
-        return Err(format!(
-            "Pyth SOL/USD RPC returned HTTP status {status}"
-        ));
+        return Err(format!("Pyth SOL/USD RPC returned HTTP status {status}"));
     }
 
     let payload = response
@@ -636,10 +598,7 @@ fn merge_normalized_states(
     }
 }
 
-fn merge_quote_contexts<T>(
-    destination: &mut BTreeMap<String, T>,
-    additions: BTreeMap<String, T>,
-) {
+fn merge_quote_contexts<T>(destination: &mut BTreeMap<String, T>, additions: BTreeMap<String, T>) {
     for (pool_id, context) in additions {
         destination.insert(pool_id, context);
     }
@@ -814,10 +773,7 @@ fn validate_registry_routes_and_sizes(
 
         if route_grid_quotes == USD_SIZE_GRID.len() {
             successful_routes += 1;
-            println!(
-                "rung10_complete_grid_route: {}",
-                route_candidate.summary()
-            );
+            println!("rung10_complete_grid_route: {}", route_candidate.summary());
         }
     }
 
@@ -869,16 +825,13 @@ fn quote_context_for_leg<'a>(
     }
 }
 
-fn context_mint_decimals(
-    context: &VenueQuoteContext<'_>,
-    mint: &str,
-) -> Result<u8, String> {
+fn context_mint_decimals(context: &VenueQuoteContext<'_>, mint: &str) -> Result<u8, String> {
     match context {
         VenueQuoteContext::Raydium { snapshot, .. } => {
             if snapshot.pool_state.token_0_mint == mint {
-                Ok(snapshot.token_0_decimals)
+                Ok(snapshot.pool_state.mint_0_decimals)
             } else if snapshot.pool_state.token_1_mint == mint {
-                Ok(snapshot.token_1_decimals)
+                Ok(snapshot.pool_state.mint_1_decimals)
             } else {
                 Err(format!("mint {mint} is not in Raydium quote context"))
             }
@@ -953,8 +906,7 @@ fn unix_time_seconds_now() -> Result<i64, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("system clock before Unix epoch: {error}"))?;
 
-    i64::try_from(duration.as_secs())
-        .map_err(|_| "Unix timestamp seconds exceeded i64".to_owned())
+    i64::try_from(duration.as_secs()).map_err(|_| "Unix timestamp seconds exceeded i64".to_owned())
 }
 
 async fn wait_for_subscription_confirmation<S>(
