@@ -274,6 +274,9 @@ mod tests {
                 protocol_fee_raw: 2,
                 creator_fee_raw: 0,
             },
+            Venue::Meteora | Venue::Orca => {
+                panic!("unsupported venue in economics test fixture")
+            }
         };
 
         VenueLegQuote {
