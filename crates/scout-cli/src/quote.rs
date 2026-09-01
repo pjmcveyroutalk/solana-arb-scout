@@ -116,6 +116,7 @@ pub enum VenueQuoteContext<'a> {
     },
 }
 
+#[cfg(test)]
 pub fn one_whole_anchor_input_raw(
     route: &TwoLegRouteCandidate,
     leg_1_context: &VenueQuoteContext<'_>,
@@ -294,6 +295,7 @@ fn context_contains_pair(
         || (mint_b == input_mint && mint_a == output_mint)
 }
 
+#[cfg(test)]
 fn context_mint_decimals(context: &VenueQuoteContext<'_>, mint: &str) -> Result<u8, String> {
     match context {
         VenueQuoteContext::Raydium { snapshot, .. } => {
