@@ -193,10 +193,7 @@ mod tests {
         assert_eq!(pool.quote_reserves, QuoteReserveState::Unavailable);
         assert!(!pool.quote_reserves.is_available());
         assert_eq!(pool.quote_reserves.label(), "unavailable");
-        assert_eq!(
-            pool.quote_reserves.summary(),
-            "quote_reserves=unavailable"
-        );
+        assert_eq!(pool.quote_reserves.summary(), "quote_reserves=unavailable");
     }
 
     #[test]
