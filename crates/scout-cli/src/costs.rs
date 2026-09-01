@@ -9,7 +9,6 @@ pub const MODELED_COMPUTE_UNIT_LIMIT: u64 = 600_000;
 pub const BASE_FEE_LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 
 const MICRO_LAMPORTS_PER_LAMPORT: u128 = 1_000_000;
-const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriorityObservationScope {
@@ -110,7 +109,9 @@ pub fn parse_priority_fee_observations(
                 .get("prioritizationFee")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| {
-                    format!("priority-fee observation at slot {slot} missing prioritizationFee")
+                    format!(
+                        "priority-fee observation at slot {slot} missing prioritizationFee"
+                    )
                 })?;
 
             Ok(PriorityFeeObservation {
@@ -283,9 +284,13 @@ pub fn jito_tip_lamports_to_cost(
 
     RequiredCost::known(
         amount_anchor_raw,
-        CostProvenanceKind::Observed,
+        CostProvenanceKind::ModeledAssumption,
         format!(
-            "source=Jito-public-tip-floor observation_time={} selected_tip_lamports={} selection_basis={}",
+            concat!(
+                "source_observation=Jito-public-tip-floor ",
+                "observation_time={} selected_tip_lamports={} ",
+                "selection_basis={} interpretation=hypothetical-submission-cost"
+            ),
             observation_time, tip_lamports, selection_basis
         ),
     )
@@ -295,7 +300,7 @@ pub fn lamports_to_anchor_raw(
     lamports: u64,
     anchor_mint: &str,
     anchor_decimals: u8,
-    sol_usd_price: &SolUsdPrice,
+    _sol_usd_price: &SolUsdPrice,
 ) -> Result<u64, String> {
     if anchor_mint == WRAPPED_SOL_MINT {
         if anchor_decimals != 9 {
@@ -307,47 +312,20 @@ pub fn lamports_to_anchor_raw(
         return Ok(lamports);
     }
 
-    if anchor_mint != USDC_MINT && anchor_mint != USDT_MINT {
+    if anchor_mint == USDC_MINT || anchor_mint == USDT_MINT {
         return Err(format!(
-            "unsupported Rung 11 external-cost anchor mint {anchor_mint}"
+            concat!(
+                "Rung 11 stablecoin external-cost conversion is not yet authorized for anchor {}; ",
+                "SOL/USD alone does not prove stablecoin/USD parity and no explicit parity ",
+                "observation/model basis has been supplied"
+            ),
+            anchor_mint
         ));
     }
 
-    if sol_usd_price.price == 0 {
-        return Err("SOL/USD price must be greater than zero".to_owned());
-    }
-
-    let anchor_scale = checked_pow10(u32::from(anchor_decimals))?;
-
-    let mut numerator = u128::from(lamports)
-        .checked_mul(u128::from(sol_usd_price.price))
-        .and_then(|value| value.checked_mul(anchor_scale))
-        .ok_or_else(|| "lamport-to-anchor numerator overflow".to_owned())?;
-
-    let mut denominator = LAMPORTS_PER_SOL;
-
-    if sol_usd_price.exponent < 0 {
-        let exponent_magnitude = sol_usd_price
-            .exponent
-            .checked_abs()
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| "SOL/USD exponent magnitude overflow".to_owned())?;
-
-        denominator = denominator
-            .checked_mul(checked_pow10(exponent_magnitude)?)
-            .ok_or_else(|| "lamport-to-anchor denominator overflow".to_owned())?;
-    } else {
-        let exponent = u32::try_from(sol_usd_price.exponent)
-            .map_err(|_| "SOL/USD exponent conversion failed".to_owned())?;
-
-        numerator = numerator
-            .checked_mul(checked_pow10(exponent)?)
-            .ok_or_else(|| "lamport-to-anchor positive-exponent overflow".to_owned())?;
-    }
-
-    let raw = checked_ceil_div(numerator, denominator)?;
-
-    u64::try_from(raw).map_err(|_| "lamport-to-anchor result exceeded u64".to_owned())
+    Err(format!(
+        "unsupported Rung 11 external-cost anchor mint {anchor_mint}"
+    ))
 }
 
 fn jito_sol_field_to_lamports(row: &Value, field: &str) -> Result<u64, String> {
@@ -529,7 +507,10 @@ mod tests {
 
     #[test]
     fn locked_transaction_shape_is_single_signer_and_600k_cu() -> Result<(), String> {
-        assert_eq!(TRANSACTION_SHAPE_BASIS_ID, "rung11-v0-single-signer-600k-cu");
+        assert_eq!(
+            TRANSACTION_SHAPE_BASIS_ID,
+            "rung11-v0-single-signer-600k-cu"
+        );
         assert_eq!(MODELED_SIGNATURE_COUNT, 1);
         assert_eq!(MODELED_COMPUTE_UNIT_LIMIT, 600_000);
         assert_eq!(modeled_base_fee_lamports()?, 5_000);
@@ -628,12 +609,8 @@ mod tests {
 
     #[test]
     fn wsol_external_cost_preserves_lamport_raw_units() -> Result<(), String> {
-        let raw = lamports_to_anchor_raw(
-            12_345,
-            WRAPPED_SOL_MINT,
-            9,
-            &SOL_USD_PRICE,
-        )?;
+        let raw =
+            lamports_to_anchor_raw(12_345, WRAPPED_SOL_MINT, 9, &SOL_USD_PRICE)?;
 
         assert_eq!(raw, 12_345);
 
@@ -641,28 +618,21 @@ mod tests {
     }
 
     #[test]
-    fn stablecoin_external_cost_uses_verified_sol_usd_context_and_rounds_up(
-    ) -> Result<(), String> {
-        let raw = lamports_to_anchor_raw(
-            5_000,
-            USDC_MINT,
-            6,
-            &SOL_USD_PRICE,
-        )?;
+    fn stablecoin_external_cost_fails_closed_without_parity_basis() {
+        let usdc_result =
+            lamports_to_anchor_raw(5_000, USDC_MINT, 6, &SOL_USD_PRICE);
 
-        assert_eq!(raw, 1);
+        let usdt_result =
+            lamports_to_anchor_raw(5_000, USDT_MINT, 6, &SOL_USD_PRICE);
 
-        Ok(())
+        assert!(usdc_result.is_err());
+        assert!(usdt_result.is_err());
     }
 
     #[test]
     fn unsupported_anchor_fails_closed() {
-        let result = lamports_to_anchor_raw(
-            5_000,
-            "unsupported-mint",
-            6,
-            &SOL_USD_PRICE,
-        );
+        let result =
+            lamports_to_anchor_raw(5_000, "unsupported-mint", 6, &SOL_USD_PRICE);
 
         assert!(result.is_err());
     }
@@ -690,72 +660,4 @@ mod tests {
     }
 
     #[test]
-    fn modeled_costs_preserve_assumption_provenance() -> Result<(), String> {
-        let base_fee =
-            modeled_base_fee_cost(WRAPPED_SOL_MINT, 9, &SOL_USD_PRICE)?;
-
-        let base_fee = base_fee.resolve("base_fee")?;
-
-        assert_eq!(
-            base_fee.provenance_kind(),
-            CostProvenanceKind::ModeledAssumption
-        );
-        assert_eq!(base_fee.amount_anchor_raw(), 5_000);
-
-        let observation = PriorityFeeObservation {
-            slot: 123,
-            micro_lamports_per_cu: 50_000,
-            scope: PriorityObservationScope::Global,
-        };
-
-        let priority_fee = modeled_priority_fee_cost(
-            &observation,
-            "fixture deterministic selection",
-            WRAPPED_SOL_MINT,
-            9,
-            &SOL_USD_PRICE,
-        )?;
-
-        let priority_fee = priority_fee.resolve("priority_fee")?;
-
-        assert_eq!(
-            priority_fee.provenance_kind(),
-            CostProvenanceKind::ModeledAssumption
-        );
-        assert_eq!(priority_fee.amount_anchor_raw(), 30_000);
-
-        Ok(())
-    }
-
-    #[test]
-    fn invalid_selection_metadata_fails_closed() {
-        let observation = PriorityFeeObservation {
-            slot: 123,
-            micro_lamports_per_cu: 50_000,
-            scope: PriorityObservationScope::Global,
-        };
-
-        assert!(
-            modeled_priority_fee_cost(
-                &observation,
-                "",
-                WRAPPED_SOL_MINT,
-                9,
-                &SOL_USD_PRICE
-            )
-            .is_err()
-        );
-
-        assert!(
-            jito_tip_lamports_to_cost(
-                1_000,
-                "",
-                "fixture",
-                WRAPPED_SOL_MINT,
-                9,
-                &SOL_USD_PRICE
-            )
-            .is_err()
-        );
-    }
-}
+    fn modeled_c
