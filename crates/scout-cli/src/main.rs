@@ -337,7 +337,8 @@ async fn discover_deterministic_cross_venue_overlap(
     let mut exact_pair_count = 0usize;
 
     for raydium_normalized in live_raydium_states {
-        let Some((anchor_mint, intermediate_mint)) = anchor_pair_from_pool(raydium_normalized) else {
+        let Some((anchor_mint, intermediate_mint)) = anchor_pair_from_pool(raydium_normalized)
+        else {
             continue;
         };
 
@@ -351,8 +352,7 @@ async fn discover_deterministic_cross_venue_overlap(
             break;
         }
 
-        let Some(raydium_snapshot) =
-            live_raydium_quote_contexts.get(&raydium_normalized.pool_id)
+        let Some(raydium_snapshot) = live_raydium_quote_contexts.get(&raydium_normalized.pool_id)
         else {
             println!(
                 "deterministic_exact_pair_probe_rejected: raydium_pool={} reason=missing live quote context",
@@ -369,36 +369,40 @@ async fn discover_deterministic_cross_venue_overlap(
             anchor_mint, intermediate_mint, raydium_normalized.pool_id
         );
 
-        for pumpswap_request in
-            pumpswap::pair_lookup_requests(&anchor_mint, &intermediate_mint)
-        {
+        for pumpswap_request in pumpswap::pair_lookup_requests(&anchor_mint, &intermediate_mint) {
             let label = format!(
                 "PumpSwap exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
             );
 
-            let pumpswap_payload =
-                match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        println!(
-                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            anchor_mint, intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+            let pumpswap_payload = match fetch_program_accounts(
+                rpc_client,
+                &pumpswap_request,
+                &label,
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!(
+                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
 
-            let pumpswap_observations =
-                match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
-                    Ok(observations) => observations,
-                    Err(error) => {
-                        println!(
-                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            anchor_mint, intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+            let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
+                &pumpswap_payload,
+            ) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    println!(
+                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
 
             println!(
                 "deterministic_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -416,17 +420,21 @@ async fn discover_deterministic_cross_venue_overlap(
                     continue;
                 }
 
-                let (pumpswap_normalized, pumpswap_snapshot) =
-                    match hydrate_pumpswap_observation(rpc_client, &pumpswap_observation).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            println!(
-                                "deterministic_exact_pair_candidate_rejected: pool={} reason={error}",
-                                pumpswap_observation.pubkey
-                            );
-                            continue;
-                        }
-                    };
+                let (pumpswap_normalized, pumpswap_snapshot) = match hydrate_pumpswap_observation(
+                    rpc_client,
+                    &pumpswap_observation,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_candidate_rejected: pool={} reason={error}",
+                            pumpswap_observation.pubkey
+                        );
+                        continue;
+                    }
+                };
 
                 if !normalized_pool_is_eligible(&pumpswap_normalized) {
                     continue;
@@ -445,14 +453,11 @@ async fn discover_deterministic_cross_venue_overlap(
                 println!("READ-ONLY RUNG 9 DETERMINISTIC DISCOVERY PASS");
 
                 let mut raydium_contexts = BTreeMap::new();
-                raydium_contexts.insert(
-                    raydium_normalized.pool_id.clone(),
-                    raydium_snapshot.clone(),
-                );
+                raydium_contexts
+                    .insert(raydium_normalized.pool_id.clone(), raydium_snapshot.clone());
 
                 let mut pumpswap_contexts = BTreeMap::new();
-                pumpswap_contexts
-                    .insert(pumpswap_normalized.pool_id.clone(), pumpswap_snapshot);
+                pumpswap_contexts.insert(pumpswap_normalized.pool_id.clone(), pumpswap_snapshot);
 
                 return Ok((
                     vec![raydium_normalized.clone()],
@@ -559,31 +564,37 @@ async fn discover_deterministic_cross_venue_overlap(
                     discovery_candidate.anchor_mint, discovery_candidate.intermediate_mint
                 );
 
-                let pumpswap_payload =
-                    match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
-                        Ok(payload) => payload,
-                        Err(error) => {
-                            println!(
-                                "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                                discovery_candidate.anchor_mint,
-                                discovery_candidate.intermediate_mint
-                            );
-                            continue;
-                        }
-                    };
+                let pumpswap_payload = match fetch_program_accounts(
+                    rpc_client,
+                    &pumpswap_request,
+                    &label,
+                )
+                .await
+                {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            discovery_candidate.anchor_mint,
+                            discovery_candidate.intermediate_mint
+                        );
+                        continue;
+                    }
+                };
 
-                let pumpswap_observations =
-                    match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
-                        Ok(observations) => observations,
-                        Err(error) => {
-                            println!(
-                                "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                                discovery_candidate.anchor_mint,
-                                discovery_candidate.intermediate_mint
-                            );
-                            continue;
-                        }
-                    };
+                let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
+                    &pumpswap_payload,
+                ) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        println!(
+                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            discovery_candidate.anchor_mint,
+                            discovery_candidate.intermediate_mint
+                        );
+                        continue;
+                    }
+                };
 
                 println!(
                     "targeted_pumpswap_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -717,9 +728,7 @@ async fn fetch_program_accounts(
     let request_id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
     let started_at = Instant::now();
 
-    println!(
-        "rpc_request_start: label={label} id={request_id} method=getProgramAccounts"
-    );
+    println!("rpc_request_start: label={label} id={request_id} method=getProgramAccounts");
 
     let response = rpc_client
         .post(SOLANA_RPC_URL)
