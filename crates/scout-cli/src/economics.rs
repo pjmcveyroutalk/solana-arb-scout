@@ -231,28 +231,27 @@ mod tests {
     const ANCHOR_MINT: &str = "So11111111111111111111111111111111111111112";
     const INTERMEDIATE_MINT: &str = "Intermediate1111111111111111111111111111111";
 
-    fn explicit_cost(amount_anchor_raw: u64, label: &str) -> ExplicitCost {
-        ExplicitCost::new(amount_anchor_raw, label).expect("test cost must be valid")
+    fn explicit_cost(amount_anchor_raw: u64, label: &str) -> Result<ExplicitCost, String> {
+        ExplicitCost::new(amount_anchor_raw, label)
     }
 
-    fn cost_model() -> EconomicsCostModel {
+    fn cost_model() -> Result<EconomicsCostModel, String> {
         EconomicsCostModel::new(
             "test-cost-basis-v1",
             CommonEconomicsCosts {
-                base_fee: explicit_cost(5, "fixture base fee"),
-                priority_fee: explicit_cost(7, "fixture priority fee"),
-                submission_cost: explicit_cost(11, "fixture submission cost"),
-                expected_failure_cost: explicit_cost(13, "fixture expected failure cost"),
-                safety_reserve: explicit_cost(17, "fixture safety reserve"),
+                base_fee: explicit_cost(5, "fixture base fee")?,
+                priority_fee: explicit_cost(7, "fixture priority fee")?,
+                submission_cost: explicit_cost(11, "fixture submission cost")?,
+                expected_failure_cost: explicit_cost(13, "fixture expected failure cost")?,
+                safety_reserve: explicit_cost(17, "fixture safety reserve")?,
             },
             TreasuryFundingCosts {
-                capital_cost: explicit_cost(19, "fixture treasury capital cost"),
+                capital_cost: explicit_cost(19, "fixture treasury capital cost")?,
             },
             FlashFundingCosts {
-                borrowing_cost: explicit_cost(23, "fixture flash borrowing cost"),
+                borrowing_cost: explicit_cost(23, "fixture flash borrowing cost")?,
             },
         )
-        .expect("test cost model must be valid")
     }
 
     fn leg_quote(
@@ -261,7 +260,7 @@ mod tests {
         amount_in_raw: u64,
         amount_out_raw: u64,
         slot: u64,
-    ) -> VenueLegQuote {
+    ) -> Result<VenueLegQuote, String> {
         let fees = match venue {
             Venue::RaydiumCpmm => VenueFeeComponents::RaydiumCpmm {
                 trade_fee_raw: 10,
@@ -275,11 +274,11 @@ mod tests {
                 creator_fee_raw: 0,
             },
             Venue::Meteora | Venue::Orca => {
-                panic!("unsupported venue in economics test fixture")
+                return Err("unsupported venue in economics test fixture".to_owned());
             }
         };
 
-        VenueLegQuote {
+        Ok(VenueLegQuote {
             venue,
             pool_id: pool_id.to_owned(),
             amount_in_requested_raw: amount_in_raw,
@@ -288,11 +287,14 @@ mod tests {
             amount_out_raw,
             fees,
             quote_source_slot: slot,
-        }
+        })
     }
 
-    fn route_quote(anchor_input_raw: u64, anchor_output_raw: u64) -> TwoLegRouteQuote {
-        TwoLegRouteQuote {
+    fn route_quote(
+        anchor_input_raw: u64,
+        anchor_output_raw: u64,
+    ) -> Result<TwoLegRouteQuote, String> {
+        Ok(TwoLegRouteQuote {
             anchor_mint: ANCHOR_MINT.to_owned(),
             intermediate_mint: INTERMEDIATE_MINT.to_owned(),
             anchor_input_requested_raw: anchor_input_raw,
@@ -305,21 +307,22 @@ mod tests {
                 anchor_input_raw,
                 2_000,
                 100,
-            ),
+            )?,
             leg_2: leg_quote(
                 Venue::PumpSwap,
                 "pumpswap-pool",
                 2_000,
                 anchor_output_raw,
                 101,
-            ),
-        }
+            )?,
+        })
     }
 
     #[test]
-    fn treasury_and_flash_models_are_evaluated_independently() {
-        let quote = route_quote(1_000, 1_200);
-        let result = evaluate_expected_net(&quote, &cost_model()).expect("economics must succeed");
+    fn treasury_and_flash_models_are_evaluated_independently() -> Result<(), String> {
+        let quote = route_quote(1_000, 1_200)?;
+        let costs = cost_model()?;
+        let result = evaluate_expected_net(&quote, &costs)?;
 
         assert_eq!(result.treasury.gross_delta_raw, 200);
         assert_eq!(result.flash.gross_delta_raw, 200);
@@ -338,12 +341,15 @@ mod tests {
 
         assert!(result.treasury.is_positive());
         assert!(result.flash.is_positive());
+
+        Ok(())
     }
 
     #[test]
-    fn negative_gross_route_remains_negative_after_costs() {
-        let quote = route_quote(1_000, 900);
-        let result = evaluate_expected_net(&quote, &cost_model()).expect("economics must succeed");
+    fn negative_gross_route_remains_negative_after_costs() -> Result<(), String> {
+        let quote = route_quote(1_000, 900)?;
+        let costs = cost_model()?;
+        let result = evaluate_expected_net(&quote, &costs)?;
 
         assert_eq!(result.treasury.gross_delta_raw, -100);
         assert_eq!(result.treasury.expected_net_raw, -172);
@@ -351,108 +357,130 @@ mod tests {
 
         assert!(!result.treasury.is_positive());
         assert!(!result.flash.is_positive());
+
+        Ok(())
     }
 
     #[test]
-    fn route_quote_output_is_the_gross_basis_without_dex_fee_double_counting() {
-        let quote = route_quote(1_000, 1_050);
-        let result = evaluate_expected_net(&quote, &cost_model()).expect("economics must succeed");
+    fn route_quote_output_is_the_gross_basis_without_dex_fee_double_counting(
+    ) -> Result<(), String> {
+        let quote = route_quote(1_000, 1_050)?;
+        let costs = cost_model()?;
+        let result = evaluate_expected_net(&quote, &costs)?;
 
         assert_eq!(result.treasury.gross_delta_raw, 50);
         assert_eq!(result.flash.gross_delta_raw, 50);
+
+        Ok(())
     }
 
     #[test]
-    fn zero_anchor_input_is_rejected() {
-        let quote = route_quote(0, 100);
+    fn zero_anchor_input_is_rejected() -> Result<(), String> {
+        let quote = route_quote(0, 100)?;
+        let costs = cost_model()?;
+        let result = evaluate_expected_net(&quote, &costs);
 
-        let error =
-            evaluate_expected_net(&quote, &cost_model()).expect_err("zero input must fail closed");
+        assert_eq!(
+            result,
+            Err("economics requires non-zero anchor input".to_owned())
+        );
 
-        assert_eq!(error, "economics requires non-zero anchor input");
+        Ok(())
     }
 
     #[test]
     fn empty_cost_provenance_is_rejected() {
-        let error = ExplicitCost::new(1, "   ").expect_err("missing provenance must fail closed");
+        let result = ExplicitCost::new(1, "   ");
 
-        assert_eq!(error, "economics cost provenance must not be empty");
+        assert_eq!(
+            result,
+            Err("economics cost provenance must not be empty".to_owned())
+        );
     }
 
     #[test]
-    fn empty_cost_basis_id_is_rejected() {
-        let error = EconomicsCostModel::new(
+    fn empty_cost_basis_id_is_rejected() -> Result<(), String> {
+        let result = EconomicsCostModel::new(
             "",
             CommonEconomicsCosts {
-                base_fee: explicit_cost(1, "base"),
-                priority_fee: explicit_cost(1, "priority"),
-                submission_cost: explicit_cost(1, "submission"),
-                expected_failure_cost: explicit_cost(1, "failure"),
-                safety_reserve: explicit_cost(1, "reserve"),
+                base_fee: explicit_cost(1, "base")?,
+                priority_fee: explicit_cost(1, "priority")?,
+                submission_cost: explicit_cost(1, "submission")?,
+                expected_failure_cost: explicit_cost(1, "failure")?,
+                safety_reserve: explicit_cost(1, "reserve")?,
             },
             TreasuryFundingCosts {
-                capital_cost: explicit_cost(1, "treasury"),
+                capital_cost: explicit_cost(1, "treasury")?,
             },
             FlashFundingCosts {
-                borrowing_cost: explicit_cost(1, "flash"),
+                borrowing_cost: explicit_cost(1, "flash")?,
             },
-        )
-        .expect_err("missing basis id must fail closed");
+        );
 
-        assert_eq!(error, "economics cost basis id must not be empty");
+        assert_eq!(
+            result,
+            Err("economics cost basis id must not be empty".to_owned())
+        );
+
+        Ok(())
     }
 
     #[test]
-    fn common_cost_overflow_is_rejected() {
-        let quote = route_quote(1_000, 2_000);
+    fn common_cost_overflow_is_rejected() -> Result<(), String> {
+        let quote = route_quote(1_000, 2_000)?;
 
         let costs = EconomicsCostModel::new(
             "overflow-test",
             CommonEconomicsCosts {
-                base_fee: explicit_cost(u64::MAX, "base"),
-                priority_fee: explicit_cost(1, "priority"),
-                submission_cost: explicit_cost(0, "submission"),
-                expected_failure_cost: explicit_cost(0, "failure"),
-                safety_reserve: explicit_cost(0, "reserve"),
+                base_fee: explicit_cost(u64::MAX, "base")?,
+                priority_fee: explicit_cost(1, "priority")?,
+                submission_cost: explicit_cost(0, "submission")?,
+                expected_failure_cost: explicit_cost(0, "failure")?,
+                safety_reserve: explicit_cost(0, "reserve")?,
             },
             TreasuryFundingCosts {
-                capital_cost: explicit_cost(0, "treasury"),
+                capital_cost: explicit_cost(0, "treasury")?,
             },
             FlashFundingCosts {
-                borrowing_cost: explicit_cost(0, "flash"),
+                borrowing_cost: explicit_cost(0, "flash")?,
             },
-        )
-        .expect("cost model itself is structurally valid");
+        )?;
 
-        let error = evaluate_expected_net(&quote, &costs).expect_err("overflow must fail closed");
+        let result = evaluate_expected_net(&quote, &costs);
 
-        assert_eq!(error, "economics common cost overflow");
+        assert_eq!(result, Err("economics common cost overflow".to_owned()));
+
+        Ok(())
     }
 
     #[test]
-    fn funding_cost_overflow_is_rejected() {
-        let quote = route_quote(1_000, 2_000);
+    fn funding_cost_overflow_is_rejected() -> Result<(), String> {
+        let quote = route_quote(1_000, 2_000)?;
 
         let costs = EconomicsCostModel::new(
             "funding-overflow-test",
             CommonEconomicsCosts {
-                base_fee: explicit_cost(u64::MAX, "base"),
-                priority_fee: explicit_cost(0, "priority"),
-                submission_cost: explicit_cost(0, "submission"),
-                expected_failure_cost: explicit_cost(0, "failure"),
-                safety_reserve: explicit_cost(0, "reserve"),
+                base_fee: explicit_cost(u64::MAX, "base")?,
+                priority_fee: explicit_cost(0, "priority")?,
+                submission_cost: explicit_cost(0, "submission")?,
+                expected_failure_cost: explicit_cost(0, "failure")?,
+                safety_reserve: explicit_cost(0, "reserve")?,
             },
             TreasuryFundingCosts {
-                capital_cost: explicit_cost(1, "treasury"),
+                capital_cost: explicit_cost(1, "treasury")?,
             },
             FlashFundingCosts {
-                borrowing_cost: explicit_cost(0, "flash"),
+                borrowing_cost: explicit_cost(0, "flash")?,
             },
-        )
-        .expect("cost model itself is structurally valid");
+        )?;
 
-        let error = evaluate_expected_net(&quote, &costs).expect_err("overflow must fail closed");
+        let result = evaluate_expected_net(&quote, &costs);
 
-        assert_eq!(error, "economics total external cost overflow");
+        assert_eq!(
+            result,
+            Err("economics total external cost overflow".to_owned())
+        );
+
+        Ok(())
     }
-}
+                }
