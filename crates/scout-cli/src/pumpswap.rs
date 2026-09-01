@@ -1857,7 +1857,7 @@ mod tests {
     #[test]
     fn noncanonical_pool_uses_flat_fees() -> Result<(), String> {
         let snapshot = quote_snapshot(false, true)?;
-        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.base_mint, 100_000)?;
+        let _quote = quote_exact_input(&snapshot, &snapshot.pool_state.base_mint, 100_000)?;
 
         let canonical = is_canonical_pump_pool(&snapshot.pool_state)?;
         let market_cap = pool_market_cap(&snapshot)?;
