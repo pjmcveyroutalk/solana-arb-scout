@@ -853,10 +853,7 @@ fn quote_context_for_leg<'a>(
                     leg.pool_id()
                 )
             }),
-        other => Err(format!(
-            "unsupported Rung 10 quote venue {}",
-            other.label()
-        )),
+        other => Err(format!("unsupported Rung 10 quote venue {}", other.label())),
     }
 }
 
