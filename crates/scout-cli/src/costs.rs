@@ -135,8 +135,13 @@ pub fn modeled_base_fee_cost(
     sol_usd_price: &SolUsdPrice,
 ) -> Result<RequiredCost, String> {
     let base_fee_lamports = modeled_base_fee_lamports()?;
-    let amount_anchor_raw =
-        lamports_to_anchor_raw(base_fee_lamports, anchor_mint, anchor_decimals, sol_usd_price)?;
+
+    let amount_anchor_raw = lamports_to_anchor_raw(
+        base_fee_lamports,
+        anchor_mint,
+        anchor_decimals,
+        sol_usd_price,
+    )?;
 
     RequiredCost::known(
         amount_anchor_raw,
@@ -336,11 +341,7 @@ fn jito_sol_field_to_lamports(row: &Value, field: &str) -> Result<u64, String> {
     let raw = match value {
         Value::Number(number) => number.to_string(),
         Value::String(text) => text.clone(),
-        _ => {
-            return Err(format!(
-                "Jito tip-floor field {field} must be numeric"
-            ))
-        }
+        _ => return Err(format!("Jito tip-floor field {field} must be numeric")),
     };
 
     decimal_sol_to_lamports(&raw)
@@ -359,15 +360,12 @@ fn decimal_sol_to_lamports(raw: &str) -> Result<u64, String> {
     }
 
     let unsigned = trimmed.strip_prefix('+').unwrap_or(trimmed);
-
     let (mantissa, exponent) = split_decimal_exponent(unsigned)?;
 
     let mut pieces = mantissa.split('.');
-
     let whole = pieces
         .next()
         .ok_or_else(|| "SOL amount missing mantissa".to_owned())?;
-
     let fractional = pieces.next().unwrap_or("");
 
     if pieces.next().is_some() {
@@ -528,8 +526,11 @@ mod tests {
         );
 
         assert_eq!(
-            request.pointer("/params/0").and_then(Value::as_array),
-            Some(&Vec::<Value>::new())
+            request
+                .pointer("/params/0")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
         );
     }
 
@@ -555,10 +556,7 @@ mod tests {
         assert_eq!(observations.len(), 2);
         assert_eq!(observations[0].slot, 100);
         assert_eq!(observations[0].micro_lamports_per_cu, 50_000);
-        assert_eq!(
-            observations[0].scope,
-            PriorityObservationScope::Global
-        );
+        assert_eq!(observations[0].scope, PriorityObservationScope::Global);
 
         Ok(())
     }
@@ -572,8 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn jito_parser_converts_sol_values_to_lamports_without_unit_confusion(
-    ) -> Result<(), String> {
+    fn jito_parser_converts_sol_values_to_lamports_without_unit_confusion() -> Result<(), String> {
         let payload = json!([
             {
                 "time": "2026-09-01T12:00:00Z",
@@ -619,22 +616,26 @@ mod tests {
 
     #[test]
     fn stablecoin_external_cost_fails_closed_without_parity_basis() {
-        let usdc_result =
-            lamports_to_anchor_raw(5_000, USDC_MINT, 6, &SOL_USD_PRICE);
+        assert!(
+            lamports_to_anchor_raw(5_000, USDC_MINT, 6, &SOL_USD_PRICE).is_err()
+        );
 
-        let usdt_result =
-            lamports_to_anchor_raw(5_000, USDT_MINT, 6, &SOL_USD_PRICE);
-
-        assert!(usdc_result.is_err());
-        assert!(usdt_result.is_err());
+        assert!(
+            lamports_to_anchor_raw(5_000, USDT_MINT, 6, &SOL_USD_PRICE).is_err()
+        );
     }
 
     #[test]
     fn unsupported_anchor_fails_closed() {
-        let result =
-            lamports_to_anchor_raw(5_000, "unsupported-mint", 6, &SOL_USD_PRICE);
-
-        assert!(result.is_err());
+        assert!(
+            lamports_to_anchor_raw(
+                5_000,
+                "unsupported-mint",
+                6,
+                &SOL_USD_PRICE
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -660,4 +661,4 @@ mod tests {
     }
 
     #[test]
-    fn modeled_c
+    fn modeled_costs_
