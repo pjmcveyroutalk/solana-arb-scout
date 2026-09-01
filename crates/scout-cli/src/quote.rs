@@ -294,10 +294,7 @@ fn context_contains_pair(
         || (mint_b == input_mint && mint_a == output_mint)
 }
 
-fn context_mint_decimals(
-    context: &VenueQuoteContext<'_>,
-    mint: &str,
-) -> Result<u8, String> {
+fn context_mint_decimals(context: &VenueQuoteContext<'_>, mint: &str) -> Result<u8, String> {
     match context {
         VenueQuoteContext::Raydium { snapshot, .. } => {
             if mint == snapshot.pool_state.token_0_mint {
@@ -323,9 +320,7 @@ fn context_mint_decimals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pumpswap::{
-        PumpSwapFeeConfig, PumpSwapFeeTier, PumpSwapFees, PumpSwapPoolState,
-    };
+    use crate::pumpswap::{PumpSwapFeeConfig, PumpSwapFeeTier, PumpSwapFees, PumpSwapPoolState};
     use crate::raydium::{RaydiumAmmConfig, RaydiumCpmmPoolState};
     use crate::route::{generate_two_leg_routes, WRAPPED_SOL_MINT};
     use scout_core::{NormalizedPoolState, NormalizedToken, PoolTradingState, QuoteReserveState};
@@ -523,14 +518,13 @@ mod tests {
             snapshot: &ray,
         };
 
-        let quote = quote_two_leg_exact_input(
-            route,
-            1_000_000_000,
-            &leg_1_context,
-            &leg_2_context,
-        )?;
+        let quote =
+            quote_two_leg_exact_input(route, 1_000_000_000, &leg_1_context, &leg_2_context)?;
 
-        assert_eq!(quote.leg_2.amount_in_requested_raw, quote.leg_1.amount_out_raw);
+        assert_eq!(
+            quote.leg_2.amount_in_requested_raw,
+            quote.leg_1.amount_out_raw
+        );
         assert_eq!(quote.leg_2.amount_in_unspent_raw, 0);
         assert_eq!(
             quote.anchor_output_raw,
