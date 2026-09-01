@@ -254,12 +254,7 @@ pub fn quote_exact_input(
     }
 
     if input_mint == snapshot.pool_state.base_mint {
-        quote_base_input(
-            snapshot,
-            amount_in_raw,
-            selected_fees,
-            creator_fee_bps,
-        )
+        quote_base_input(snapshot, amount_in_raw, selected_fees, creator_fee_bps)
     } else if input_mint == snapshot.pool_state.quote_mint {
         quote_quote_input(
             snapshot,
@@ -453,11 +448,9 @@ fn is_canonical_pump_pool(pool: &PumpSwapPoolState) -> Result<bool, String> {
         .map_err(|error| format!("invalid PumpSwap creator for canonicality: {error}"))?;
     let pump_program = Pubkey::from_str(PUMP_PROGRAM_ID)
         .map_err(|error| format!("invalid Pump program id: {error}"))?;
-    let (expected_creator, _) = Pubkey::try_find_program_address(
-        &[b"pool-authority", base_mint.as_ref()],
-        &pump_program,
-    )
-    .ok_or_else(|| "could not derive canonical PumpSwap pool authority PDA".to_owned())?;
+    let (expected_creator, _) =
+        Pubkey::try_find_program_address(&[b"pool-authority", base_mint.as_ref()], &pump_program)
+            .ok_or_else(|| "could not derive canonical PumpSwap pool authority PDA".to_owned())?;
 
     Ok(pool_creator == expected_creator)
 }
