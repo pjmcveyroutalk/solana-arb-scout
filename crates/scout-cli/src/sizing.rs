@@ -1,5 +1,5 @@
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crate::route::{USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde_json::{json, Value};
 
 pub const USD_SIZE_GRID: [u64; 9] = [1, 5, 10, 25, 50, 100, 250, 500, 1_000];
@@ -9,8 +9,8 @@ const PYTH_RECEIVER_PROGRAM_ID: &str = "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5L
 const PRICE_UPDATE_V2_LEN: usize = 134;
 const PRICE_UPDATE_V2_DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
 const SOL_USD_FEED_ID: [u8; 32] = [
-    239, 13, 139, 111, 218, 44, 235, 164, 29, 161, 93, 64, 149, 209, 218, 57, 42, 13, 47,
-    142, 208, 198, 199, 188, 15, 76, 250, 200, 194, 128, 181, 109,
+    239, 13, 139, 111, 218, 44, 235, 164, 29, 161, 93, 64, 149, 209, 218, 57, 42, 13, 47, 142, 208,
+    198, 199, 188, 15, 76, 250, 200, 194, 128, 181, 109,
 ];
 const MAX_SOL_USD_AGE_SECONDS: u64 = 90;
 const MAX_FUTURE_SKEW_SECONDS: i64 = 5;
@@ -56,7 +56,9 @@ pub fn sol_usd_price_request() -> Value {
 
 pub fn parse_sol_usd_price(payload: &Value, now_unix_seconds: i64) -> Result<SolUsdPrice, String> {
     if let Some(error) = payload.get("error") {
-        return Err(format!("Pyth SOL/USD getAccountInfo returned an RPC error: {error}"));
+        return Err(format!(
+            "Pyth SOL/USD getAccountInfo returned an RPC error: {error}"
+        ));
     }
 
     let rpc_slot = payload
@@ -102,7 +104,9 @@ pub fn parse_sol_usd_price(payload: &Value, now_unix_seconds: i64) -> Result<Sol
         .ok_or_else(|| "Pyth SOL/USD account missing data encoding".to_owned())?;
 
     if encoding != "base64" {
-        return Err(format!("unexpected Pyth SOL/USD account encoding: {encoding}"));
+        return Err(format!(
+            "unexpected Pyth SOL/USD account encoding: {encoding}"
+        ));
     }
 
     let data = BASE64_STANDARD
@@ -323,7 +327,10 @@ mod tests {
     fn price_request_targets_sponsored_sol_usd_account() {
         let request = sol_usd_price_request();
 
-        assert_eq!(request.get("method").and_then(Value::as_str), Some("getAccountInfo"));
+        assert_eq!(
+            request.get("method").and_then(Value::as_str),
+            Some("getAccountInfo")
+        );
         assert_eq!(
             request.pointer("/params/0").and_then(Value::as_str),
             Some(PYTH_SOL_USD_ACCOUNT)
@@ -349,8 +356,7 @@ mod tests {
         let bytes = price_update_bytes(20_000_000_000, -8, NOW - 30);
 
         let mut wrong_owner = price_payload(&bytes);
-        wrong_owner["result"]["value"]["owner"] =
-            Value::from("11111111111111111111111111111111");
+        wrong_owner["result"]["value"]["owner"] = Value::from("11111111111111111111111111111111");
         assert!(parse_sol_usd_price(&wrong_owner, NOW).is_err());
 
         let mut wrong_feed_bytes = bytes.clone();
@@ -420,12 +426,7 @@ mod tests {
             rpc_slot: 1,
         };
         assert_eq!(
-            usd_dollars_to_anchor_raw(
-                1,
-                WRAPPED_SOL_MINT,
-                9,
-                Some(&positive_exponent_price)
-            )?,
+            usd_dollars_to_anchor_raw(1, WRAPPED_SOL_MINT, 9, Some(&positive_exponent_price))?,
             5_000_000
         );
 
