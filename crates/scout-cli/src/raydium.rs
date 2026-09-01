@@ -6,6 +6,10 @@ use serde_json::{json, Value};
 
 pub const RAYDIUM_CPMM_PROGRAM_ID: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const FEE_RATE_DENOMINATOR: u64 = 1_000_000;
+
 const POOL_STATE_LEN: usize = 637;
 const POOL_STATE_DISCRIMINATOR: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70];
 
@@ -166,6 +170,271 @@ impl RaydiumHydrationSnapshot {
             self.amm_config.creator_fee_rate,
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaydiumExactInputQuote {
+    pub amount_in_raw: u64,
+    pub amount_out_raw: u64,
+    pub trade_fee_raw: u64,
+    pub protocol_fee_raw: u64,
+    pub fund_fee_raw: u64,
+    pub creator_fee_raw: u64,
+    pub source_slot: u64,
+}
+
+pub fn quote_exact_input(
+    snapshot: &RaydiumHydrationSnapshot,
+    input_mint: &str,
+    amount_in_raw: u64,
+) -> Result<RaydiumExactInputQuote, String> {
+    if amount_in_raw == 0 {
+        return Err("Raydium quote input must be greater than zero".to_owned());
+    }
+
+    ensure_legacy_token_program(
+        &snapshot.pool_state.token_0_program,
+        "Raydium token_0",
+    )?;
+    ensure_legacy_token_program(
+        &snapshot.pool_state.token_1_program,
+        "Raydium token_1",
+    )?;
+
+    let zero_for_one = if input_mint == snapshot.pool_state.token_0_mint {
+        true
+    } else if input_mint == snapshot.pool_state.token_1_mint {
+        false
+    } else {
+        return Err(format!(
+            "Raydium quote input mint {input_mint} is not in pool"
+        ));
+    };
+
+    let (input_reserve, output_reserve) = if zero_for_one {
+        (
+            snapshot.token_0_effective_raw,
+            snapshot.token_1_effective_raw,
+        )
+    } else {
+        (
+            snapshot.token_1_effective_raw,
+            snapshot.token_0_effective_raw,
+        )
+    };
+
+    if input_reserve == 0 || output_reserve == 0 {
+        return Err("Raydium quote reserves must be greater than zero".to_owned());
+    }
+
+    validate_fee_rate(snapshot.amm_config.trade_fee_rate, "trade_fee_rate")?;
+    validate_fee_rate(snapshot.amm_config.protocol_fee_rate, "protocol_fee_rate")?;
+    validate_fee_rate(snapshot.amm_config.fund_fee_rate, "fund_fee_rate")?;
+    validate_fee_rate(snapshot.amm_config.creator_fee_rate, "creator_fee_rate")?;
+
+    let trade_fee_share_rate = snapshot
+        .amm_config
+        .protocol_fee_rate
+        .checked_add(snapshot.amm_config.fund_fee_rate)
+        .ok_or_else(|| "Raydium protocol/fund fee-share rate overflow".to_owned())?;
+    if trade_fee_share_rate > FEE_RATE_DENOMINATOR {
+        return Err(format!(
+            "Raydium protocol/fund fee-share total exceeds {FEE_RATE_DENOMINATOR}: {trade_fee_share_rate}"
+        ));
+    }
+
+    let creator_fee_rate = if snapshot.pool_state.enable_creator_fee {
+        snapshot.amm_config.creator_fee_rate
+    } else {
+        0
+    };
+
+    let creator_fee_on_input =
+        creator_fee_on_input(snapshot.pool_state.creator_fee_on, zero_for_one)?;
+
+    let (trade_fee_raw, creator_fee_raw, curve_input_raw) = if creator_fee_on_input {
+        let combined_rate = snapshot
+            .amm_config
+            .trade_fee_rate
+            .checked_add(creator_fee_rate)
+            .ok_or_else(|| "Raydium combined input fee rate overflow".to_owned())?;
+
+        if combined_rate >= FEE_RATE_DENOMINATOR {
+            return Err(format!(
+                "Raydium combined input fee rate must be below {FEE_RATE_DENOMINATOR}"
+            ));
+        }
+
+        let total_fee = fee_ceil(amount_in_raw, combined_rate, FEE_RATE_DENOMINATOR)?;
+        let creator_fee = if combined_rate == 0 {
+            0
+        } else {
+            fee_floor(total_fee, creator_fee_rate, combined_rate)?
+        };
+        let trade_fee = total_fee
+            .checked_sub(creator_fee)
+            .ok_or_else(|| "Raydium trade-fee split underflow".to_owned())?;
+        let curve_input = amount_in_raw
+            .checked_sub(total_fee)
+            .ok_or_else(|| "Raydium input fee exceeds quote input".to_owned())?;
+
+        (trade_fee, creator_fee, curve_input)
+    } else {
+        let trade_fee = fee_ceil(
+            amount_in_raw,
+            snapshot.amm_config.trade_fee_rate,
+            FEE_RATE_DENOMINATOR,
+        )?;
+        let curve_input = amount_in_raw
+            .checked_sub(trade_fee)
+            .ok_or_else(|| "Raydium trade fee exceeds quote input".to_owned())?;
+
+        (trade_fee, 0, curve_input)
+    };
+
+    if curve_input_raw == 0 {
+        return Err("Raydium quote input is fully consumed by fees".to_owned());
+    }
+
+    let protocol_fee_raw = fee_floor(
+        trade_fee_raw,
+        snapshot.amm_config.protocol_fee_rate,
+        FEE_RATE_DENOMINATOR,
+    )?;
+    let fund_fee_raw = fee_floor(
+        trade_fee_raw,
+        snapshot.amm_config.fund_fee_rate,
+        FEE_RATE_DENOMINATOR,
+    )?;
+
+    let curve_output_raw = constant_product_output(curve_input_raw, input_reserve, output_reserve)?;
+
+    let (amount_out_raw, creator_fee_raw) = if creator_fee_on_input {
+        (curve_output_raw, creator_fee_raw)
+    } else {
+        let creator_fee = fee_ceil(
+            curve_output_raw,
+            creator_fee_rate,
+            FEE_RATE_DENOMINATOR,
+        )?;
+        let amount_out = curve_output_raw
+            .checked_sub(creator_fee)
+            .ok_or_else(|| "Raydium creator fee exceeds quote output".to_owned())?;
+
+        (amount_out, creator_fee)
+    };
+
+    if amount_out_raw == 0 {
+        return Err("Raydium quote output rounded to zero".to_owned());
+    }
+
+    Ok(RaydiumExactInputQuote {
+        amount_in_raw,
+        amount_out_raw,
+        trade_fee_raw,
+        protocol_fee_raw,
+        fund_fee_raw,
+        creator_fee_raw,
+        source_slot: snapshot.slot,
+    })
+}
+
+fn ensure_legacy_token_program(program: &str, label: &str) -> Result<(), String> {
+    if program == SPL_TOKEN_PROGRAM_ID {
+        return Ok(());
+    }
+
+    if program == TOKEN_2022_PROGRAM_ID {
+        return Err(format!(
+            "{label} uses Token-2022; transfer-fee extension state is not hydrated, so quoting fails closed"
+        ));
+    }
+
+    Err(format!("{label} uses unsupported token program {program}"))
+}
+
+fn creator_fee_on_input(creator_fee_on: u8, zero_for_one: bool) -> Result<bool, String> {
+    match creator_fee_on {
+        0 => Ok(true),
+        1 => Ok(zero_for_one),
+        2 => Ok(!zero_for_one),
+        _ => Err(format!(
+            "invalid Raydium creator_fee_on value {creator_fee_on}"
+        )),
+    }
+}
+
+fn validate_fee_rate(rate: u64, label: &str) -> Result<(), String> {
+    if rate > FEE_RATE_DENOMINATOR {
+        return Err(format!(
+            "Raydium {label} exceeds denominator {FEE_RATE_DENOMINATOR}: {rate}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn fee_ceil(amount: u64, rate: u64, denominator: u64) -> Result<u64, String> {
+    if rate == 0 || amount == 0 {
+        return Ok(0);
+    }
+
+    let numerator = u128::from(amount)
+        .checked_mul(u128::from(rate))
+        .ok_or_else(|| "Raydium fee multiplication overflow".to_owned())?;
+    let value = ceil_div_u128(numerator, u128::from(denominator))?;
+
+    u64::try_from(value).map_err(|_| "Raydium fee exceeded u64".to_owned())
+}
+
+fn fee_floor(amount: u64, rate: u64, denominator: u64) -> Result<u64, String> {
+    if denominator == 0 {
+        return Err("Raydium fee denominator cannot be zero".to_owned());
+    }
+
+    let numerator = u128::from(amount)
+        .checked_mul(u128::from(rate))
+        .ok_or_else(|| "Raydium fee multiplication overflow".to_owned())?;
+    let value = numerator / u128::from(denominator);
+
+    u64::try_from(value).map_err(|_| "Raydium fee exceeded u64".to_owned())
+}
+
+fn constant_product_output(
+    amount_in_raw: u64,
+    input_reserve_raw: u64,
+    output_reserve_raw: u64,
+) -> Result<u64, String> {
+    let denominator = u128::from(input_reserve_raw)
+        .checked_add(u128::from(amount_in_raw))
+        .ok_or_else(|| "Raydium constant-product denominator overflow".to_owned())?;
+
+    if denominator == 0 {
+        return Err("Raydium constant-product denominator cannot be zero".to_owned());
+    }
+
+    let numerator = u128::from(amount_in_raw)
+        .checked_mul(u128::from(output_reserve_raw))
+        .ok_or_else(|| "Raydium constant-product multiplication overflow".to_owned())?;
+    let output = numerator / denominator;
+
+    u64::try_from(output).map_err(|_| "Raydium quote output exceeded u64".to_owned())
+}
+
+fn ceil_div_u128(numerator: u128, denominator: u128) -> Result<u128, String> {
+    if denominator == 0 {
+        return Err("Raydium division by zero".to_owned());
+    }
+
+    if numerator == 0 {
+        return Ok(0);
+    }
+
+    numerator
+        .checked_sub(1)
+        .and_then(|value| value.checked_div(denominator))
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| "Raydium ceiling division overflow".to_owned())
 }
 
 pub fn program_subscribe_request() -> Value {
@@ -1284,5 +1553,98 @@ mod tests {
         data.extend_from_slice(&[0u8; 28 * 8]);
 
         data
+    }
+
+    fn quote_snapshot(creator_fee_on: u8) -> Result<RaydiumHydrationSnapshot, String> {
+        let mut pool_state = decode_pool_state(&fixture_pool_state(0, 0))?;
+        pool_state.token_0_program = SPL_TOKEN_PROGRAM_ID.to_owned();
+        pool_state.token_1_program = SPL_TOKEN_PROGRAM_ID.to_owned();
+        pool_state.creator_fee_on = creator_fee_on;
+
+        Ok(RaydiumHydrationSnapshot {
+            slot: 900,
+            pool_state,
+            amm_config: decode_amm_config(&fixture_amm_config())?,
+            token_0_vault_raw: 1_000_000,
+            token_1_vault_raw: 2_000_000,
+            token_0_accrued_fees_raw: 0,
+            token_1_accrued_fees_raw: 0,
+            token_0_effective_raw: 1_000_000,
+            token_1_effective_raw: 2_000_000,
+        })
+    }
+
+    #[test]
+    fn exact_input_quote_matches_creator_fee_on_input_rounding() -> Result<(), String> {
+        let snapshot = quote_snapshot(0)?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.token_0_mint, 100_000)?;
+
+        assert_eq!(quote.amount_in_raw, 100_000);
+        assert_eq!(quote.trade_fee_raw, 250);
+        assert_eq!(quote.creator_fee_raw, 50);
+        assert_eq!(quote.protocol_fee_raw, 30);
+        assert_eq!(quote.fund_fee_raw, 10);
+        assert_eq!(quote.amount_out_raw, 181_322);
+        assert_eq!(quote.source_slot, 900);
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_input_quote_matches_creator_fee_on_output_rounding() -> Result<(), String> {
+        let snapshot = quote_snapshot(2)?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.token_0_mint, 100_000)?;
+
+        assert_eq!(quote.trade_fee_raw, 250);
+        assert_eq!(quote.creator_fee_raw, 91);
+        assert_eq!(quote.protocol_fee_raw, 30);
+        assert_eq!(quote.fund_fee_raw, 10);
+        assert_eq!(quote.amount_out_raw, 181_313);
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_input_quote_supports_reverse_orientation() -> Result<(), String> {
+        let snapshot = quote_snapshot(1)?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.token_1_mint, 200_000)?;
+
+        assert_eq!(quote.amount_in_raw, 200_000);
+        assert!(quote.amount_out_raw > 0);
+        assert_eq!(quote.source_slot, snapshot.slot);
+
+        Ok(())
+    }
+
+    #[test]
+    fn exact_input_quote_fails_closed_for_token_2022() -> Result<(), String> {
+        let mut snapshot = quote_snapshot(0)?;
+        snapshot.pool_state.token_1_program = TOKEN_2022_PROGRAM_ID.to_owned();
+
+        let result = quote_exact_input(&snapshot, &snapshot.pool_state.token_0_mint, 100_000);
+
+        assert!(matches!(result, Err(error) if error.contains("Token-2022")));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_input_quote_rejects_invalid_creator_fee_direction() -> Result<(), String> {
+        let snapshot = quote_snapshot(3)?;
+        let result = quote_exact_input(&snapshot, &snapshot.pool_state.token_0_mint, 100_000);
+
+        assert!(matches!(result, Err(error) if error.contains("creator_fee_on")));
+        Ok(())
+    }
+
+    #[test]
+    fn exact_input_quote_rejects_invalid_trade_fee_share_total() -> Result<(), String> {
+        let mut snapshot = quote_snapshot(0)?;
+        snapshot.amm_config.protocol_fee_rate = 700_000;
+        snapshot.amm_config.fund_fee_rate = 400_001;
+
+        let result = quote_exact_input(&snapshot, &snapshot.pool_state.token_0_mint, 100_000);
+
+        assert!(matches!(result, Err(error) if error.contains("fee-share total")));
+        Ok(())
     }
 }
