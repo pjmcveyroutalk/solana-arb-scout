@@ -395,18 +395,19 @@ async fn discover_deterministic_cross_venue_overlap(
                     }
                 };
 
-                let pumpswap_observations =
-                    match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
-                        Ok(observations) => observations,
-                        Err(error) => {
-                            println!(
-                                "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                                discovery_candidate.anchor_mint,
-                                discovery_candidate.intermediate_mint
-                            );
-                            continue;
-                        }
-                    };
+                let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
+                    &pumpswap_payload,
+                ) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        println!(
+                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            discovery_candidate.anchor_mint,
+                            discovery_candidate.intermediate_mint
+                        );
+                        continue;
+                    }
+                };
 
                 for pumpswap_observation in pumpswap_observations {
                     if !pumpswap_observation_matches_pair(
@@ -418,7 +419,8 @@ async fn discover_deterministic_cross_venue_overlap(
                     }
 
                     let (pumpswap_normalized, pumpswap_snapshot) =
-                        match hydrate_pumpswap_observation(rpc_client, &pumpswap_observation).await {
+                        match hydrate_pumpswap_observation(rpc_client, &pumpswap_observation).await
+                        {
                             Ok(result) => result,
                             Err(error) => {
                                 println!(
