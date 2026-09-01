@@ -260,7 +260,7 @@ fn context_venue(context: &VenueQuoteContext<'_>) -> Venue {
     }
 }
 
-fn context_pool_id(context: &VenueQuoteContext<'_>) -> &str {
+fn context_pool_id<'a>(context: &'a VenueQuoteContext<'_>) -> &'a str {
     match context {
         VenueQuoteContext::Raydium { pool_id, .. }
         | VenueQuoteContext::PumpSwap { pool_id, .. } => pool_id.as_str(),
