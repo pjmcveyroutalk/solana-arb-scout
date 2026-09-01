@@ -39,6 +39,10 @@ const MAX_TARGETED_ROUTE_LOOKUPS: usize = 15;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| "could not install rustls ring crypto provider".to_owned())?;
+
     let rpc_client = Client::new();
 
     let request = SOLANA_WS_URL
