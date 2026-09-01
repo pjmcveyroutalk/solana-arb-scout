@@ -15,7 +15,7 @@ jobs:
   live-read-only:
     name: Live Solana Read-Only Test
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -46,4 +46,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout 60s cargo run -p scout-cli
+          timeout 150s cargo run -p scout-cli
