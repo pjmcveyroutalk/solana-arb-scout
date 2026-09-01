@@ -27,6 +27,26 @@ impl RouteLeg {
         }
     }
 
+    pub fn venue(&self) -> Venue {
+        self.venue
+    }
+
+    pub fn pool_id(&self) -> &str {
+        &self.pool_id
+    }
+
+    pub fn input_mint(&self) -> &str {
+        &self.input_mint
+    }
+
+    pub fn output_mint(&self) -> &str {
+        &self.output_mint
+    }
+
+    pub fn source_slot(&self) -> u64 {
+        self.source_slot
+    }
+
     fn summary(&self) -> String {
         format!(
             "venue={} pool={} input={} output={} slot={}",
@@ -48,6 +68,22 @@ pub struct TwoLegRouteCandidate {
 }
 
 impl TwoLegRouteCandidate {
+    pub fn anchor_mint(&self) -> &str {
+        &self.anchor_mint
+    }
+
+    pub fn intermediate_mint(&self) -> &str {
+        &self.intermediate_mint
+    }
+
+    pub fn leg_1(&self) -> &RouteLeg {
+        &self.leg_1
+    }
+
+    pub fn leg_2(&self) -> &RouteLeg {
+        &self.leg_2
+    }
+
     pub fn summary(&self) -> String {
         format!(
             "anchor={} intermediate={} leg1=[{}] leg2=[{}]",
