@@ -3,8 +3,14 @@ use scout_core::{
     NormalizedPoolState, NormalizedToken, PoolTradingState, QuoteReserveState, Venue,
 };
 use serde_json::{json, Value};
+use solana_pubkey::Pubkey;
+use std::str::FromStr;
 
 pub const PUMPSWAP_PROGRAM_ID: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
+const PUMP_PROGRAM_ID: &str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+const DEFAULT_PUBKEY: &str = "11111111111111111111111111111111";
+const FEE_BPS_DENOMINATOR: u64 = 10_000;
 
 const PUMPSWAP_GLOBAL_CONFIG: &str = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw";
 
@@ -156,6 +162,8 @@ pub struct PumpSwapHydrationSnapshot {
     pub quote_vault_raw: u64,
     pub effective_quote_raw: u64,
     pub base_mint_supply_raw: u64,
+    pub base_token_program: String,
+    pub quote_token_program: String,
     pub base_decimals: u8,
     pub quote_decimals: u8,
     pub disable_flags: u8,
@@ -171,6 +179,7 @@ impl PumpSwapHydrationSnapshot {
                 "base_vault_raw={} quote_vault_raw={} ",
                 "effective_quote_raw={} ",
                 "base_mint_supply_raw={} ",
+                "base_token_program={} quote_token_program={} ",
                 "base_decimals={} quote_decimals={} ",
                 "disable_flags={} trading_state={:?} ",
                 "fee_config=[{}]"
@@ -180,6 +189,8 @@ impl PumpSwapHydrationSnapshot {
             self.quote_vault_raw,
             self.effective_quote_raw,
             self.base_mint_supply_raw,
+            self.base_token_program,
+            self.quote_token_program,
             self.base_decimals,
             self.quote_decimals,
             self.disable_flags,
@@ -187,6 +198,305 @@ impl PumpSwapHydrationSnapshot {
             self.fee_config.summary(),
         )
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PumpSwapExactInputQuote {
+    pub amount_in_requested_raw: u64,
+    pub amount_in_consumed_raw: u64,
+    pub amount_in_unspent_raw: u64,
+    pub amount_out_raw: u64,
+    pub lp_fee_raw: u64,
+    pub protocol_fee_raw: u64,
+    pub creator_fee_raw: u64,
+    pub source_slot: u64,
+}
+
+pub fn quote_exact_input(
+    snapshot: &PumpSwapHydrationSnapshot,
+    input_mint: &str,
+    amount_in_raw: u64,
+) -> Result<PumpSwapExactInputQuote, String> {
+    if amount_in_raw == 0 {
+        return Err("PumpSwap quote input must be greater than zero".to_owned());
+    }
+
+    ensure_quote_token_program(&snapshot.base_token_program, "PumpSwap base mint")?;
+    ensure_quote_token_program(&snapshot.quote_token_program, "PumpSwap quote mint")?;
+
+    if snapshot.base_vault_raw == 0 || snapshot.effective_quote_raw == 0 {
+        return Err("PumpSwap quote reserves must be greater than zero".to_owned());
+    }
+
+    if snapshot.trading_state != PoolTradingState::Tradable {
+        return Err("PumpSwap pool is not currently tradable".to_owned());
+    }
+
+    let canonical_pump_pool = is_canonical_pump_pool(&snapshot.pool_state)?;
+    let market_cap_lamports = pool_market_cap(snapshot)?;
+    let selected_fees = select_pumpswap_fees(snapshot, canonical_pump_pool, market_cap_lamports)?;
+    let creator_fee_active = coin_creator_fee_is_active(&snapshot.pool_state)?;
+    let creator_fee_bps = if creator_fee_active {
+        selected_fees.creator_fee_bps
+    } else {
+        0
+    };
+    let total_fee_bps = selected_fees
+        .lp_fee_bps
+        .checked_add(selected_fees.protocol_fee_bps)
+        .and_then(|fees| fees.checked_add(creator_fee_bps))
+        .ok_or_else(|| "PumpSwap total fee-bps overflow".to_owned())?;
+
+    if total_fee_bps > FEE_BPS_DENOMINATOR {
+        return Err(format!(
+            "PumpSwap total fee bps exceeds {FEE_BPS_DENOMINATOR}: {total_fee_bps}"
+        ));
+    }
+
+    if input_mint == snapshot.pool_state.base_mint {
+        quote_base_input(
+            snapshot,
+            amount_in_raw,
+            selected_fees,
+            creator_fee_bps,
+        )
+    } else if input_mint == snapshot.pool_state.quote_mint {
+        quote_quote_input(
+            snapshot,
+            amount_in_raw,
+            selected_fees,
+            creator_fee_bps,
+            total_fee_bps,
+        )
+    } else {
+        Err(format!(
+            "PumpSwap quote input mint {input_mint} is not in pool"
+        ))
+    }
+}
+
+fn ensure_quote_token_program(program: &str, label: &str) -> Result<(), String> {
+    if program == SPL_TOKEN_PROGRAM_ID {
+        return Ok(());
+    }
+
+    if program == TOKEN_2022_PROGRAM_ID {
+        return Err(format!(
+            "{label} uses Token-2022; transfer-fee extension state is not hydrated, so quoting fails closed"
+        ));
+    }
+
+    Err(format!("{label} uses unsupported token program {program}"))
+}
+
+fn quote_base_input(
+    snapshot: &PumpSwapHydrationSnapshot,
+    amount_in_raw: u64,
+    selected_fees: PumpSwapFees,
+    creator_fee_bps: u64,
+) -> Result<PumpSwapExactInputQuote, String> {
+    let denominator = u128::from(snapshot.base_vault_raw)
+        .checked_add(u128::from(amount_in_raw))
+        .ok_or_else(|| "PumpSwap sell denominator overflow".to_owned())?;
+    let numerator = u128::from(snapshot.effective_quote_raw)
+        .checked_mul(u128::from(amount_in_raw))
+        .ok_or_else(|| "PumpSwap sell multiplication overflow".to_owned())?;
+    let raw_quote_out = u64::try_from(numerator / denominator)
+        .map_err(|_| "PumpSwap sell output exceeded u64".to_owned())?;
+
+    if raw_quote_out == 0 {
+        return Err("PumpSwap sell output rounded to zero".to_owned());
+    }
+
+    let lp_fee_raw = fee_bps_ceil(raw_quote_out, selected_fees.lp_fee_bps)?;
+    let protocol_fee_raw = fee_bps_ceil(raw_quote_out, selected_fees.protocol_fee_bps)?;
+    let creator_fee_raw = fee_bps_ceil(raw_quote_out, creator_fee_bps)?;
+    let total_fee_raw = lp_fee_raw
+        .checked_add(protocol_fee_raw)
+        .and_then(|fees| fees.checked_add(creator_fee_raw))
+        .ok_or_else(|| "PumpSwap sell fee overflow".to_owned())?;
+    let amount_out_raw = raw_quote_out
+        .checked_sub(total_fee_raw)
+        .ok_or_else(|| "PumpSwap sell fees exceed raw quote output".to_owned())?;
+
+    if amount_out_raw == 0 {
+        return Err("PumpSwap sell output is fully consumed by fees".to_owned());
+    }
+
+    Ok(PumpSwapExactInputQuote {
+        amount_in_requested_raw: amount_in_raw,
+        amount_in_consumed_raw: amount_in_raw,
+        amount_in_unspent_raw: 0,
+        amount_out_raw,
+        lp_fee_raw,
+        protocol_fee_raw,
+        creator_fee_raw,
+        source_slot: snapshot.slot,
+    })
+}
+
+fn quote_quote_input(
+    snapshot: &PumpSwapHydrationSnapshot,
+    amount_in_raw: u64,
+    selected_fees: PumpSwapFees,
+    creator_fee_bps: u64,
+    total_fee_bps: u64,
+) -> Result<PumpSwapExactInputQuote, String> {
+    let fee_denominator = FEE_BPS_DENOMINATOR
+        .checked_add(total_fee_bps)
+        .ok_or_else(|| "PumpSwap buy fee denominator overflow".to_owned())?;
+    let effective_quote_raw = u64::try_from(
+        u128::from(amount_in_raw)
+            .checked_mul(u128::from(FEE_BPS_DENOMINATOR))
+            .ok_or_else(|| "PumpSwap buy effective-quote multiplication overflow".to_owned())?
+            / u128::from(fee_denominator),
+    )
+    .map_err(|_| "PumpSwap buy effective quote exceeded u64".to_owned())?;
+
+    if effective_quote_raw == 0 {
+        return Err("PumpSwap buy effective quote rounded to zero".to_owned());
+    }
+
+    let curve_denominator = u128::from(snapshot.effective_quote_raw)
+        .checked_add(u128::from(effective_quote_raw))
+        .ok_or_else(|| "PumpSwap buy curve denominator overflow".to_owned())?;
+    let base_out_raw = u64::try_from(
+        u128::from(snapshot.base_vault_raw)
+            .checked_mul(u128::from(effective_quote_raw))
+            .ok_or_else(|| "PumpSwap buy multiplication overflow".to_owned())?
+            / curve_denominator,
+    )
+    .map_err(|_| "PumpSwap buy output exceeded u64".to_owned())?;
+
+    if base_out_raw == 0 || base_out_raw >= snapshot.base_vault_raw {
+        return Err("PumpSwap buy output is zero or depletes the base reserve".to_owned());
+    }
+
+    let raw_quote_required = u64::try_from(ceil_div_u128(
+        u128::from(snapshot.effective_quote_raw)
+            .checked_mul(u128::from(base_out_raw))
+            .ok_or_else(|| "PumpSwap buy reverse-quote multiplication overflow".to_owned())?,
+        u128::from(snapshot.base_vault_raw - base_out_raw),
+    )?)
+    .map_err(|_| "PumpSwap buy raw quote exceeded u64".to_owned())?;
+
+    let lp_fee_raw = fee_bps_ceil(raw_quote_required, selected_fees.lp_fee_bps)?;
+    let protocol_fee_raw = fee_bps_ceil(raw_quote_required, selected_fees.protocol_fee_bps)?;
+    let creator_fee_raw = fee_bps_ceil(raw_quote_required, creator_fee_bps)?;
+    let amount_in_consumed_raw = raw_quote_required
+        .checked_add(lp_fee_raw)
+        .and_then(|amount| amount.checked_add(protocol_fee_raw))
+        .and_then(|amount| amount.checked_add(creator_fee_raw))
+        .ok_or_else(|| "PumpSwap buy consumed-input overflow".to_owned())?;
+
+    if amount_in_consumed_raw > amount_in_raw {
+        return Err(format!(
+            "PumpSwap buy quote exceeded requested input: requested={amount_in_raw} consumed={amount_in_consumed_raw}"
+        ));
+    }
+
+    Ok(PumpSwapExactInputQuote {
+        amount_in_requested_raw: amount_in_raw,
+        amount_in_consumed_raw,
+        amount_in_unspent_raw: amount_in_raw - amount_in_consumed_raw,
+        amount_out_raw: base_out_raw,
+        lp_fee_raw,
+        protocol_fee_raw,
+        creator_fee_raw,
+        source_slot: snapshot.slot,
+    })
+}
+
+fn select_pumpswap_fees(
+    snapshot: &PumpSwapHydrationSnapshot,
+    canonical_pump_pool: bool,
+    market_cap_lamports: u128,
+) -> Result<PumpSwapFees, String> {
+    if !canonical_pump_pool {
+        return Ok(snapshot.fee_config.flat_fees.clone());
+    }
+
+    let first_tier = snapshot
+        .fee_config
+        .fee_tiers
+        .first()
+        .ok_or_else(|| "PumpSwap dynamic FeeConfig has no fee tiers".to_owned())?;
+
+    if market_cap_lamports < first_tier.market_cap_lamports_threshold {
+        return Ok(first_tier.fees.clone());
+    }
+
+    for tier in snapshot.fee_config.fee_tiers.iter().rev() {
+        if market_cap_lamports >= tier.market_cap_lamports_threshold {
+            return Ok(tier.fees.clone());
+        }
+    }
+
+    Ok(first_tier.fees.clone())
+}
+
+fn pool_market_cap(snapshot: &PumpSwapHydrationSnapshot) -> Result<u128, String> {
+    if snapshot.base_vault_raw == 0 {
+        return Err("PumpSwap market-cap base reserve cannot be zero".to_owned());
+    }
+
+    u128::from(snapshot.effective_quote_raw)
+        .checked_mul(u128::from(snapshot.base_mint_supply_raw))
+        .map(|value| value / u128::from(snapshot.base_vault_raw))
+        .ok_or_else(|| "PumpSwap market-cap multiplication overflow".to_owned())
+}
+
+fn is_canonical_pump_pool(pool: &PumpSwapPoolState) -> Result<bool, String> {
+    let base_mint = Pubkey::from_str(&pool.base_mint)
+        .map_err(|error| format!("invalid PumpSwap base mint for canonicality: {error}"))?;
+    let pool_creator = Pubkey::from_str(&pool.creator)
+        .map_err(|error| format!("invalid PumpSwap creator for canonicality: {error}"))?;
+    let pump_program = Pubkey::from_str(PUMP_PROGRAM_ID)
+        .map_err(|error| format!("invalid Pump program id: {error}"))?;
+    let (expected_creator, _) = Pubkey::try_find_program_address(
+        &[b"pool-authority", base_mint.as_ref()],
+        &pump_program,
+    )
+    .ok_or_else(|| "could not derive canonical PumpSwap pool authority PDA".to_owned())?;
+
+    Ok(pool_creator == expected_creator)
+}
+
+fn coin_creator_fee_is_active(pool: &PumpSwapPoolState) -> Result<bool, String> {
+    let coin_creator = pool.coin_creator.as_deref().ok_or_else(|| {
+        "PumpSwap coin_creator is unavailable; creator fee cannot be quoted".to_owned()
+    })?;
+
+    Ok(coin_creator != DEFAULT_PUBKEY)
+}
+
+fn fee_bps_ceil(amount: u64, basis_points: u64) -> Result<u64, String> {
+    if amount == 0 || basis_points == 0 {
+        return Ok(0);
+    }
+
+    let numerator = u128::from(amount)
+        .checked_mul(u128::from(basis_points))
+        .ok_or_else(|| "PumpSwap fee multiplication overflow".to_owned())?;
+    let value = ceil_div_u128(numerator, u128::from(FEE_BPS_DENOMINATOR))?;
+
+    u64::try_from(value).map_err(|_| "PumpSwap fee exceeded u64".to_owned())
+}
+
+fn ceil_div_u128(numerator: u128, denominator: u128) -> Result<u128, String> {
+    if denominator == 0 {
+        return Err("PumpSwap division by zero".to_owned());
+    }
+
+    if numerator == 0 {
+        return Ok(0);
+    }
+
+    numerator
+        .checked_sub(1)
+        .and_then(|value| value.checked_div(denominator))
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| "PumpSwap ceiling division overflow".to_owned())
 }
 
 pub fn program_subscribe_request() -> Value {
@@ -478,6 +788,8 @@ pub fn parse_hydration_response(
         quote_vault_raw,
         effective_quote_raw,
         base_mint_supply_raw,
+        base_token_program: base_mint_owner,
+        quote_token_program: quote_mint_owner,
         base_decimals,
         quote_decimals,
         disable_flags,
@@ -1474,6 +1786,146 @@ mod tests {
         assert_eq!(observations[0].pubkey, "pool");
         assert_eq!(observations[0].slot, 42);
 
+        Ok(())
+    }
+
+    fn quote_snapshot(
+        canonical: bool,
+        creator_fee_active: bool,
+    ) -> Result<PumpSwapHydrationSnapshot, String> {
+        let mut pool_state = decode_pool_state(&sample_pool_data())?;
+        let base_mint = Pubkey::from_str(&pool_state.base_mint)
+            .map_err(|error| format!("test base mint parse failed: {error}"))?;
+        let pump_program = Pubkey::from_str(PUMP_PROGRAM_ID)
+            .map_err(|error| format!("test Pump program parse failed: {error}"))?;
+        let (pump_pool_authority, _) = Pubkey::try_find_program_address(
+            &[b"pool-authority", base_mint.as_ref()],
+            &pump_program,
+        )
+        .ok_or_else(|| "test canonical authority derivation failed".to_owned())?;
+
+        pool_state.creator = if canonical {
+            pump_pool_authority.to_string()
+        } else {
+            Pubkey::new_from_array([42u8; 32]).to_string()
+        };
+        pool_state.coin_creator = Some(if creator_fee_active {
+            Pubkey::new_from_array([43u8; 32]).to_string()
+        } else {
+            DEFAULT_PUBKEY.to_owned()
+        });
+
+        let mut fee_config = decode_fee_config(&sample_fee_config_data())?;
+        fee_config.flat_fees = PumpSwapFees {
+            lp_fee_bps: 100,
+            protocol_fee_bps: 50,
+            creator_fee_bps: 25,
+        };
+
+        Ok(PumpSwapHydrationSnapshot {
+            slot: 901,
+            pool_state,
+            base_vault_raw: 1_000_000,
+            quote_vault_raw: 2_000_000,
+            effective_quote_raw: 2_000_000,
+            base_mint_supply_raw: 1_000_000,
+            base_token_program: SPL_TOKEN_PROGRAM_ID.to_owned(),
+            quote_token_program: SPL_TOKEN_PROGRAM_ID.to_owned(),
+            base_decimals: 6,
+            quote_decimals: 6,
+            disable_flags: 0,
+            trading_state: PoolTradingState::Tradable,
+            fee_config,
+        })
+    }
+
+    #[test]
+    fn canonical_pool_selects_dynamic_market_cap_tier() -> Result<(), String> {
+        let snapshot = quote_snapshot(true, true)?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.base_mint, 100_000)?;
+
+        let canonical = is_canonical_pump_pool(&snapshot.pool_state)?;
+        let market_cap = pool_market_cap(&snapshot)?;
+        let fees = select_pumpswap_fees(&snapshot, canonical, market_cap)?;
+
+        assert!(canonical);
+        assert_eq!(market_cap, 2_000_000);
+        assert_eq!(fees.lp_fee_bps, 20);
+        assert_eq!(fees.protocol_fee_bps, 5);
+        assert_eq!(fees.creator_fee_bps, 5);
+        assert_eq!(quote.lp_fee_raw, 364);
+        assert_eq!(quote.protocol_fee_raw, 91);
+        assert_eq!(quote.creator_fee_raw, 91);
+        assert_eq!(quote.amount_out_raw, 181_272);
+
+        Ok(())
+    }
+
+    #[test]
+    fn noncanonical_pool_uses_flat_fees() -> Result<(), String> {
+        let snapshot = quote_snapshot(false, true)?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.base_mint, 100_000)?;
+
+        let canonical = is_canonical_pump_pool(&snapshot.pool_state)?;
+        let market_cap = pool_market_cap(&snapshot)?;
+        let fees = select_pumpswap_fees(&snapshot, canonical, market_cap)?;
+
+        assert!(!canonical);
+        assert_eq!(fees.lp_fee_bps, 100);
+        assert_eq!(fees.protocol_fee_bps, 50);
+        assert_eq!(fees.creator_fee_bps, 25);
+
+        Ok(())
+    }
+
+    #[test]
+    fn quote_input_buy_matches_official_integer_rounding() -> Result<(), String> {
+        let snapshot = quote_snapshot(true, true)?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.quote_mint, 100_000)?;
+
+        assert_eq!(quote.amount_in_requested_raw, 100_000);
+        assert_eq!(quote.amount_in_consumed_raw, 99_998);
+        assert_eq!(quote.amount_in_unspent_raw, 2);
+        assert_eq!(quote.amount_out_raw, 47_482);
+        assert_eq!(quote.lp_fee_raw, 200);
+        assert_eq!(quote.protocol_fee_raw, 50);
+        assert_eq!(quote.creator_fee_raw, 50);
+
+        Ok(())
+    }
+
+    #[test]
+    fn default_coin_creator_suppresses_creator_fee() -> Result<(), String> {
+        let snapshot = quote_snapshot(true, false)?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.quote_mint, 100_000)?;
+
+        assert_eq!(quote.creator_fee_raw, 0);
+        assert_eq!(quote.amount_in_consumed_raw, 99_999);
+        assert_eq!(quote.amount_in_unspent_raw, 1);
+        assert_eq!(quote.amount_out_raw, 47_505);
+
+        Ok(())
+    }
+
+    #[test]
+    fn quote_fails_closed_for_token_2022() -> Result<(), String> {
+        let mut snapshot = quote_snapshot(true, true)?;
+        snapshot.base_token_program = TOKEN_2022_PROGRAM_ID.to_owned();
+
+        let result = quote_exact_input(&snapshot, &snapshot.pool_state.base_mint, 100_000);
+
+        assert!(matches!(result, Err(error) if error.contains("Token-2022")));
+        Ok(())
+    }
+
+    #[test]
+    fn quote_fails_closed_without_coin_creator() -> Result<(), String> {
+        let mut snapshot = quote_snapshot(true, true)?;
+        snapshot.pool_state.coin_creator = None;
+
+        let result = quote_exact_input(&snapshot, &snapshot.pool_state.base_mint, 100_000);
+
+        assert!(matches!(result, Err(error) if error.contains("coin_creator")));
         Ok(())
     }
 }
