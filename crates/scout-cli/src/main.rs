@@ -37,13 +37,6 @@ const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
 const MAX_TARGETED_ROUTE_LOOKUPS: usize = 15;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RouteDiscoveryPair {
-    anchor_mint: String,
-    intermediate_mint: String,
-    raydium_pool_id: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let rpc_client = Client::new();
