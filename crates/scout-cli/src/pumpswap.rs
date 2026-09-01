@@ -256,12 +256,7 @@ pub fn quote_exact_input(
     if input_mint == snapshot.pool_state.base_mint {
         quote_base_input(snapshot, amount_in_raw, selected_fees, creator_fee_bps)
     } else if input_mint == snapshot.pool_state.quote_mint {
-        quote_quote_input(
-            snapshot,
-            amount_in_raw,
-            selected_fees,
-            creator_fee_bps,
-        )
+        quote_quote_input(snapshot, amount_in_raw, selected_fees, creator_fee_bps)
     } else {
         Err(format!(
             "PumpSwap quote input mint {input_mint} is not in pool"
