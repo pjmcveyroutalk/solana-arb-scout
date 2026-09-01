@@ -371,8 +371,7 @@ mod tests {
 
     #[test]
     fn empty_cost_provenance_is_rejected() {
-        let error =
-            ExplicitCost::new(1, "   ").expect_err("missing provenance must fail closed");
+        let error = ExplicitCost::new(1, "   ").expect_err("missing provenance must fail closed");
 
         assert_eq!(error, "economics cost provenance must not be empty");
     }
@@ -422,8 +421,7 @@ mod tests {
         )
         .expect("cost model itself is structurally valid");
 
-        let error =
-            evaluate_expected_net(&quote, &costs).expect_err("overflow must fail closed");
+        let error = evaluate_expected_net(&quote, &costs).expect_err("overflow must fail closed");
 
         assert_eq!(error, "economics common cost overflow");
     }
@@ -450,8 +448,7 @@ mod tests {
         )
         .expect("cost model itself is structurally valid");
 
-        let error =
-            evaluate_expected_net(&quote, &costs).expect_err("overflow must fail closed");
+        let error = evaluate_expected_net(&quote, &costs).expect_err("overflow must fail closed");
 
         assert_eq!(error, "economics total external cost overflow");
     }
