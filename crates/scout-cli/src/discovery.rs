@@ -152,7 +152,7 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
-    const TEST_INTERMEDIATE_MINT: &str = "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iVJgkX6R";
+    const TEST_INTERMEDIATE_MINT: &str = USDC_MINT;
 
     #[test]
     fn lookup_requests_cover_all_anchor_mint_positions() {
