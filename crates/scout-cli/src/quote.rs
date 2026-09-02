@@ -376,6 +376,7 @@ mod tests {
                 token_1_mint: TEST_MINT.to_owned(),
                 token_0_program: SPL_TOKEN_PROGRAM_ID.to_owned(),
                 token_1_program: SPL_TOKEN_PROGRAM_ID.to_owned(),
+                observation_key: "11111111111111111111111111111111".to_owned(),
                 status: 0,
                 lp_mint_decimals: 6,
                 mint_0_decimals: 9,
