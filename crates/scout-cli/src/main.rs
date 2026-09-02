@@ -474,10 +474,7 @@ async fn discover_deterministic_cross_venue_overlap(
                 let (pumpswap_normalized, pumpswap_snapshot) = match pumpswap_hydration_result {
                     Ok(result) => result,
                     Err(error) => {
-                        let reason = format!(
-                            "pool={} reason={error}",
-                            pumpswap_observation.pubkey
-                        );
+                        let reason = format!("pool={} reason={error}", pumpswap_observation.pubkey);
                         println!("deterministic_exact_pair_candidate_rejected: {reason}");
                         completeness.record_incomplete(reason);
                         continue;
@@ -585,19 +582,18 @@ async fn discover_deterministic_cross_venue_overlap(
                     }
                 };
 
-            let raydium_observations =
-                match parse_raydium_pair_lookup_response(&raydium_payload) {
-                    Ok(observations) => observations,
-                    Err(error) => {
-                        let reason = format!(
-                            "anchor={} intermediate={} reason={error}",
-                            anchor_mint, intermediate_mint
-                        );
-                        println!("deterministic_raydium_exact_pair_lookup_rejected: {reason}");
-                        completeness.record_incomplete(reason);
-                        continue;
-                    }
-                };
+            let raydium_observations = match parse_raydium_pair_lookup_response(&raydium_payload) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    let reason = format!(
+                        "anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    println!("deterministic_raydium_exact_pair_lookup_rejected: {reason}");
+                    completeness.record_incomplete(reason);
+                    continue;
+                }
+            };
 
             println!(
                 "deterministic_raydium_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -621,8 +617,7 @@ async fn discover_deterministic_cross_venue_overlap(
                 let (raydium_normalized, raydium_snapshot) = match raydium_hydration_result {
                     Ok(result) => result,
                     Err(error) => {
-                        let reason =
-                            format!("pool={} reason={error}", raydium_observation.pubkey);
+                        let reason = format!("pool={} reason={error}", raydium_observation.pubkey);
                         println!("deterministic_raydium_exact_pair_candidate_rejected: {reason}");
                         completeness.record_incomplete(reason);
                         continue;
@@ -1740,7 +1735,10 @@ mod tests {
     fn retry_after_accepts_integer_seconds_only() {
         assert_eq!(parse_retry_after_seconds("3"), Some(3));
         assert_eq!(parse_retry_after_seconds(" 7 "), Some(7));
-        assert_eq!(parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(
+            parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
         assert_eq!(parse_retry_after_seconds("invalid"), None);
     }
 }
