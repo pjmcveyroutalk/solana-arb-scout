@@ -4,6 +4,7 @@ pub mod economics;
 mod pumpswap;
 mod quote;
 mod raydium;
+mod recorder;
 mod registry;
 mod route;
 mod sizing;
@@ -47,6 +48,16 @@ struct PythUsdPrices {
     sol: SolUsdPrice,
     usdc: Option<SolUsdPrice>,
     usdt: Option<SolUsdPrice>,
+}
+
+#[derive(Debug)]
+struct Rung11QuoteRecord {
+    route_index: usize,
+    dollars: u64,
+    anchor_decimals: u8,
+    route_quote: quote::TwoLegRouteQuote,
+    candidate_found_at_unix_ms: u64,
+    quote_complete_at_unix_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1050,6 +1061,7 @@ async fn validate_registry_routes_and_sizes(
 
     let eligible_pools = registry.current_eligible_pools();
     let route_candidates = generate_two_leg_routes(&eligible_pools);
+    let route_candidates_found_at_unix_ms = unix_time_ms_now()?;
 
     println!("route_candidate_count={}", route_candidates.len());
 
@@ -1066,13 +1078,29 @@ async fn validate_registry_routes_and_sizes(
     println!("READ-ONLY TWO-LEG ROUTE ENGINE PASS");
     println!("READ-ONLY RUNG 9 ROUTE CANDIDATE PASS");
 
+    let mut shadow_recorder = recorder::ShadowRecorder::start(
+        &eligible_pools,
+        route_candidates.len(),
+        &USD_SIZE_GRID,
+        &usd_prices.sol,
+        usd_prices.usdc.as_ref(),
+        usd_prices.usdt.as_ref(),
+    )?;
+
+    println!(
+        "rung12_shadow_output_started: {}",
+        shadow_recorder.output_path().display()
+    );
+
     println!("\nRung 10 deterministic USD size-grid quote engine");
 
     let mut successful_routes = 0usize;
     let mut successful_grid_quotes = 0usize;
-    let mut rung11c_quote_records = Vec::new();
+    let mut rung11c_quote_records = Vec::<Rung11QuoteRecord>::new();
 
     for (route_index, route_candidate) in route_candidates.iter().enumerate() {
+        let candidate_found_at_unix_ms = route_candidates_found_at_unix_ms;
+
         let leg_1_context = match quote_context_for_leg(
             route_candidate.leg_1(),
             raydium_quote_contexts,
@@ -1084,6 +1112,11 @@ async fn validate_registry_routes_and_sizes(
                     "rung10_route_rejected: route=[{}] reason={error}",
                     route_candidate.summary()
                 );
+                shadow_recorder.record_route_rejection(
+                    route_candidate,
+                    candidate_found_at_unix_ms,
+                    &error,
+                )?;
                 continue;
             }
         };
@@ -1099,6 +1132,11 @@ async fn validate_registry_routes_and_sizes(
                     "rung10_route_rejected: route=[{}] reason={error}",
                     route_candidate.summary()
                 );
+                shadow_recorder.record_route_rejection(
+                    route_candidate,
+                    candidate_found_at_unix_ms,
+                    &error,
+                )?;
                 continue;
             }
         };
@@ -1111,6 +1149,11 @@ async fn validate_registry_routes_and_sizes(
                         "rung10_route_rejected: route=[{}] reason={error}",
                         route_candidate.summary()
                     );
+                    shadow_recorder.record_route_rejection(
+                        route_candidate,
+                        candidate_found_at_unix_ms,
+                        &error,
+                    )?;
                     continue;
                 }
             };
@@ -1130,6 +1173,21 @@ async fn validate_registry_routes_and_sizes(
                         "rung10_size_rejected: route=[{}] usd=${dollars} reason={error}",
                         route_candidate.summary()
                     );
+                    shadow_recorder.record_quote_rejection(
+                        route_candidate,
+                        dollars,
+                        None,
+                        &error,
+                        recorder::CandidateTiming {
+                            candidate_found_at_unix_ms,
+                            quote_complete_at_unix_ms: None,
+                            economics_complete_at_unix_ms: None,
+                            hypothetical_ready_at_unix_ms: None,
+                        },
+                        &usd_prices.sol,
+                        usd_prices.usdc.as_ref(),
+                        usd_prices.usdt.as_ref(),
+                    )?;
                     continue;
                 }
             };
@@ -1141,24 +1199,42 @@ async fn validate_registry_routes_and_sizes(
                 &leg_2_context,
             ) {
                 Ok(route_quote) => {
+                    let quote_complete_at_unix_ms = unix_time_ms_now()?;
                     route_grid_quotes += 1;
                     successful_grid_quotes += 1;
                     println!(
                         "rung10_grid_quote: usd=${dollars} {}",
                         route_quote.summary()
                     );
-                    rung11c_quote_records.push((
+                    rung11c_quote_records.push(Rung11QuoteRecord {
                         route_index,
                         dollars,
                         anchor_decimals,
                         route_quote,
-                    ));
+                        candidate_found_at_unix_ms,
+                        quote_complete_at_unix_ms,
+                    });
                 }
                 Err(error) => {
                     println!(
                         "rung10_grid_quote_rejected: route=[{}] usd=${dollars} amount_in_raw={amount_in_raw} reason={error}",
                         route_candidate.summary()
                     );
+                    shadow_recorder.record_quote_rejection(
+                        route_candidate,
+                        dollars,
+                        Some(amount_in_raw),
+                        &error,
+                        recorder::CandidateTiming {
+                            candidate_found_at_unix_ms,
+                            quote_complete_at_unix_ms: None,
+                            economics_complete_at_unix_ms: None,
+                            hypothetical_ready_at_unix_ms: None,
+                        },
+                        &usd_prices.sol,
+                        usd_prices.usdc.as_ref(),
+                        usd_prices.usdt.as_ref(),
+                    )?;
                 }
             }
         }
@@ -1189,7 +1265,7 @@ async fn validate_registry_routes_and_sizes(
 
     let successful_route_indices = rung11c_quote_records
         .iter()
-        .map(|(route_index, _, _, _)| *route_index)
+        .map(|record| record.route_index)
         .collect::<BTreeSet<_>>();
 
     for route_index in successful_route_indices {
@@ -1256,21 +1332,50 @@ async fn validate_registry_routes_and_sizes(
         usd_prices.usdt.as_ref(),
     );
 
-    for (route_index, dollars, anchor_decimals, route_quote) in &rung11c_quote_records {
-        let Some(route_candidate) = route_candidates.get(*route_index) else {
-            continue;
-        };
-        let Some(priority_observation) = route_priority_observations.get(route_index) else {
-            println!(
-                "rung11c_cost_model_rejected: route=[{}] reason=missing priority observation state",
-                route_candidate.summary()
-            );
+    for record in &rung11c_quote_records {
+        let Some(route_candidate) = route_candidates.get(record.route_index) else {
             continue;
         };
 
+        let priority_observation =
+            if let Some(observation) = route_priority_observations.get(&record.route_index) {
+                observation
+            } else {
+                let reason = "missing priority observation state";
+                println!(
+                    "rung11c_cost_model_rejected: route=[{}] reason={reason}",
+                    route_candidate.summary()
+                );
+                let missing_priority =
+                    costs::PriorityObservationState::Unavailable(reason.to_owned());
+                let economics_complete_at_unix_ms = unix_time_ms_now()?;
+                shadow_recorder.record_economics_evaluation(
+                    route_candidate,
+                    record.dollars,
+                    record.anchor_decimals,
+                    &record.route_quote,
+                    None,
+                    Some(reason),
+                    None,
+                    None,
+                    &missing_priority,
+                    &jito_observation,
+                    recorder::CandidateTiming {
+                        candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
+                        quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
+                        economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
+                        hypothetical_ready_at_unix_ms: None,
+                    },
+                    &usd_prices.sol,
+                    usd_prices.usdc.as_ref(),
+                    usd_prices.usdt.as_ref(),
+                )?;
+                continue;
+            };
+
         let cost_model = match costs::economics_cost_model_with_usd_prices(
             route_candidate.anchor_mint(),
-            *anchor_decimals,
+            record.anchor_decimals,
             priority_observation,
             &jito_observation,
             Some(&external_cost_usd_prices),
@@ -1281,38 +1386,124 @@ async fn validate_registry_routes_and_sizes(
                     "rung11c_cost_model_rejected: route=[{}] reason={error}",
                     route_candidate.summary()
                 );
+                let economics_complete_at_unix_ms = unix_time_ms_now()?;
+                shadow_recorder.record_economics_evaluation(
+                    route_candidate,
+                    record.dollars,
+                    record.anchor_decimals,
+                    &record.route_quote,
+                    None,
+                    Some(&error),
+                    None,
+                    None,
+                    priority_observation,
+                    &jito_observation,
+                    recorder::CandidateTiming {
+                        candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
+                        quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
+                        economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
+                        hypothetical_ready_at_unix_ms: None,
+                    },
+                    &usd_prices.sol,
+                    usd_prices.usdc.as_ref(),
+                    usd_prices.usdt.as_ref(),
+                )?;
                 continue;
             }
         };
 
-        for funding_mode in [
+        let treasury_result = economics::evaluate_expected_net_for_mode(
+            &record.route_quote,
+            &cost_model,
             economics::FundingMode::Treasury,
-            economics::FundingMode::Flash,
-        ] {
-            match economics::evaluate_expected_net_for_mode(route_quote, &cost_model, funding_mode)
-            {
-                Ok(result) => {
-                    println!("rung11c_expected_net: usd=${dollars} {}", result.summary());
-                }
-                Err(error) => {
-                    println!(
-                        concat!(
-                            "rung11c_expected_net_fail_closed: usd=${} funding={} ",
-                            "route=[{}] reason={}"
-                        ),
-                        dollars,
-                        funding_mode.label(),
-                        route_candidate.summary(),
-                        error
-                    );
-                }
+        );
+        match &treasury_result {
+            Ok(result) => {
+                println!(
+                    "rung11c_expected_net: usd=${} {}",
+                    record.dollars,
+                    result.summary()
+                );
+            }
+            Err(error) => {
+                println!(
+                    concat!(
+                        "rung11c_expected_net_fail_closed: usd=${} funding={} ",
+                        "route=[{}] reason={}"
+                    ),
+                    record.dollars,
+                    economics::FundingMode::Treasury.label(),
+                    route_candidate.summary(),
+                    error
+                );
             }
         }
+
+        let flash_result = economics::evaluate_expected_net_for_mode(
+            &record.route_quote,
+            &cost_model,
+            economics::FundingMode::Flash,
+        );
+        match &flash_result {
+            Ok(result) => {
+                println!(
+                    "rung11c_expected_net: usd=${} {}",
+                    record.dollars,
+                    result.summary()
+                );
+            }
+            Err(error) => {
+                println!(
+                    concat!(
+                        "rung11c_expected_net_fail_closed: usd=${} funding={} ",
+                        "route=[{}] reason={}"
+                    ),
+                    record.dollars,
+                    economics::FundingMode::Flash.label(),
+                    route_candidate.summary(),
+                    error
+                );
+            }
+        }
+
+        let economics_complete_at_unix_ms = unix_time_ms_now()?;
+        let hypothetical_ready_at_unix_ms = match (&treasury_result, &flash_result) {
+            (Ok(treasury), Ok(flash)) if treasury.is_positive() || flash.is_positive() => {
+                Some(unix_time_ms_now()?)
+            }
+            _ => None,
+        };
+
+        shadow_recorder.record_economics_evaluation(
+            route_candidate,
+            record.dollars,
+            record.anchor_decimals,
+            &record.route_quote,
+            Some(&cost_model),
+            None,
+            Some(&treasury_result),
+            Some(&flash_result),
+            priority_observation,
+            &jito_observation,
+            recorder::CandidateTiming {
+                candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
+                quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
+                economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
+                hypothetical_ready_at_unix_ms,
+            },
+            &usd_prices.sol,
+            usd_prices.usdc.as_ref(),
+            usd_prices.usdt.as_ref(),
+        )?;
     }
 
     if rung11c_route_scope_attempts > 0 {
         println!("READ-ONLY RUNG 11C COST OBSERVATION PASS");
     }
+
+    let shadow_output = shadow_recorder.finish()?;
+    println!("rung12_shadow_output_complete: {}", shadow_output.display());
+    println!("READ-ONLY RUNG 12 SHADOW RECORDER PASS");
 
     Ok(())
 }
