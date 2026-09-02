@@ -225,10 +225,24 @@ pub enum JitoObservationState {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ExternalCostUsdPrices<'a> {
+pub struct ExternalCostUsdPrices<'a> {
     sol_usd: &'a SolUsdPrice,
     usdc_usd: Option<&'a SolUsdPrice>,
     usdt_usd: Option<&'a SolUsdPrice>,
+}
+
+impl<'a> ExternalCostUsdPrices<'a> {
+    pub fn new(
+        sol_usd: &'a SolUsdPrice,
+        usdc_usd: Option<&'a SolUsdPrice>,
+        usdt_usd: Option<&'a SolUsdPrice>,
+    ) -> Self {
+        Self {
+            sol_usd,
+            usdc_usd,
+            usdt_usd,
+        }
+    }
 }
 
 pub fn raydium_contention_footprint(
@@ -696,14 +710,31 @@ pub fn economics_cost_model(
     priority_observation: &PriorityObservationState,
     jito_observation: &JitoObservationState,
 ) -> Result<EconomicsCostModel, String> {
+    economics_cost_model_with_usd_prices(
+        anchor_mint,
+        anchor_decimals,
+        priority_observation,
+        jito_observation,
+        None,
+    )
+}
+
+pub fn economics_cost_model_with_usd_prices(
+    anchor_mint: &str,
+    anchor_decimals: u8,
+    priority_observation: &PriorityObservationState,
+    jito_observation: &JitoObservationState,
+    usd_prices: Option<&ExternalCostUsdPrices<'_>>,
+) -> Result<EconomicsCostModel, String> {
     EconomicsCostModel::new(
         RUNG11_V0_BASIS_ID,
         CommonEconomicsCosts {
-            base_fee: modeled_base_fee_cost(anchor_mint, anchor_decimals)?,
+            base_fee: modeled_base_fee_cost(anchor_mint, anchor_decimals, usd_prices)?,
             priority_fee: modeled_priority_fee_cost(
                 anchor_mint,
                 anchor_decimals,
                 priority_observation,
+                usd_prices,
             )?,
             submission_cost: submission_cost_unknown(jito_observation)?,
             expected_failure_cost: RequiredCost::unknown(
@@ -730,19 +761,26 @@ pub fn economics_cost_model(
     )
 }
 
-fn modeled_base_fee_cost(anchor_mint: &str, anchor_decimals: u8) -> Result<RequiredCost, String> {
+fn modeled_base_fee_cost(
+    anchor_mint: &str,
+    anchor_decimals: u8,
+    usd_prices: Option<&ExternalCostUsdPrices<'_>>,
+) -> Result<RequiredCost, String> {
     let base_fee_lamports = modeled_base_fee_lamports()?;
 
-    match lamports_to_anchor_raw(base_fee_lamports, anchor_mint, anchor_decimals, None) {
+    match lamports_to_anchor_raw(base_fee_lamports, anchor_mint, anchor_decimals, usd_prices) {
         Ok(amount_anchor_raw) => RequiredCost::known(
             amount_anchor_raw,
             CostProvenanceKind::ModeledAssumption,
             format!(
                 concat!(
                     "basis={} current_base_fee_lamports_per_signature={} ",
-                    "modeled_signature_count={} anchor_conversion=WSOL-lamports-1:1"
+                    "modeled_signature_count={} anchor_conversion={}"
                 ),
-                RUNG11_V0_BASIS_ID, BASE_FEE_LAMPORTS_PER_SIGNATURE, MODELED_SIGNATURE_COUNT
+                RUNG11_V0_BASIS_ID,
+                BASE_FEE_LAMPORTS_PER_SIGNATURE,
+                MODELED_SIGNATURE_COUNT,
+                anchor_conversion_provenance(anchor_mint)
             ),
         ),
         Err(reason) => RequiredCost::unknown(
@@ -756,6 +794,7 @@ fn modeled_priority_fee_cost(
     anchor_mint: &str,
     anchor_decimals: u8,
     priority_observation: &PriorityObservationState,
+    usd_prices: Option<&ExternalCostUsdPrices<'_>>,
 ) -> Result<RequiredCost, String> {
     let observation = match priority_observation {
         PriorityObservationState::Available(observation) => observation,
@@ -784,7 +823,7 @@ fn modeled_priority_fee_cost(
         MODELED_COMPUTE_UNIT_LIMIT,
     )?;
 
-    match lamports_to_anchor_raw(priority_lamports, anchor_mint, anchor_decimals, None) {
+    match lamports_to_anchor_raw(priority_lamports, anchor_mint, anchor_decimals, usd_prices) {
         Ok(amount_anchor_raw) => RequiredCost::known(
             amount_anchor_raw,
             CostProvenanceKind::ModeledAssumption,
@@ -793,7 +832,7 @@ fn modeled_priority_fee_cost(
                     "basis={} policy={} selected_micro_lamports_per_cu={} modeled_cu_limit={} ",
                     "observed_total_samples={} observed_positive_samples={} ",
                     "observed_slot_range={}..={} ",
-                    "scope_accounts={} scope_provenance={} anchor_conversion=WSOL-lamports-1:1"
+                    "scope_accounts={} scope_provenance={} anchor_conversion={}"
                 ),
                 RUNG11_V0_BASIS_ID,
                 selection.policy_id,
@@ -804,13 +843,22 @@ fn modeled_priority_fee_cost(
                 selection.min_slot,
                 selection.max_slot,
                 observation.scope_accounts.len(),
-                observation.scope_provenance
+                observation.scope_provenance,
+                anchor_conversion_provenance(anchor_mint)
             ),
         ),
         Err(reason) => RequiredCost::unknown(
             CostProvenanceKind::ModeledAssumption,
             format!("priority_fee unknown: {reason}"),
         ),
+    }
+}
+
+fn anchor_conversion_provenance(anchor_mint: &str) -> &'static str {
+    if anchor_mint == WRAPPED_SOL_MINT {
+        "WSOL-lamports-1:1"
+    } else {
+        "Pyth-conservative-SOLUSD-cross-stableUSD-confidence-bounds-ceil"
     }
 }
 
@@ -1284,11 +1332,7 @@ mod tests {
     fn usdc_external_cost_conversion_uses_observed_cross_price() -> Result<(), String> {
         let sol = usd_price(20_000_000_000, 0, -8);
         let usdc = usd_price(100_000_000, 0, -8);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: Some(&usdc),
-            usdt_usd: None,
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, Some(&usdc), None);
 
         assert_eq!(
             lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices))?,
@@ -1302,11 +1346,7 @@ mod tests {
     fn usdt_external_cost_conversion_respects_depeg() -> Result<(), String> {
         let sol = usd_price(20_000_000_000, 0, -8);
         let usdt = usd_price(80_000_000, 0, -8);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: None,
-            usdt_usd: Some(&usdt),
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, None, Some(&usdt));
 
         assert_eq!(
             lamports_to_anchor_raw(5_000, USDT_MINT, 6, Some(&prices))?,
@@ -1321,11 +1361,7 @@ mod tests {
     ) -> Result<(), String> {
         let sol = usd_price(20_000_000_000, 100_000_000, -8);
         let usdc = usd_price(100_000_000, 1_000_000, -8);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: Some(&usdc),
-            usdt_usd: None,
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, Some(&usdc), None);
 
         assert_eq!(
             lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices))?,
@@ -1339,11 +1375,7 @@ mod tests {
     fn stablecoin_external_cost_conversion_normalizes_exponents() -> Result<(), String> {
         let sol = usd_price(20_000, 0, -2);
         let usdc = usd_price(1_000_000, 0, -6);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: Some(&usdc),
-            usdt_usd: None,
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, Some(&usdc), None);
 
         assert_eq!(
             lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices))?,
@@ -1357,11 +1389,7 @@ mod tests {
     fn stablecoin_external_cost_conversion_rejects_nonpositive_lower_bound() {
         let sol = usd_price(20_000_000_000, 0, -8);
         let usdc = usd_price(100_000_000, 100_000_000, -8);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: Some(&usdc),
-            usdt_usd: None,
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, Some(&usdc), None);
 
         assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices)).is_err());
     }
@@ -1370,11 +1398,7 @@ mod tests {
     fn stablecoin_external_cost_conversion_requires_matching_feed() {
         let sol = usd_price(20_000_000_000, 0, -8);
         let usdt = usd_price(100_000_000, 0, -8);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: None,
-            usdt_usd: Some(&usdt),
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, None, Some(&usdt));
 
         assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices)).is_err());
     }
@@ -1383,11 +1407,7 @@ mod tests {
     fn stablecoin_external_cost_conversion_rejects_wrong_decimals() {
         let sol = usd_price(20_000_000_000, 0, -8);
         let usdc = usd_price(100_000_000, 0, -8);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: Some(&usdc),
-            usdt_usd: None,
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, Some(&usdc), None);
 
         assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 9, Some(&prices)).is_err());
         assert!(lamports_to_anchor_raw(5_000, USDT_MINT, 9, Some(&prices)).is_err());
@@ -1397,11 +1417,7 @@ mod tests {
     fn stablecoin_external_cost_conversion_rejects_unbounded_exponent_delta() {
         let sol = usd_price(20_000_000_000, 0, 100);
         let usdc = usd_price(100_000_000, 0, -8);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: Some(&usdc),
-            usdt_usd: None,
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, Some(&usdc), None);
 
         assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices)).is_err());
     }
@@ -1410,11 +1426,7 @@ mod tests {
     fn stablecoin_external_cost_conversion_rejects_sol_upper_bound_overflow() {
         let sol = usd_price(u64::MAX, 1, -8);
         let usdc = usd_price(100_000_000, 0, -8);
-        let prices = ExternalCostUsdPrices {
-            sol_usd: &sol,
-            usdc_usd: Some(&usdc),
-            usdt_usd: None,
-        };
+        let prices = ExternalCostUsdPrices::new(&sol, Some(&usdc), None);
 
         assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices)).is_err());
     }
@@ -1451,9 +1463,60 @@ mod tests {
                     CostProvenanceKind::ModeledAssumption
                 );
                 assert!(cost.provenance().contains(PRIORITY_SELECTION_POLICY_ID));
+                assert!(cost.provenance().contains("WSOL-lamports-1:1"));
             }
             RequiredCost::Unknown { .. } => {
                 return Err("expected modeled known priority fee".to_owned());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn stablecoin_cost_model_uses_observed_usd_conversion() -> Result<(), String> {
+        let priority_observation = PriorityObservationState::Available(PriorityFeeObservation {
+            samples: vec![PriorityFeeObservationSample {
+                slot: 100,
+                micro_lamports_per_cu: 10_000,
+            }],
+            scope_accounts: vec![TEST_VAULT_A.to_owned()],
+            scope_provenance: "fixture localized venue contention scope".to_owned(),
+        });
+
+        let sol = usd_price(20_000_000_000, 0, -8);
+        let usdc = usd_price(100_000_000, 0, -8);
+        let prices = ExternalCostUsdPrices::new(&sol, Some(&usdc), None);
+
+        let model = economics_cost_model_with_usd_prices(
+            USDC_MINT,
+            6,
+            &priority_observation,
+            &JitoObservationState::Unavailable("fixture unavailable".to_owned()),
+            Some(&prices),
+        )?;
+
+        match model.common.base_fee {
+            RequiredCost::Known(cost) => {
+                assert_eq!(cost.amount_anchor_raw(), 1_000);
+                assert!(cost.provenance().contains(
+                    "Pyth-conservative-SOLUSD-cross-stableUSD-confidence-bounds-ceil"
+                ));
+            }
+            RequiredCost::Unknown { .. } => {
+                return Err("expected modeled known USDC base fee".to_owned());
+            }
+        }
+
+        match model.common.priority_fee {
+            RequiredCost::Known(cost) => {
+                assert_eq!(cost.amount_anchor_raw(), 1_200);
+                assert!(cost.provenance().contains(
+                    "Pyth-conservative-SOLUSD-cross-stableUSD-confidence-bounds-ceil"
+                ));
+            }
+            RequiredCost::Unknown { .. } => {
+                return Err("expected modeled known USDC priority fee".to_owned());
             }
         }
 
