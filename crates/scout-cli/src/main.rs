@@ -405,17 +405,18 @@ async fn discover_deterministic_cross_venue_overlap(
                 }
             };
 
-            let pumpswap_observations =
-                match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
-                    Ok(observations) => observations,
-                    Err(error) => {
-                        println!(
-                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            anchor_mint, intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+            let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
+                &pumpswap_payload,
+            ) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    println!(
+                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
 
             println!(
                 "deterministic_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
