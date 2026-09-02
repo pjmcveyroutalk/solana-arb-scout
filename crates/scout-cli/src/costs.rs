@@ -48,20 +48,16 @@ impl DeterministicVenueContentionFootprint {
 
         if accounts.len() > MAX_LOCALIZED_PRIORITY_ACCOUNTS {
             return Err(format!(
-                concat!(
-                    "localized priority-fee contention footprint exceeds RPC maximum: ",
-                    "count={} max={MAX_LOCALIZED_PRIORITY_ACCOUNTS}"
-                ),
+                "localized priority-fee contention footprint exceeds RPC maximum: count={} max={MAX_LOCALIZED_PRIORITY_ACCOUNTS}",
                 accounts.len()
             ));
         }
 
         for account in &accounts {
             Pubkey::from_str(account).map_err(|error| {
-                format!(concat!(
-                    "localized priority-fee contention account is invalid: ",
-                    "account={account} error={error}"
-                ))
+                format!(
+                    "localized priority-fee contention account is invalid: account={account} error={error}"
+                )
             })?;
         }
 
@@ -378,10 +374,9 @@ pub fn parse_localized_priority_fee_response(
         .ok_or_else(|| "priority-fee response missing numeric id".to_owned())?;
 
     if response_id != PRIORITY_FEE_RPC_REQUEST_ID {
-        return Err(format!(concat!(
-            "priority-fee response id mismatch: ",
-            "expected={PRIORITY_FEE_RPC_REQUEST_ID} actual={response_id}"
-        )));
+        return Err(format!(
+            "priority-fee response id mismatch: expected={PRIORITY_FEE_RPC_REQUEST_ID} actual={response_id}"
+        ));
     }
 
     let result = payload
