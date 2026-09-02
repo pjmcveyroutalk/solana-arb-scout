@@ -1,6 +1,6 @@
 use crate::economics::{
-    CommonEconomicsCosts, CostProvenanceKind, EconomicsCostModel, FlashFundingCosts,
-    RequiredCost, TreasuryFundingCosts,
+    CommonEconomicsCosts, CostProvenanceKind, EconomicsCostModel, FlashFundingCosts, RequiredCost,
+    TreasuryFundingCosts,
 };
 use crate::raydium::{RaydiumHydrationSnapshot, RAYDIUM_CPMM_PROGRAM_ID};
 use crate::route::{USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
@@ -58,18 +58,18 @@ impl DeterministicVenueContentionFootprint {
 
         for account in &accounts {
             Pubkey::from_str(account).map_err(|error| {
-                format!(
-                    concat!(
-                        "localized priority-fee contention account is invalid: ",
-                        "account={account} error={error}"
-                    )
-                )
+                format!(concat!(
+                    "localized priority-fee contention account is invalid: ",
+                    "account={account} error={error}"
+                ))
             })?;
         }
 
         let provenance = provenance.into();
         if provenance.trim().is_empty() {
-            return Err("localized priority-fee contention provenance must not be empty".to_owned());
+            return Err(
+                "localized priority-fee contention provenance must not be empty".to_owned(),
+            );
         }
 
         Ok(Self {
@@ -248,9 +248,7 @@ fn raydium_contention_footprint_from_fields(
     let pool = Pubkey::from_str(pool_id)
         .map_err(|error| format!("invalid Raydium pool id {pool_id}: {error}"))?;
     let program = Pubkey::from_str(RAYDIUM_CPMM_PROGRAM_ID).map_err(|error| {
-        format!(
-            "invalid configured Raydium CPMM program id {RAYDIUM_CPMM_PROGRAM_ID}: {error}"
-        )
+        format!("invalid configured Raydium CPMM program id {RAYDIUM_CPMM_PROGRAM_ID}: {error}")
     })?;
 
     let (derived_observation, _) =
@@ -344,9 +342,7 @@ fn venue_contention_footprint(
     }
 }
 
-pub fn localized_priority_fee_request(
-    footprint: &DeterministicVenueContentionFootprint,
-) -> Value {
+pub fn localized_priority_fee_request(footprint: &DeterministicVenueContentionFootprint) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": PRIORITY_FEE_RPC_REQUEST_ID,
@@ -382,12 +378,10 @@ pub fn parse_localized_priority_fee_response(
         .ok_or_else(|| "priority-fee response missing numeric id".to_owned())?;
 
     if response_id != PRIORITY_FEE_RPC_REQUEST_ID {
-        return Err(format!(
-            concat!(
-                "priority-fee response id mismatch: ",
-                "expected={PRIORITY_FEE_RPC_REQUEST_ID} actual={response_id}"
-            )
-        ));
+        return Err(format!(concat!(
+            "priority-fee response id mismatch: ",
+            "expected={PRIORITY_FEE_RPC_REQUEST_ID} actual={response_id}"
+        )));
     }
 
     let result = payload
@@ -407,9 +401,7 @@ pub fn parse_localized_priority_fee_response(
             .get("prioritizationFee")
             .and_then(Value::as_u64)
             .ok_or_else(|| {
-                format!(
-                    "priority-fee observation at slot {slot} missing prioritizationFee"
-                )
+                format!("priority-fee observation at slot {slot} missing prioritizationFee")
             })?;
 
         samples.push(PriorityFeeObservationSample {
@@ -533,26 +525,11 @@ pub fn parse_jito_tip_floor_response(payload: &Value) -> Result<JitoTipFloorObse
 
     Ok(JitoTipFloorObservation {
         time,
-        landed_tips_25th_lamports: jito_sol_field_to_lamports(
-            row,
-            "landed_tips_25th_percentile",
-        )?,
-        landed_tips_50th_lamports: jito_sol_field_to_lamports(
-            row,
-            "landed_tips_50th_percentile",
-        )?,
-        landed_tips_75th_lamports: jito_sol_field_to_lamports(
-            row,
-            "landed_tips_75th_percentile",
-        )?,
-        landed_tips_95th_lamports: jito_sol_field_to_lamports(
-            row,
-            "landed_tips_95th_percentile",
-        )?,
-        landed_tips_99th_lamports: jito_sol_field_to_lamports(
-            row,
-            "landed_tips_99th_percentile",
-        )?,
+        landed_tips_25th_lamports: jito_sol_field_to_lamports(row, "landed_tips_25th_percentile")?,
+        landed_tips_50th_lamports: jito_sol_field_to_lamports(row, "landed_tips_50th_percentile")?,
+        landed_tips_75th_lamports: jito_sol_field_to_lamports(row, "landed_tips_75th_percentile")?,
+        landed_tips_95th_lamports: jito_sol_field_to_lamports(row, "landed_tips_95th_percentile")?,
+        landed_tips_99th_lamports: jito_sol_field_to_lamports(row, "landed_tips_99th_percentile")?,
         ema_landed_tips_50th_lamports: jito_sol_field_to_lamports(
             row,
             "ema_landed_tips_50th_percentile",
@@ -569,9 +546,7 @@ fn jito_sol_field_to_lamports(row: &Value, field: &str) -> Result<u64, String> {
         Value::Number(number) => number.to_string(),
         Value::String(text) if !text.trim().is_empty() => text.clone(),
         _ => {
-            return Err(format!(
-                "Jito tip-floor field {field} must be numeric SOL"
-            ));
+            return Err(format!("Jito tip-floor field {field} must be numeric SOL"));
         }
     };
 
@@ -606,7 +581,9 @@ fn decimal_sol_to_lamports(text: &str) -> Result<u64, String> {
         return Err("SOL amount contains no digits".to_owned());
     }
 
-    if !integer_part.chars().all(|character| character.is_ascii_digit())
+    if !integer_part
+        .chars()
+        .all(|character| character.is_ascii_digit())
         || !fractional_part
             .chars()
             .all(|character| character.is_ascii_digit())
@@ -762,9 +739,7 @@ fn modeled_base_fee_cost(anchor_mint: &str, anchor_decimals: u8) -> Result<Requi
                     "basis={} current_base_fee_lamports_per_signature={} ",
                     "modeled_signature_count={} anchor_conversion=WSOL-lamports-1:1"
                 ),
-                RUNG11_V0_BASIS_ID,
-                BASE_FEE_LAMPORTS_PER_SIGNATURE,
-                MODELED_SIGNATURE_COUNT
+                RUNG11_V0_BASIS_ID, BASE_FEE_LAMPORTS_PER_SIGNATURE, MODELED_SIGNATURE_COUNT
             ),
         ),
         Err(reason) => RequiredCost::unknown(
@@ -847,9 +822,9 @@ fn submission_cost_unknown(
             ),
             observation.time
         ),
-        JitoObservationState::Unavailable(reason) => format!(
-            "submission_cost unknown: Jito tip-floor telemetry unavailable: {reason}"
-        ),
+        JitoObservationState::Unavailable(reason) => {
+            format!("submission_cost unknown: Jito tip-floor telemetry unavailable: {reason}")
+        }
     };
 
     RequiredCost::unknown(CostProvenanceKind::ModeledAssumption, reason)
@@ -907,10 +882,7 @@ mod tests {
         )?;
 
         assert_eq!(footprint.accounts().len(), 3);
-        assert!(footprint
-            .accounts()
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]));
+        assert!(footprint.accounts().windows(2).all(|pair| pair[0] < pair[1]));
 
         Ok(())
     }
@@ -926,8 +898,8 @@ mod tests {
 
     #[test]
     fn raydium_footprint_requires_stored_observation_key_to_match_pda() -> Result<(), String> {
-        let pool = Pubkey::from_str(TEST_POOL)
-            .map_err(|error| format!("invalid test pool pubkey: {error}"))?;
+        let pool =
+            Pubkey::from_str(TEST_POOL).map_err(|error| format!("invalid test pool pubkey: {error}"))?;
         let program = Pubkey::from_str(RAYDIUM_CPMM_PROGRAM_ID)
             .map_err(|error| format!("invalid Raydium program pubkey: {error}"))?;
         let (observation, _) =
@@ -1211,9 +1183,7 @@ mod tests {
         let model = economics_cost_model(
             WRAPPED_SOL_MINT,
             9,
-            &PriorityObservationState::Unavailable(
-                PUMPSWAP_CONTENTION_POLICY_REASON.to_owned(),
-            ),
+            &PriorityObservationState::Unavailable(PUMPSWAP_CONTENTION_POLICY_REASON.to_owned()),
             &JitoObservationState::Unavailable("fixture unavailable".to_owned()),
         )?;
 
@@ -1307,7 +1277,10 @@ mod tests {
             &JitoObservationState::Unavailable("fixture unavailable".to_owned()),
         )?;
 
-        assert!(matches!(model.common.base_fee, RequiredCost::Unknown { .. }));
+        assert!(matches!(
+            model.common.base_fee,
+            RequiredCost::Unknown { .. }
+        ));
         assert!(matches!(
             model.common.priority_fee,
             RequiredCost::Unknown { .. }
