@@ -949,21 +949,27 @@ fn conservative_lamports_to_stable_raw(
 
     let exponent_delta = i64::from(sol_usd.exponent) - i64::from(stable_usd.exponent);
 
-    if exponent_delta > 0 {
-        let exponent = u32::try_from(exponent_delta)
-            .map_err(|_| "positive USD exponent delta conversion failed".to_owned())?;
-        numerator = numerator
-            .checked_mul(checked_pow10_u128(exponent)?)
-            .ok_or_else(|| "stablecoin external-cost exponent numerator overflow".to_owned())?;
-    } else if exponent_delta < 0 {
-        let magnitude = exponent_delta
-            .checked_neg()
-            .ok_or_else(|| "negative USD exponent delta overflow".to_owned())?;
-        let exponent = u32::try_from(magnitude)
-            .map_err(|_| "negative USD exponent delta conversion failed".to_owned())?;
-        denominator = denominator
-            .checked_mul(checked_pow10_u128(exponent)?)
-            .ok_or_else(|| "stablecoin external-cost exponent denominator overflow".to_owned())?;
+    match exponent_delta.cmp(&0) {
+        std::cmp::Ordering::Greater => {
+            let exponent = u32::try_from(exponent_delta)
+                .map_err(|_| "positive USD exponent delta conversion failed".to_owned())?;
+            numerator = numerator
+                .checked_mul(checked_pow10_u128(exponent)?)
+                .ok_or_else(|| "stablecoin external-cost exponent numerator overflow".to_owned())?;
+        }
+        std::cmp::Ordering::Less => {
+            let magnitude = exponent_delta
+                .checked_neg()
+                .ok_or_else(|| "negative USD exponent delta overflow".to_owned())?;
+            let exponent = u32::try_from(magnitude)
+                .map_err(|_| "negative USD exponent delta conversion failed".to_owned())?;
+            denominator = denominator
+                .checked_mul(checked_pow10_u128(exponent)?)
+                .ok_or_else(|| {
+                    "stablecoin external-cost exponent denominator overflow".to_owned()
+                })?;
+        }
+        std::cmp::Ordering::Equal => {}
     }
 
     let quotient = numerator / denominator;
@@ -1013,10 +1019,7 @@ mod tests {
         )?;
 
         assert_eq!(footprint.accounts().len(), 3);
-        assert!(footprint
-            .accounts()
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]));
+        assert!(footprint.accounts().windows(2).all(|pair| pair[0] < pair[1]));
 
         Ok(())
     }
