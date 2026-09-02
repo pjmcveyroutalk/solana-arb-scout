@@ -37,6 +37,7 @@ pub enum PythUsdFeed {
     Usdt,
 }
 
+#[cfg(test)]
 const PYTH_USD_FEEDS: [PythUsdFeed; 3] = [PythUsdFeed::Sol, PythUsdFeed::Usdc, PythUsdFeed::Usdt];
 
 impl PythUsdFeed {
@@ -112,6 +113,7 @@ pub fn pyth_usd_price_request(feed: PythUsdFeed) -> Value {
     })
 }
 
+#[cfg(test)]
 pub fn sol_usd_price_request() -> Value {
     pyth_usd_price_request(PYTH_USD_FEEDS[0])
 }
@@ -296,6 +298,7 @@ pub fn parse_pyth_usd_price(
     })
 }
 
+#[cfg(test)]
 pub fn parse_sol_usd_price(payload: &Value, now_unix_seconds: i64) -> Result<SolUsdPrice, String> {
     parse_pyth_usd_price(payload, now_unix_seconds, PythUsdFeed::Sol)
 }
