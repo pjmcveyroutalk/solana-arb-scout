@@ -6,21 +6,14 @@ const RAYDIUM_POOL_STATE_DISCRIMINATOR_B58: &str = "iUE1qg7KXeV";
 const RAYDIUM_TOKEN_0_MINT_OFFSET: usize = 168;
 const RAYDIUM_TOKEN_1_MINT_OFFSET: usize = 200;
 
-pub fn raydium_pair_lookup_requests(
-    anchor_mint: &str,
-    intermediate_mint: &str,
-) -> [Value; 2] {
+pub fn raydium_pair_lookup_requests(anchor_mint: &str, intermediate_mint: &str) -> [Value; 2] {
     [
         raydium_pair_lookup_request(9, anchor_mint, intermediate_mint),
         raydium_pair_lookup_request(10, intermediate_mint, anchor_mint),
     ]
 }
 
-fn raydium_pair_lookup_request(
-    request_id: u64,
-    token_0_mint: &str,
-    token_1_mint: &str,
-) -> Value {
+fn raydium_pair_lookup_request(request_id: u64, token_0_mint: &str, token_1_mint: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": request_id,
@@ -85,12 +78,9 @@ pub fn parse_raydium_pair_lookup_response(
     let mut observations = Vec::with_capacity(accounts.len());
 
     for entry in accounts {
-        let pubkey = entry
-            .get("pubkey")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                "Raydium exact-pair getProgramAccounts entry missing pubkey".to_owned()
-            })?;
+        let pubkey = entry.get("pubkey").and_then(Value::as_str).ok_or_else(|| {
+            "Raydium exact-pair getProgramAccounts entry missing pubkey".to_owned()
+        })?;
         let account = entry.get("account").ok_or_else(|| {
             "Raydium exact-pair getProgramAccounts entry missing account".to_owned()
         })?;
@@ -115,9 +105,7 @@ pub fn parse_raydium_pair_lookup_response(
 
         if observations
             .iter()
-            .any(|existing: &RaydiumCpmmAccountObservation| {
-                existing.pubkey == observation.pubkey
-            })
+            .any(|existing: &RaydiumCpmmAccountObservation| existing.pubkey == observation.pubkey)
         {
             continue;
         }
@@ -138,8 +126,7 @@ mod tests {
 
     #[test]
     fn pair_lookup_requests_cover_both_orientations_and_both_mints() {
-        let requests =
-            raydium_pair_lookup_requests(WRAPPED_SOL_MINT, TEST_INTERMEDIATE_MINT);
+        let requests = raydium_pair_lookup_requests(WRAPPED_SOL_MINT, TEST_INTERMEDIATE_MINT);
 
         assert_eq!(requests.len(), 2);
 
@@ -252,10 +239,7 @@ mod tests {
 
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].slot, 777);
-        assert_eq!(
-            observations[0].pool_state.token_0_mint,
-            WRAPPED_SOL_MINT
-        );
+        assert_eq!(observations[0].pool_state.token_0_mint, WRAPPED_SOL_MINT);
         assert_eq!(
             observations[0].pool_state.token_1_mint,
             TEST_INTERMEDIATE_MINT
