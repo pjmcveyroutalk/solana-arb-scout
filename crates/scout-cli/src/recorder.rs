@@ -1,6 +1,4 @@
-use crate::costs::{
-    self, JitoObservationState, PriorityObservationState,
-};
+use crate::costs::{self, JitoObservationState, PriorityObservationState};
 use crate::economics::{EconomicsCostModel, ExpectedNetEconomics, RequiredCost};
 use crate::quote::{TwoLegRouteQuote, VenueFeeComponents, VenueLegQuote};
 use crate::route::TwoLegRouteCandidate;
@@ -198,7 +196,10 @@ impl ShadowRecorder {
 
         let mut pool_timing = BTreeMap::new();
         for pool in eligible_pools {
-            if pool_timing.insert(pool.pool_id.clone(), pool.clone()).is_some() {
+            if pool_timing
+                .insert(pool.pool_id.clone(), pool.clone())
+                .is_some()
+            {
                 return Err(format!(
                     "R12 eligible-pool timing map contained duplicate pool id {}",
                     pool.pool_id
@@ -572,7 +573,11 @@ pub fn validate_jsonl_replay(path: &Path) -> Result<(), String> {
                 }
                 saw_run_end = true;
             }
-            other => return Err(format!("R12 replay encountered unknown event type: {other}")),
+            other => {
+                return Err(format!(
+                    "R12 replay encountered unknown event type: {other}"
+                ))
+            }
         }
 
         if saw_run_end && event_type != "run_end" {
@@ -673,7 +678,9 @@ fn validate_candidate_payload(
             | "economics_resolved_nonpositive"
             | "economics_resolved_positive"
     ) {
-        return Err(format!("R12 replay encountered unknown candidate status: {status}"));
+        return Err(format!(
+            "R12 replay encountered unknown candidate status: {status}"
+        ));
     }
 
     let lifecycle_value = payload
@@ -740,9 +747,7 @@ fn validate_candidate_payload(
                     .get("hypothetical_ready_at_unix_ms")
                     .is_some_and(|value| !value.is_null())
             {
-                return Err(
-                    "R12 quote_rejected record contains economics/ready timing".to_owned(),
-                );
+                return Err("R12 quote_rejected record contains economics/ready timing".to_owned());
             }
         }
         "economics_unresolved"
@@ -751,7 +756,9 @@ fn validate_candidate_payload(
             let quote_complete = timing
                 .get("quote_complete_at_unix_ms")
                 .and_then(Value::as_u64)
-                .ok_or_else(|| "R12 economics candidate missing quote_complete timestamp".to_owned())?;
+                .ok_or_else(|| {
+                    "R12 economics candidate missing quote_complete timestamp".to_owned()
+                })?;
             let economics_complete = timing
                 .get("economics_complete_at_unix_ms")
                 .and_then(Value::as_u64)
@@ -889,7 +896,9 @@ fn validate_required_cost(cost: &Value) -> Result<(), String> {
             required_u64(cost, "amount_anchor_raw")?;
             let kind = required_str(cost, "provenance_kind")?;
             if kind != "observed" && kind != "modeled_assumption" {
-                return Err(format!("R12 known cost has invalid provenance kind: {kind}"));
+                return Err(format!(
+                    "R12 known cost has invalid provenance kind: {kind}"
+                ));
             }
             let provenance = required_str(cost, "provenance")?;
             if provenance.trim().is_empty() {
@@ -902,7 +911,9 @@ fn validate_required_cost(cost: &Value) -> Result<(), String> {
             }
             let kind = required_str(cost, "provenance_kind")?;
             if kind != "observed" && kind != "modeled_assumption" {
-                return Err(format!("R12 unknown cost has invalid provenance kind: {kind}"));
+                return Err(format!(
+                    "R12 unknown cost has invalid provenance kind: {kind}"
+                ));
             }
             let reason = required_str(cost, "reason")?;
             if reason.trim().is_empty() {
@@ -1464,10 +1475,8 @@ mod tests {
     #[test]
     fn known_and_unknown_costs_preserve_distinct_shapes() -> Result<(), String> {
         let known = RequiredCost::known(7, CostProvenanceKind::Observed, "fixture observed")?;
-        let unknown = RequiredCost::unknown(
-            CostProvenanceKind::ModeledAssumption,
-            "fixture unresolved",
-        )?;
+        let unknown =
+            RequiredCost::unknown(CostProvenanceKind::ModeledAssumption, "fixture unresolved")?;
         let known_json = required_cost_value(&known);
         let unknown_json = required_cost_value(&unknown);
 
@@ -1608,16 +1617,10 @@ mod tests {
             .ok_or_else(|| "fixture route missing".to_owned())?;
         let quote = quote_fixture(route);
         let model = cost_model_fixture()?;
-        let treasury = crate::economics::evaluate_expected_net_for_mode(
-            &quote,
-            &model,
-            FundingMode::Treasury,
-        );
-        let flash = crate::economics::evaluate_expected_net_for_mode(
-            &quote,
-            &model,
-            FundingMode::Flash,
-        );
+        let treasury =
+            crate::economics::evaluate_expected_net_for_mode(&quote, &model, FundingMode::Treasury);
+        let flash =
+            crate::economics::evaluate_expected_net_for_mode(&quote, &model, FundingMode::Flash);
         assert!(treasury.is_err());
         assert!(flash.is_err());
 
