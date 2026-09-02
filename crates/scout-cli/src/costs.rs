@@ -933,9 +933,7 @@ fn conservative_lamports_to_stable_raw(
         .ok_or_else(|| "stablecoin/USD lower confidence bound underflow".to_owned())?;
 
     if stable_lower == 0 {
-        return Err(
-            "stablecoin/USD lower confidence bound must be greater than zero".to_owned(),
-        );
+        return Err("stablecoin/USD lower confidence bound must be greater than zero".to_owned());
     }
 
     let token_scale = checked_pow10_u128(u32::from(stable_decimals))?;
