@@ -405,18 +405,17 @@ async fn discover_deterministic_cross_venue_overlap(
                 }
             };
 
-            let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
-                &pumpswap_payload,
-            ) {
-                Ok(observations) => observations,
-                Err(error) => {
-                    println!(
-                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let pumpswap_observations =
+                match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        continue;
+                    }
+                };
 
             println!(
                 "deterministic_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -534,32 +533,32 @@ async fn discover_deterministic_cross_venue_overlap(
                 "Raydium exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
             );
 
-            let raydium_payload =
-                match fetch_program_accounts(rpc_client, &raydium_request, &label).await {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        println!(
-                            "deterministic_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            anchor_mint, intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+            let raydium_payload = match fetch_program_accounts(rpc_client, &raydium_request, &label)
+                .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!(
+                        "deterministic_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
 
-            let raydium_observations =
-                match parse_raydium_pair_lookup_response(&raydium_payload) {
-                    Ok(observations) => {
-                        successful_raydium_pair_responses += 1;
-                        observations
-                    }
-                    Err(error) => {
-                        println!(
-                            "deterministic_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            anchor_mint, intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+            let raydium_observations = match parse_raydium_pair_lookup_response(&raydium_payload) {
+                Ok(observations) => {
+                    successful_raydium_pair_responses += 1;
+                    observations
+                }
+                Err(error) => {
+                    println!(
+                        "deterministic_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
 
             println!(
                 "deterministic_raydium_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
