@@ -23,8 +23,8 @@ const USDC_USD_FEED_ID: [u8; 32] = [
 ];
 
 const USDT_USD_FEED_ID: [u8; 32] = [
-    43, 137, 185, 220, 143, 223, 159, 52, 112, 154, 91, 16, 107, 71, 47, 15, 57, 187, 108, 169, 206,
-    4, 176, 253, 127, 46, 151, 22, 136, 226, 229, 59,
+    43, 137, 185, 220, 143, 223, 159, 52, 112, 154, 91, 16, 107, 71, 47, 15, 57, 187, 108, 169,
+    206, 4, 176, 253, 127, 46, 151, 22, 136, 226, 229, 59,
 ];
 
 const MAX_PYTH_USD_AGE_SECONDS: u64 = 90;
@@ -37,8 +37,7 @@ pub enum PythUsdFeed {
     Usdt,
 }
 
-const PYTH_USD_FEEDS: [PythUsdFeed; 3] =
-    [PythUsdFeed::Sol, PythUsdFeed::Usdc, PythUsdFeed::Usdt];
+const PYTH_USD_FEEDS: [PythUsdFeed; 3] = [PythUsdFeed::Sol, PythUsdFeed::Usdc, PythUsdFeed::Usdt];
 
 impl PythUsdFeed {
     pub fn label(self) -> &'static str {
@@ -215,9 +214,12 @@ pub fn parse_pyth_usd_price(
         ));
     }
 
-    let verification_level = *data
-        .get(40)
-        .ok_or_else(|| format!("Pyth {} PriceUpdateV2 missing verification level", feed.label()))?;
+    let verification_level = *data.get(40).ok_or_else(|| {
+        format!(
+            "Pyth {} PriceUpdateV2 missing verification level",
+            feed.label()
+        )
+    })?;
 
     if verification_level != 1 {
         return Err(format!(
@@ -231,10 +233,7 @@ pub fn parse_pyth_usd_price(
         .ok_or_else(|| format!("Pyth {} PriceUpdateV2 missing feed id", feed.label()))?;
 
     if feed_id != feed.feed_id().as_slice() {
-        return Err(format!(
-            "Pyth price update feed id is not {}",
-            feed.label()
-        ));
+        return Err(format!("Pyth price update feed id is not {}", feed.label()));
     }
 
     let price_signed = read_i64(&data, 73)?;
@@ -456,7 +455,9 @@ mod tests {
         }
 
         assert_eq!(
-            sol_usd_price_request().pointer("/params/0").and_then(Value::as_str),
+            sol_usd_price_request()
+                .pointer("/params/0")
+                .and_then(Value::as_str),
             Some(PYTH_SOL_USD_ACCOUNT)
         );
     }
@@ -502,27 +503,16 @@ mod tests {
         let bytes = price_update_bytes(feed, 100_000_000, 25_000, -8, NOW - 30);
 
         let mut wrong_owner = price_payload(feed, &bytes);
-        wrong_owner["result"]["value"]["owner"] =
-            Value::from("11111111111111111111111111111111");
+        wrong_owner["result"]["value"]["owner"] = Value::from("11111111111111111111111111111111");
         assert!(parse_pyth_usd_price(&wrong_owner, NOW, feed).is_err());
 
         let mut wrong_feed_bytes = bytes.clone();
         wrong_feed_bytes[41] ^= 1;
-        assert!(parse_pyth_usd_price(
-            &price_payload(feed, &wrong_feed_bytes),
-            NOW,
-            feed
-        )
-        .is_err());
+        assert!(parse_pyth_usd_price(&price_payload(feed, &wrong_feed_bytes), NOW, feed).is_err());
 
         let mut partial_bytes = bytes.clone();
         partial_bytes[40] = 0;
-        assert!(parse_pyth_usd_price(
-            &price_payload(feed, &partial_bytes),
-            NOW,
-            feed
-        )
-        .is_err());
+        assert!(parse_pyth_usd_price(&price_payload(feed, &partial_bytes), NOW, feed).is_err());
 
         let stale = price_update_bytes(feed, 100_000_000, 25_000, -8, NOW - 91);
         assert!(parse_pyth_usd_price(&price_payload(feed, &stale), NOW, feed).is_err());
@@ -588,12 +578,7 @@ mod tests {
         };
 
         assert_eq!(
-            usd_dollars_to_anchor_raw(
-                1,
-                WRAPPED_SOL_MINT,
-                9,
-                Some(&positive_exponent_price)
-            )?,
+            usd_dollars_to_anchor_raw(1, WRAPPED_SOL_MINT, 9, Some(&positive_exponent_price))?,
             5_000_000
         );
 
