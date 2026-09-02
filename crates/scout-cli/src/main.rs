@@ -1,3 +1,4 @@
+mod costs;
 mod discovery;
 pub mod economics;
 mod pumpswap;
@@ -153,12 +154,14 @@ async fn main() -> Result<(), String> {
     let sol_usd_price = fetch_sol_usd_price(&rpc_client).await?;
 
     validate_registry_routes_and_sizes(
+        &rpc_client,
         raydium_states,
         pumpswap_states,
         &raydium_quote_contexts,
         &pumpswap_quote_contexts,
         &sol_usd_price,
     )
+    .await
 }
 
 async fn observe_slots<S>(reader: &mut S) -> Result<(), String>
@@ -903,7 +906,8 @@ fn normalized_pool_is_eligible(pool: &NormalizedPoolState) -> bool {
     )
 }
 
-fn validate_registry_routes_and_sizes(
+async fn validate_registry_routes_and_sizes(
+    rpc_client: &Client,
     raydium_states: Vec<NormalizedPoolState>,
     pumpswap_states: Vec<NormalizedPoolState>,
     raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
@@ -957,8 +961,9 @@ fn validate_registry_routes_and_sizes(
 
     let mut successful_routes = 0usize;
     let mut successful_grid_quotes = 0usize;
+    let mut rung11c_quote_records = Vec::new();
 
-    for route_candidate in &route_candidates {
+    for (route_index, route_candidate) in route_candidates.iter().enumerate() {
         let leg_1_context = match quote_context_for_leg(
             route_candidate.leg_1(),
             raydium_quote_contexts,
@@ -1033,6 +1038,12 @@ fn validate_registry_routes_and_sizes(
                         "rung10_grid_quote: usd=${dollars} {}",
                         route_quote.summary()
                     );
+                    rung11c_quote_records.push((
+                        route_index,
+                        dollars,
+                        anchor_decimals,
+                        route_quote,
+                    ));
                 }
                 Err(error) => {
                     println!(
@@ -1059,6 +1070,138 @@ fn validate_registry_routes_and_sizes(
     println!("rung10_complete_grid_route_count={successful_routes}");
     println!("rung10_successful_grid_quote_count={successful_grid_quotes}");
     println!("READ-ONLY RUNG 10 SIZE + QUOTE ENGINE PASS");
+
+    println!("\nRung 11C read-only cost observation");
+
+    let jito_observation = observe_jito_tip_floor(rpc_client).await;
+    let mut priority_cache = BTreeMap::<Vec<String>, costs::PriorityObservationState>::new();
+    let mut route_priority_observations =
+        BTreeMap::<usize, costs::PriorityObservationState>::new();
+    let mut rung11c_route_scope_attempts = 0usize;
+
+    let successful_route_indices = rung11c_quote_records
+        .iter()
+        .map(|(route_index, _, _, _)| *route_index)
+        .collect::<BTreeSet<_>>();
+
+    for route_index in successful_route_indices {
+        let Some(route_candidate) = route_candidates.get(route_index) else {
+            continue;
+        };
+
+        let leg_1_context = match quote_context_for_leg(
+            route_candidate.leg_1(),
+            raydium_quote_contexts,
+            pumpswap_quote_contexts,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                println!(
+                    "rung11c_priority_scope_unknown: route=[{}] reason={error}",
+                    route_candidate.summary()
+                );
+                route_priority_observations.insert(
+                    route_index,
+                    costs::PriorityObservationState::Unavailable(error),
+                );
+                continue;
+            }
+        };
+
+        let leg_2_context = match quote_context_for_leg(
+            route_candidate.leg_2(),
+            raydium_quote_contexts,
+            pumpswap_quote_contexts,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                println!(
+                    "rung11c_priority_scope_unknown: route=[{}] reason={error}",
+                    route_candidate.summary()
+                );
+                route_priority_observations.insert(
+                    route_index,
+                    costs::PriorityObservationState::Unavailable(error),
+                );
+                continue;
+            }
+        };
+
+        rung11c_route_scope_attempts += 1;
+
+        let priority_observation = route_priority_observation(
+            rpc_client,
+            route_candidate.leg_1(),
+            &leg_1_context,
+            route_candidate.leg_2(),
+            &leg_2_context,
+            &mut priority_cache,
+        )
+        .await;
+
+        route_priority_observations.insert(route_index, priority_observation);
+    }
+
+    for (route_index, dollars, anchor_decimals, route_quote) in &rung11c_quote_records {
+        let Some(route_candidate) = route_candidates.get(*route_index) else {
+            continue;
+        };
+
+        let Some(priority_observation) = route_priority_observations.get(route_index) else {
+            println!(
+                "rung11c_cost_model_rejected: route=[{}] reason=missing priority observation state",
+                route_candidate.summary()
+            );
+            continue;
+        };
+
+        let cost_model = match costs::economics_cost_model(
+            route_candidate.anchor_mint(),
+            *anchor_decimals,
+            priority_observation,
+            &jito_observation,
+        ) {
+            Ok(model) => model,
+            Err(error) => {
+                println!(
+                    "rung11c_cost_model_rejected: route=[{}] reason={error}",
+                    route_candidate.summary()
+                );
+                continue;
+            }
+        };
+
+        for funding_mode in [
+            economics::FundingMode::Treasury,
+            economics::FundingMode::Flash,
+        ] {
+            match economics::evaluate_expected_net_for_mode(
+                route_quote,
+                &cost_model,
+                funding_mode,
+            ) {
+                Ok(result) => {
+                    println!("rung11c_expected_net: usd=${dollars} {}", result.summary());
+                }
+                Err(error) => {
+                    println!(
+                        concat!(
+                            "rung11c_expected_net_fail_closed: usd=${} funding={} ",
+                            "route=[{}] reason={}"
+                        ),
+                        dollars,
+                        funding_mode.label(),
+                        route_candidate.summary(),
+                        error
+                    );
+                }
+            }
+        }
+    }
+
+    if rung11c_route_scope_attempts > 0 {
+        println!("READ-ONLY RUNG 11C COST OBSERVATION PASS");
+    }
 
     Ok(())
 }
@@ -1116,6 +1259,194 @@ fn context_mint_decimals(context: &VenueQuoteContext<'_>, mint: &str) -> Result<
             } else {
                 Err(format!("mint {mint} is not in PumpSwap quote context"))
             }
+        }
+    }
+}
+
+async fn observe_jito_tip_floor(rpc_client: &Client) -> costs::JitoObservationState {
+    let started_at = Instant::now();
+
+    let response = match rpc_client.get(costs::JITO_TIP_FLOOR_URL).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let reason = format!(
+                "Jito tip-floor HTTP request failed after {} ms: {error}",
+                started_at.elapsed().as_millis()
+            );
+            println!("rung11c_jito_observation_unavailable: {reason}");
+            return costs::JitoObservationState::Unavailable(reason);
+        }
+    };
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let reason = format!(
+            "Jito tip-floor HTTP status {status} after {} ms",
+            started_at.elapsed().as_millis()
+        );
+        println!("rung11c_jito_observation_unavailable: {reason}");
+        return costs::JitoObservationState::Unavailable(reason);
+    }
+
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let reason = format!(
+                "Jito tip-floor response was invalid JSON after {} ms: {error}",
+                started_at.elapsed().as_millis()
+            );
+            println!("rung11c_jito_observation_unavailable: {reason}");
+            return costs::JitoObservationState::Unavailable(reason);
+        }
+    };
+
+    match costs::parse_jito_tip_floor_response(&payload) {
+        Ok(observation) => {
+            println!("rung11c_jito_observation: {}", observation.summary());
+            costs::JitoObservationState::Available(observation)
+        }
+        Err(error) => {
+            println!("rung11c_jito_observation_unavailable: {error}");
+            costs::JitoObservationState::Unavailable(error)
+        }
+    }
+}
+
+async fn route_priority_observation(
+    rpc_client: &Client,
+    leg_1: &RouteLeg,
+    leg_1_context: &VenueQuoteContext<'_>,
+    leg_2: &RouteLeg,
+    leg_2_context: &VenueQuoteContext<'_>,
+    cache: &mut BTreeMap<Vec<String>, costs::PriorityObservationState>,
+) -> costs::PriorityObservationState {
+    let leg_1_raydium = match leg_1_context {
+        VenueQuoteContext::Raydium { snapshot, .. } => Some(*snapshot),
+        VenueQuoteContext::PumpSwap { .. } => None,
+    };
+
+    let leg_2_raydium = match leg_2_context {
+        VenueQuoteContext::Raydium { snapshot, .. } => Some(*snapshot),
+        VenueQuoteContext::PumpSwap { .. } => None,
+    };
+
+    let footprint = match costs::route_contention_footprint(
+        costs::VenueContentionInput {
+            venue: leg_1.venue(),
+            pool_id: leg_1.pool_id(),
+            raydium_snapshot: leg_1_raydium,
+        },
+        costs::VenueContentionInput {
+            venue: leg_2.venue(),
+            pool_id: leg_2.pool_id(),
+            raydium_snapshot: leg_2_raydium,
+        },
+    ) {
+        Ok(footprint) => footprint,
+        Err(error) => {
+            println!(
+                concat!(
+                    "rung11c_priority_scope_unknown: leg1_pool={} leg2_pool={} ",
+                    "reason={}"
+                ),
+                leg_1.pool_id(),
+                leg_2.pool_id(),
+                error
+            );
+            return costs::PriorityObservationState::Unavailable(error);
+        }
+    };
+
+    println!("rung11c_priority_scope: {}", footprint.summary());
+
+    let cache_key = footprint.accounts().to_vec();
+
+    if let Some(cached) = cache.get(&cache_key) {
+        println!(
+            "rung11c_priority_observation_cache_hit: account_count={}",
+            cache_key.len()
+        );
+        return cached.clone();
+    }
+
+    let observation = fetch_localized_priority_observation(rpc_client, &footprint).await;
+    cache.insert(cache_key, observation.clone());
+    observation
+}
+
+async fn fetch_localized_priority_observation(
+    rpc_client: &Client,
+    footprint: &costs::DeterministicVenueContentionFootprint,
+) -> costs::PriorityObservationState {
+    let request = costs::localized_priority_fee_request(footprint);
+    let started_at = Instant::now();
+
+    println!(
+        concat!(
+            "rpc_request_start: label=Rung11C localized priority ",
+            "method=getRecentPrioritizationFees account_count={}"
+        ),
+        footprint.accounts().len()
+    );
+
+    let response = match rpc_client.post(SOLANA_RPC_URL).json(&request).send().await {
+        Ok(response) => response,
+        Err(error) => {
+            let reason = format!(
+                "localized priority RPC request failed after {} ms: {error}",
+                started_at.elapsed().as_millis()
+            );
+            println!("rung11c_priority_observation_unavailable: {reason}");
+            return costs::PriorityObservationState::Unavailable(reason);
+        }
+    };
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let reason = format!(
+            "localized priority RPC returned HTTP status {status} after {} ms",
+            started_at.elapsed().as_millis()
+        );
+        println!("rung11c_priority_observation_unavailable: {reason}");
+        return costs::PriorityObservationState::Unavailable(reason);
+    }
+
+    let payload = match response.json::<Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            let reason = format!(
+                "localized priority RPC returned invalid JSON after {} ms: {error}",
+                started_at.elapsed().as_millis()
+            );
+            println!("rung11c_priority_observation_unavailable: {reason}");
+            return costs::PriorityObservationState::Unavailable(reason);
+        }
+    };
+
+    match costs::parse_localized_priority_fee_response(&payload, footprint) {
+        Ok(observation) => {
+            println!("rung11c_priority_observation: {}", observation.summary());
+
+            match costs::select_priority_fee(&observation) {
+                Ok(Some(selection)) => {
+                    println!("rung11c_priority_selection: {}", selection.summary());
+                }
+                Ok(None) => {
+                    println!("rung11c_priority_selection_unknown: no positive localized samples");
+                }
+                Err(error) => {
+                    println!("rung11c_priority_selection_rejected: {error}");
+                    return costs::PriorityObservationState::Unavailable(error);
+                }
+            }
+
+            costs::PriorityObservationState::Available(observation)
+        }
+        Err(error) => {
+            println!("rung11c_priority_observation_unavailable: {error}");
+            costs::PriorityObservationState::Unavailable(error)
         }
     }
 }
