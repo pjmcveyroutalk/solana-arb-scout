@@ -12,7 +12,7 @@ use discovery::{parse_raydium_pair_lookup_response, raydium_pair_lookup_requests
 use futures_util::{SinkExt, StreamExt};
 use quote::{quote_two_leg_exact_input, VenueQuoteContext};
 use registry::ActiveMintRegistry;
-use reqwest::Client;
+use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
 use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
 use serde_json::{json, Value};
@@ -22,7 +22,7 @@ use sizing::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message},
@@ -34,6 +34,9 @@ const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DETERMINISTIC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(210);
+const GPA_REQUEST_PACING: Duration = Duration::from_millis(300);
+const GPA_RETRY_FALLBACK: Duration = Duration::from_secs(1);
+const MAX_GPA_RETRIES: usize = 2;
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
@@ -44,6 +47,35 @@ struct PythUsdPrices {
     sol: SolUsdPrice,
     usdc: Option<SolUsdPrice>,
     usdt: Option<SolUsdPrice>,
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryCompleteness {
+    incomplete_probe_count: usize,
+    first_cause: Option<String>,
+}
+
+impl DiscoveryCompleteness {
+    fn record_incomplete(&mut self, cause: String) {
+        self.incomplete_probe_count += 1;
+
+        if self.first_cause.is_none() {
+            self.first_cause = Some(cause);
+        }
+    }
+
+    fn terminal_error(&self) -> String {
+        if self.incomplete_probe_count > 0 {
+            format!(
+                "Rung 9 deterministic discovery incomplete: incomplete_probe_count={} first_cause={}",
+                self.incomplete_probe_count,
+                self.first_cause.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            "Rung 9 bounded bidirectional exact-pair discovery complete with no live Raydium-PumpSwap same-pair overlap"
+                .to_owned()
+        }
+    }
 }
 
 #[tokio::main]
@@ -347,6 +379,8 @@ async fn discover_deterministic_cross_venue_overlap(
 > {
     println!("Solana on-chain state remains authoritative.");
 
+    let mut completeness = DiscoveryCompleteness::default();
+
     let mut seen_raydium_pairs = BTreeSet::new();
     let mut raydium_pair_count = 0usize;
 
@@ -368,10 +402,12 @@ async fn discover_deterministic_cross_venue_overlap(
 
         let Some(raydium_snapshot) = live_raydium_quote_contexts.get(&raydium_normalized.pool_id)
         else {
-            println!(
-                "deterministic_exact_pair_probe_rejected: raydium_pool={} reason=missing live quote context",
+            let reason = format!(
+                "raydium_pool={} reason=missing live quote context",
                 raydium_normalized.pool_id
             );
+            println!("deterministic_exact_pair_probe_rejected: {reason}");
+            completeness.record_incomplete(reason);
             continue;
         };
 
@@ -388,35 +424,33 @@ async fn discover_deterministic_cross_venue_overlap(
                 "PumpSwap exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
             );
 
-            let pumpswap_payload = match fetch_program_accounts(
-                rpc_client,
-                &pumpswap_request,
-                &label,
-            )
-            .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    println!(
-                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let pumpswap_payload =
+                match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let reason = format!(
+                            "anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        println!("deterministic_exact_pair_lookup_rejected: {reason}");
+                        completeness.record_incomplete(reason);
+                        continue;
+                    }
+                };
 
-            let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
-                &pumpswap_payload,
-            ) {
-                Ok(observations) => observations,
-                Err(error) => {
-                    println!(
-                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let pumpswap_observations =
+                match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        let reason = format!(
+                            "anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        println!("deterministic_exact_pair_lookup_rejected: {reason}");
+                        completeness.record_incomplete(reason);
+                        continue;
+                    }
+                };
 
             println!(
                 "deterministic_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -440,10 +474,12 @@ async fn discover_deterministic_cross_venue_overlap(
                 let (pumpswap_normalized, pumpswap_snapshot) = match pumpswap_hydration_result {
                     Ok(result) => result,
                     Err(error) => {
-                        println!(
-                            "deterministic_exact_pair_candidate_rejected: pool={} reason={error}",
+                        let reason = format!(
+                            "pool={} reason={error}",
                             pumpswap_observation.pubkey
                         );
+                        println!("deterministic_exact_pair_candidate_rejected: {reason}");
+                        completeness.record_incomplete(reason);
                         continue;
                     }
                 };
@@ -489,7 +525,6 @@ async fn discover_deterministic_cross_venue_overlap(
 
     let mut seen_pumpswap_pairs = BTreeSet::new();
     let mut pumpswap_pair_count = 0usize;
-    let mut successful_raydium_pair_responses = 0usize;
 
     for pumpswap_normalized in live_pumpswap_states {
         let Some((anchor_mint, intermediate_mint)) = anchor_pair_from_pool(pumpswap_normalized)
@@ -510,10 +545,12 @@ async fn discover_deterministic_cross_venue_overlap(
         let Some(pumpswap_snapshot) =
             live_pumpswap_quote_contexts.get(&pumpswap_normalized.pool_id)
         else {
-            println!(
-                "deterministic_reverse_probe_rejected: pumpswap_pool={} reason=missing live quote context",
+            let reason = format!(
+                "pumpswap_pool={} reason=missing live quote context",
                 pumpswap_normalized.pool_id
             );
+            println!("deterministic_reverse_probe_rejected: {reason}");
+            completeness.record_incomplete(reason);
             continue;
         };
 
@@ -534,32 +571,33 @@ async fn discover_deterministic_cross_venue_overlap(
                 "Raydium exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
             );
 
-            let raydium_payload = match fetch_program_accounts(rpc_client, &raydium_request, &label)
-                .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    println!(
-                        "deterministic_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let raydium_payload =
+                match fetch_program_accounts(rpc_client, &raydium_request, &label).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        let reason = format!(
+                            "anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        println!("deterministic_raydium_exact_pair_lookup_rejected: {reason}");
+                        completeness.record_incomplete(reason);
+                        continue;
+                    }
+                };
 
-            let raydium_observations = match parse_raydium_pair_lookup_response(&raydium_payload) {
-                Ok(observations) => {
-                    successful_raydium_pair_responses += 1;
-                    observations
-                }
-                Err(error) => {
-                    println!(
-                        "deterministic_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let raydium_observations =
+                match parse_raydium_pair_lookup_response(&raydium_payload) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        let reason = format!(
+                            "anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        println!("deterministic_raydium_exact_pair_lookup_rejected: {reason}");
+                        completeness.record_incomplete(reason);
+                        continue;
+                    }
+                };
 
             println!(
                 "deterministic_raydium_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -583,10 +621,10 @@ async fn discover_deterministic_cross_venue_overlap(
                 let (raydium_normalized, raydium_snapshot) = match raydium_hydration_result {
                     Ok(result) => result,
                     Err(error) => {
-                        println!(
-                            "deterministic_raydium_exact_pair_candidate_rejected: pool={} reason={error}",
-                            raydium_observation.pubkey
-                        );
+                        let reason =
+                            format!("pool={} reason={error}", raydium_observation.pubkey);
+                        println!("deterministic_raydium_exact_pair_candidate_rejected: {reason}");
+                        completeness.record_incomplete(reason);
                         continue;
                     }
                 };
@@ -631,17 +669,21 @@ async fn discover_deterministic_cross_venue_overlap(
         seen_pumpswap_pairs.len()
     );
 
-    if successful_raydium_pair_responses == 0 {
-        return Err(
-            "all bounded Raydium exact-pair lookup requests failed before a valid RPC response was parsed"
-                .to_owned(),
+    if completeness.incomplete_probe_count > 0 {
+        println!(
+            "deterministic_discovery_incomplete: incomplete_probe_count={} first_cause={}",
+            completeness.incomplete_probe_count,
+            completeness.first_cause.as_deref().unwrap_or("unknown")
+        );
+    } else {
+        println!(
+            "deterministic_discovery_complete_no_overlap: raydium_unique_pairs={} pumpswap_unique_pairs={}",
+            seen_raydium_pairs.len(),
+            seen_pumpswap_pairs.len()
         );
     }
 
-    Err(
-        "Rung 9 bounded bidirectional exact-pair discovery found no live Raydium-PumpSwap same-pair overlap"
-            .to_owned(),
-    )
+    Err(completeness.terminal_error())
 }
 
 async fn hydrate_raydium_observation(
@@ -696,55 +738,101 @@ async fn fetch_program_accounts(
     let request_id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
     let started_at = Instant::now();
 
-    println!("rpc_request_start: label={label} id={request_id} method=getProgramAccounts");
+    for attempt in 0..=MAX_GPA_RETRIES {
+        sleep(GPA_REQUEST_PACING).await;
 
-    let response = rpc_client
-        .post(SOLANA_RPC_URL)
-        .json(request)
-        .send()
-        .await
-        .map_err(|error| {
+        println!(
+            "rpc_request_start: label={label} id={request_id} method=getProgramAccounts attempt={}",
+            attempt + 1
+        );
+
+        let response = rpc_client
+            .post(SOLANA_RPC_URL)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| {
+                format!(
+                    "{label} RPC request failed after {} ms: {error}",
+                    started_at.elapsed().as_millis()
+                )
+            })?;
+
+        let status = response.status();
+
+        if status == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_GPA_RETRIES {
+            let retry_delay = retry_after_delay(&response);
+
+            println!(
+                concat!(
+                    "rpc_request_rate_limited: label={} id={} status={} attempt={} ",
+                    "retry_after_ms={}"
+                ),
+                label,
+                request_id,
+                status,
+                attempt + 1,
+                retry_delay.as_millis()
+            );
+
+            sleep(retry_delay).await;
+            continue;
+        }
+
+        if !status.is_success() {
+            return Err(format!(
+                "{label} RPC returned HTTP status {status} after {} ms",
+                started_at.elapsed().as_millis()
+            ));
+        }
+
+        let payload = response.json::<Value>().await.map_err(|error| {
             format!(
-                "{label} RPC request failed after {} ms: {error}",
+                "{label} RPC returned invalid JSON after {} ms: {error}",
                 started_at.elapsed().as_millis()
             )
         })?;
 
-    let status = response.status();
+        let result_count = payload
+            .pointer("/result/value")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
 
-    if !status.is_success() {
-        return Err(format!(
-            "{label} RPC returned HTTP status {status} after {} ms",
-            started_at.elapsed().as_millis()
-        ));
+        println!(
+            concat!(
+                "rpc_request_finish: label={} id={} status={} elapsed_ms={} ",
+                "result_count={} rpc_error={} attempts={}"
+            ),
+            label,
+            request_id,
+            status,
+            started_at.elapsed().as_millis(),
+            result_count,
+            payload.get("error").is_some(),
+            attempt + 1
+        );
+
+        return Ok(payload);
     }
 
-    let payload = response.json::<Value>().await.map_err(|error| {
-        format!(
-            "{label} RPC returned invalid JSON after {} ms: {error}",
-            started_at.elapsed().as_millis()
-        )
-    })?;
+    Err(format!(
+        "{label} RPC exhausted bounded getProgramAccounts retry policy after {} attempts",
+        MAX_GPA_RETRIES + 1
+    ))
+}
 
-    let result_count = payload
-        .pointer("/result/value")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+fn retry_after_delay(response: &reqwest::Response) -> Duration {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_retry_after_seconds)
+        .map(Duration::from_secs)
+        .unwrap_or(GPA_RETRY_FALLBACK)
+}
 
-    println!(
-        concat!(
-            "rpc_request_finish: label={} id={} status={} elapsed_ms={} ",
-            "result_count={} rpc_error={}"
-        ),
-        label,
-        request_id,
-        status,
-        started_at.elapsed().as_millis(),
-        result_count,
-        payload.get("error").is_some()
-    );
-
-    Ok(payload)
+fn parse_retry_after_seconds(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok()
 }
 
 async fn fetch_pyth_usd_price(
@@ -1613,5 +1701,46 @@ where
             .map_err(|error| format!("invalid text frame: {error}"))?;
 
         return serde_json::from_str(&text).map_err(|error| format!("invalid JSON: {error}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_search_without_incomplete_probes_reports_no_overlap() {
+        let completeness = DiscoveryCompleteness::default();
+
+        assert_eq!(
+            completeness.terminal_error(),
+            "Rung 9 bounded bidirectional exact-pair discovery complete with no live Raydium-PumpSwap same-pair overlap"
+        );
+    }
+
+    #[test]
+    fn incomplete_search_preserves_count_and_first_cause() {
+        let mut completeness = DiscoveryCompleteness::default();
+
+        completeness.record_incomplete("first transport failure".to_owned());
+        completeness.record_incomplete("later parsing failure".to_owned());
+
+        assert_eq!(completeness.incomplete_probe_count, 2);
+        assert_eq!(
+            completeness.first_cause.as_deref(),
+            Some("first transport failure")
+        );
+        assert_eq!(
+            completeness.terminal_error(),
+            "Rung 9 deterministic discovery incomplete: incomplete_probe_count=2 first_cause=first transport failure"
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_integer_seconds_only() {
+        assert_eq!(parse_retry_after_seconds("3"), Some(3));
+        assert_eq!(parse_retry_after_seconds(" 7 "), Some(7));
+        assert_eq!(parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after_seconds("invalid"), None);
     }
 }
