@@ -8,10 +8,7 @@ mod registry;
 mod route;
 mod sizing;
 
-use discovery::{
-    parse_raydium_anchor_lookup_response, raydium_anchor_lookup_requests,
-    route_candidate_from_observation,
-};
+use discovery::{parse_raydium_pair_lookup_response, raydium_pair_lookup_requests};
 use futures_util::{SinkExt, StreamExt};
 use quote::{quote_two_leg_exact_input, VenueQuoteContext};
 use registry::ActiveMintRegistry;
@@ -129,7 +126,7 @@ async fn main() -> Result<(), String> {
     };
 
     if initial_routes.is_empty() {
-        println!("\nRung 9 deterministic anchor-filtered route reacquisition");
+        println!("\nRung 9 deterministic exact-pair route reacquisition");
 
         let (
             discovered_raydium_states,
@@ -142,6 +139,8 @@ async fn main() -> Result<(), String> {
                 &rpc_client,
                 &raydium_states,
                 &raydium_quote_contexts,
+                &pumpswap_states,
+                &pumpswap_quote_contexts,
             ),
         )
         .await
@@ -335,6 +334,8 @@ async fn discover_deterministic_cross_venue_overlap(
     rpc_client: &Client,
     live_raydium_states: &[NormalizedPoolState],
     live_raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    live_pumpswap_states: &[NormalizedPoolState],
+    live_pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
 ) -> Result<
     (
         Vec<NormalizedPoolState>,
@@ -346,8 +347,8 @@ async fn discover_deterministic_cross_venue_overlap(
 > {
     println!("Solana on-chain state remains authoritative.");
 
-    let mut seen_live_pairs = BTreeSet::new();
-    let mut exact_pair_count = 0usize;
+    let mut seen_raydium_pairs = BTreeSet::new();
+    let mut raydium_pair_count = 0usize;
 
     for raydium_normalized in live_raydium_states {
         let Some((anchor_mint, intermediate_mint)) = anchor_pair_from_pool(raydium_normalized)
@@ -355,13 +356,13 @@ async fn discover_deterministic_cross_venue_overlap(
             continue;
         };
 
-        if !seen_live_pairs.insert((anchor_mint.clone(), intermediate_mint.clone())) {
+        if !seen_raydium_pairs.insert((anchor_mint.clone(), intermediate_mint.clone())) {
             continue;
         }
 
-        exact_pair_count += 1;
+        raydium_pair_count += 1;
 
-        if exact_pair_count > MAX_TARGETED_ROUTE_LOOKUPS {
+        if raydium_pair_count > MAX_TARGETED_ROUTE_LOOKUPS {
             break;
         }
 
@@ -387,35 +388,29 @@ async fn discover_deterministic_cross_venue_overlap(
                 "PumpSwap exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
             );
 
-            let pumpswap_payload = match fetch_program_accounts(
-                rpc_client,
-                &pumpswap_request,
-                &label,
-            )
-            .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    println!(
-                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let pumpswap_payload =
+                match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        continue;
+                    }
+                };
 
-            let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
-                &pumpswap_payload,
-            ) {
-                Ok(observations) => observations,
-                Err(error) => {
-                    println!(
-                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let pumpswap_observations =
+                match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        continue;
+                    }
+                };
 
             println!(
                 "deterministic_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -454,7 +449,7 @@ async fn discover_deterministic_cross_venue_overlap(
                 println!(
                     concat!(
                         "deterministic_cross_venue_overlap: anchor={} intermediate={} ",
-                        "raydium_pool={} pumpswap_pool={} source=live-exact-pair"
+                        "raydium_pool={} pumpswap_pool={} source=raydium-live-exact-pair"
                     ),
                     anchor_mint,
                     intermediate_mint,
@@ -481,208 +476,162 @@ async fn discover_deterministic_cross_venue_overlap(
     }
 
     println!(
-        "deterministic_exact_pair_probe_exhausted: unique_pairs={}",
-        seen_live_pairs.len()
+        "deterministic_raydium_to_pumpswap_exhausted: unique_pairs={}",
+        seen_raydium_pairs.len()
     );
-    println!("deterministic_broad_anchor_fallback_start");
+    println!("deterministic_reverse_exact_pair_probe_start");
 
-    let mut seen_raydium_pools = BTreeSet::new();
-    let mut pair_count = 0usize;
-    let mut successful_anchor_responses = 0usize;
+    let mut seen_pumpswap_pairs = BTreeSet::new();
+    let mut pumpswap_pair_count = 0usize;
+    let mut successful_raydium_pair_responses = 0usize;
 
-    for request in raydium_anchor_lookup_requests() {
-        let request_id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
+    for pumpswap_normalized in live_pumpswap_states {
+        let Some((anchor_mint, intermediate_mint)) = anchor_pair_from_pool(pumpswap_normalized)
+        else {
+            continue;
+        };
 
-        let payload =
-            match fetch_program_accounts(rpc_client, &request, "Raydium anchor lookup").await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    println!("raydium_anchor_lookup_rejected: id={request_id} reason={error}");
-                    continue;
-                }
-            };
+        if !seen_pumpswap_pairs.insert((anchor_mint.clone(), intermediate_mint.clone())) {
+            continue;
+        }
 
-        let observations = match parse_raydium_anchor_lookup_response(&payload) {
-            Ok(observations) => {
-                successful_anchor_responses += 1;
-                observations
-            }
-            Err(error) => {
-                println!("raydium_anchor_lookup_rejected: id={request_id} reason={error}");
-                continue;
-            }
+        pumpswap_pair_count += 1;
+
+        if pumpswap_pair_count > MAX_TARGETED_ROUTE_LOOKUPS {
+            break;
+        }
+
+        let Some(pumpswap_snapshot) =
+            live_pumpswap_quote_contexts.get(&pumpswap_normalized.pool_id)
+        else {
+            println!(
+                "deterministic_reverse_probe_rejected: pumpswap_pool={} reason=missing live quote context",
+                pumpswap_normalized.pool_id
+            );
+            continue;
         };
 
         println!(
-            "raydium_anchor_lookup_parsed: id={} observation_count={}",
-            request_id,
-            observations.len()
+            concat!(
+                "deterministic_reverse_probe_pair_start: anchor={} intermediate={} ",
+                "pumpswap_pool={} pair={}/{}"
+            ),
+            anchor_mint,
+            intermediate_mint,
+            pumpswap_normalized.pool_id,
+            pumpswap_pair_count,
+            MAX_TARGETED_ROUTE_LOOKUPS
         );
 
-        for observation in observations {
-            if !seen_raydium_pools.insert(observation.pubkey.clone()) {
-                continue;
-            }
-
-            let Some(discovery_candidate) = route_candidate_from_observation(observation) else {
-                continue;
-            };
-
-            pair_count += 1;
-
-            if pair_count > MAX_TARGETED_ROUTE_LOOKUPS {
-                break;
-            }
-
-            println!(
-                concat!(
-                    "targeted_raydium_candidate_start: anchor={} intermediate={} ",
-                    "pool={} candidate={}/{}"
-                ),
-                discovery_candidate.anchor_mint,
-                discovery_candidate.intermediate_mint,
-                discovery_candidate.observation.pubkey,
-                pair_count,
-                MAX_TARGETED_ROUTE_LOOKUPS
+        for raydium_request in raydium_pair_lookup_requests(&anchor_mint, &intermediate_mint) {
+            let label = format!(
+                "Raydium exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
             );
 
-            let (raydium_normalized, raydium_snapshot) =
-                match hydrate_raydium_observation(rpc_client, &discovery_candidate.observation)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        println!(
-                            "targeted_raydium_candidate_rejected: pool={} reason={error}",
-                            discovery_candidate.observation.pubkey
-                        );
-                        continue;
-                    }
-                };
-
-            if !normalized_pool_is_eligible(&raydium_normalized) {
-                continue;
-            }
-
-            let pumpswap_requests = pumpswap::pair_lookup_requests(
-                &discovery_candidate.anchor_mint,
-                &discovery_candidate.intermediate_mint,
-            );
-
-            for pumpswap_request in pumpswap_requests {
-                let label = format!(
-                    "PumpSwap pair lookup anchor={} intermediate={}",
-                    discovery_candidate.anchor_mint, discovery_candidate.intermediate_mint
-                );
-
-                let pumpswap_payload = match fetch_program_accounts(
-                    rpc_client,
-                    &pumpswap_request,
-                    &label,
-                )
-                .await
-                {
+            let raydium_payload =
+                match fetch_program_accounts(rpc_client, &raydium_request, &label).await {
                     Ok(payload) => payload,
                     Err(error) => {
                         println!(
-                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            discovery_candidate.anchor_mint,
-                            discovery_candidate.intermediate_mint
+                            "deterministic_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
                         );
                         continue;
                     }
                 };
 
-                let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
-                    &pumpswap_payload,
-                ) {
-                    Ok(observations) => observations,
+            let raydium_observations =
+                match parse_raydium_pair_lookup_response(&raydium_payload) {
+                    Ok(observations) => {
+                        successful_raydium_pair_responses += 1;
+                        observations
+                    }
                     Err(error) => {
                         println!(
-                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            discovery_candidate.anchor_mint,
-                            discovery_candidate.intermediate_mint
+                            "deterministic_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
                         );
                         continue;
                     }
                 };
 
-                println!(
-                    "targeted_pumpswap_lookup_parsed: anchor={} intermediate={} observation_count={}",
-                    discovery_candidate.anchor_mint,
-                    discovery_candidate.intermediate_mint,
-                    pumpswap_observations.len()
-                );
+            println!(
+                "deterministic_raydium_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
+                anchor_mint,
+                intermediate_mint,
+                raydium_observations.len()
+            );
 
-                for pumpswap_observation in pumpswap_observations {
-                    if !pumpswap_observation_matches_pair(
-                        &pumpswap_observation,
-                        &discovery_candidate.anchor_mint,
-                        &discovery_candidate.intermediate_mint,
-                    ) {
-                        continue;
-                    }
-
-                    let (pumpswap_normalized, pumpswap_snapshot) =
-                        match hydrate_pumpswap_observation(rpc_client, &pumpswap_observation).await
-                        {
-                            Ok(result) => result,
-                            Err(error) => {
-                                println!(
-                                    "targeted_pumpswap_candidate_rejected: pool={} reason={error}",
-                                    pumpswap_observation.pubkey
-                                );
-                                continue;
-                            }
-                        };
-
-                    if !normalized_pool_is_eligible(&pumpswap_normalized) {
-                        continue;
-                    }
-
-                    println!(
-                        concat!(
-                            "deterministic_cross_venue_overlap: anchor={} intermediate={} ",
-                            "raydium_pool={} pumpswap_pool={} source=broad-anchor-fallback"
-                        ),
-                        discovery_candidate.anchor_mint,
-                        discovery_candidate.intermediate_mint,
-                        raydium_normalized.pool_id,
-                        pumpswap_normalized.pool_id,
-                    );
-                    println!("READ-ONLY RUNG 9 DETERMINISTIC DISCOVERY PASS");
-
-                    let mut raydium_contexts = BTreeMap::new();
-                    raydium_contexts.insert(raydium_normalized.pool_id.clone(), raydium_snapshot);
-
-                    let mut pumpswap_contexts = BTreeMap::new();
-                    pumpswap_contexts
-                        .insert(pumpswap_normalized.pool_id.clone(), pumpswap_snapshot);
-
-                    return Ok((
-                        vec![raydium_normalized],
-                        raydium_contexts,
-                        vec![pumpswap_normalized],
-                        pumpswap_contexts,
-                    ));
+            for raydium_observation in raydium_observations {
+                if !raydium_observation_matches_pair(
+                    &raydium_observation,
+                    &anchor_mint,
+                    &intermediate_mint,
+                ) {
+                    continue;
                 }
-            }
-        }
 
-        if pair_count >= MAX_TARGETED_ROUTE_LOOKUPS {
-            break;
+                let raydium_hydration_result =
+                    hydrate_raydium_observation(rpc_client, &raydium_observation).await;
+
+                let (raydium_normalized, raydium_snapshot) = match raydium_hydration_result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        println!(
+                            "deterministic_raydium_exact_pair_candidate_rejected: pool={} reason={error}",
+                            raydium_observation.pubkey
+                        );
+                        continue;
+                    }
+                };
+
+                if !normalized_pool_is_eligible(&raydium_normalized) {
+                    continue;
+                }
+
+                println!(
+                    concat!(
+                        "deterministic_cross_venue_overlap: anchor={} intermediate={} ",
+                        "raydium_pool={} pumpswap_pool={} source=pumpswap-live-exact-pair-reverse"
+                    ),
+                    anchor_mint,
+                    intermediate_mint,
+                    raydium_normalized.pool_id,
+                    pumpswap_normalized.pool_id,
+                );
+                println!("READ-ONLY RUNG 9 DETERMINISTIC DISCOVERY PASS");
+
+                let mut raydium_contexts = BTreeMap::new();
+                raydium_contexts.insert(raydium_normalized.pool_id.clone(), raydium_snapshot);
+
+                let mut pumpswap_contexts = BTreeMap::new();
+                pumpswap_contexts
+                    .insert(pumpswap_normalized.pool_id.clone(), pumpswap_snapshot.clone());
+
+                return Ok((
+                    vec![raydium_normalized],
+                    raydium_contexts,
+                    vec![pumpswap_normalized.clone()],
+                    pumpswap_contexts,
+                ));
+            }
         }
     }
 
-    if successful_anchor_responses == 0 {
+    println!(
+        "deterministic_reverse_exact_pair_probe_exhausted: unique_pairs={}",
+        seen_pumpswap_pairs.len()
+    );
+
+    if successful_raydium_pair_responses == 0 {
         return Err(
-            "all bounded Raydium anchor lookup requests failed before a valid RPC response was parsed"
+            "all bounded Raydium exact-pair lookup requests failed before a valid RPC response was parsed"
                 .to_owned(),
         );
     }
 
     Err(
-        "Rung 9 deterministic discovery found no live Raydium-PumpSwap same-pair overlap"
+        "Rung 9 bounded bidirectional exact-pair discovery found no live Raydium-PumpSwap same-pair overlap"
             .to_owned(),
     )
 }
@@ -936,6 +885,18 @@ fn anchor_pair_from_pool(pool: &NormalizedPoolState) -> Option<(String, String)>
     None
 }
 
+fn raydium_observation_matches_pair(
+    observation: &raydium::RaydiumCpmmAccountObservation,
+    anchor_mint: &str,
+    intermediate_mint: &str,
+) -> bool {
+    let token_0_mint = observation.pool_state.token_0_mint.as_str();
+    let token_1_mint = observation.pool_state.token_1_mint.as_str();
+
+    (token_0_mint == anchor_mint && token_1_mint == intermediate_mint)
+        || (token_1_mint == anchor_mint && token_0_mint == intermediate_mint)
+}
+
 fn pumpswap_observation_matches_pair(
     observation: &pumpswap::PumpSwapAccountObservation,
     anchor_mint: &str,
@@ -1091,10 +1052,7 @@ async fn validate_registry_routes_and_sizes(
                 Ok(route_quote) => {
                     route_grid_quotes += 1;
                     successful_grid_quotes += 1;
-                    println!(
-                        "rung10_grid_quote: usd=${dollars} {}",
-                        route_quote.summary()
-                    );
+                    println!("rung10_grid_quote: usd=${dollars} {}", route_quote.summary());
                     rung11c_quote_records.push((
                         route_index,
                         dollars,
@@ -1132,7 +1090,8 @@ async fn validate_registry_routes_and_sizes(
 
     let jito_observation = observe_jito_tip_floor(rpc_client).await;
     let mut priority_cache = BTreeMap::<Vec<String>, costs::PriorityObservationState>::new();
-    let mut route_priority_observations = BTreeMap::<usize, costs::PriorityObservationState>::new();
+    let mut route_priority_observations =
+        BTreeMap::<usize, costs::PriorityObservationState>::new();
     let mut rung11c_route_scope_attempts = 0usize;
 
     let successful_route_indices = rung11c_quote_records
