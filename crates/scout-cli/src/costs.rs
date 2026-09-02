@@ -4,6 +4,7 @@ use crate::economics::{
 };
 use crate::raydium::{RaydiumHydrationSnapshot, RAYDIUM_CPMM_PROGRAM_ID};
 use crate::route::{USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
+use crate::sizing::SolUsdPrice;
 use scout_core::Venue;
 use serde_json::{json, Value};
 use solana_pubkey::Pubkey;
@@ -221,6 +222,13 @@ impl JitoTipFloorObservation {
 pub enum JitoObservationState {
     Available(JitoTipFloorObservation),
     Unavailable(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExternalCostUsdPrices<'a> {
+    sol_usd: &'a SolUsdPrice,
+    usdc_usd: Option<&'a SolUsdPrice>,
+    usdt_usd: Option<&'a SolUsdPrice>,
 }
 
 pub fn raydium_contention_footprint(
@@ -725,7 +733,7 @@ pub fn economics_cost_model(
 fn modeled_base_fee_cost(anchor_mint: &str, anchor_decimals: u8) -> Result<RequiredCost, String> {
     let base_fee_lamports = modeled_base_fee_lamports()?;
 
-    match lamports_to_anchor_raw(base_fee_lamports, anchor_mint, anchor_decimals) {
+    match lamports_to_anchor_raw(base_fee_lamports, anchor_mint, anchor_decimals, None) {
         Ok(amount_anchor_raw) => RequiredCost::known(
             amount_anchor_raw,
             CostProvenanceKind::ModeledAssumption,
@@ -776,7 +784,7 @@ fn modeled_priority_fee_cost(
         MODELED_COMPUTE_UNIT_LIMIT,
     )?;
 
-    match lamports_to_anchor_raw(priority_lamports, anchor_mint, anchor_decimals) {
+    match lamports_to_anchor_raw(priority_lamports, anchor_mint, anchor_decimals, None) {
         Ok(amount_anchor_raw) => RequiredCost::known(
             amount_anchor_raw,
             CostProvenanceKind::ModeledAssumption,
@@ -829,6 +837,7 @@ fn lamports_to_anchor_raw(
     lamports: u64,
     anchor_mint: &str,
     anchor_decimals: u8,
+    usd_prices: Option<&ExternalCostUsdPrices<'_>>,
 ) -> Result<u64, String> {
     if anchor_mint == WRAPPED_SOL_MINT {
         if anchor_decimals != 9 {
@@ -840,20 +849,138 @@ fn lamports_to_anchor_raw(
         return Ok(lamports);
     }
 
-    if anchor_mint == USDC_MINT || anchor_mint == USDT_MINT {
-        return Err(format!(
+    if anchor_mint == USDC_MINT {
+        if anchor_decimals != 6 {
+            return Err(format!(
+                "USDC anchor expected 6 decimals, got {anchor_decimals}"
+            ));
+        }
+
+        let usd_prices = usd_prices.ok_or_else(|| {
             concat!(
-                "stablecoin external-cost conversion is not authorized for anchor {}; ",
-                "SOL-denominated network costs cannot be converted to stablecoin raw units ",
-                "without an explicit stablecoin/USD conversion or parity model"
-            ),
-            anchor_mint
-        ));
+                "stablecoin external-cost conversion is not active for USDC: ",
+                "read-only SOL/USD and USDC/USD observations were not supplied"
+            )
+            .to_owned()
+        })?;
+
+        let stable_usd = usd_prices.usdc_usd.ok_or_else(|| {
+            "stablecoin external-cost conversion is missing a USDC/USD observation".to_owned()
+        })?;
+
+        return conservative_lamports_to_stable_raw(
+            lamports,
+            anchor_decimals,
+            usd_prices.sol_usd,
+            stable_usd,
+        );
+    }
+
+    if anchor_mint == USDT_MINT {
+        if anchor_decimals != 6 {
+            return Err(format!(
+                "USDT anchor expected 6 decimals, got {anchor_decimals}"
+            ));
+        }
+
+        let usd_prices = usd_prices.ok_or_else(|| {
+            concat!(
+                "stablecoin external-cost conversion is not active for USDT: ",
+                "read-only SOL/USD and USDT/USD observations were not supplied"
+            )
+            .to_owned()
+        })?;
+
+        let stable_usd = usd_prices.usdt_usd.ok_or_else(|| {
+            "stablecoin external-cost conversion is missing a USDT/USD observation".to_owned()
+        })?;
+
+        return conservative_lamports_to_stable_raw(
+            lamports,
+            anchor_decimals,
+            usd_prices.sol_usd,
+            stable_usd,
+        );
     }
 
     Err(format!(
         "unsupported Rung 11 external-cost anchor mint {anchor_mint}"
     ))
+}
+
+fn conservative_lamports_to_stable_raw(
+    lamports: u64,
+    stable_decimals: u8,
+    sol_usd: &SolUsdPrice,
+    stable_usd: &SolUsdPrice,
+) -> Result<u64, String> {
+    if sol_usd.price == 0 {
+        return Err("SOL/USD price must be greater than zero".to_owned());
+    }
+
+    if stable_usd.price == 0 {
+        return Err("stablecoin/USD price must be greater than zero".to_owned());
+    }
+
+    let sol_upper = sol_usd
+        .price
+        .checked_add(sol_usd.confidence)
+        .ok_or_else(|| "SOL/USD upper confidence bound overflow".to_owned())?;
+
+    let stable_lower = stable_usd
+        .price
+        .checked_sub(stable_usd.confidence)
+        .ok_or_else(|| "stablecoin/USD lower confidence bound underflow".to_owned())?;
+
+    if stable_lower == 0 {
+        return Err(
+            "stablecoin/USD lower confidence bound must be greater than zero".to_owned(),
+        );
+    }
+
+    let token_scale = checked_pow10_u128(u32::from(stable_decimals))?;
+
+    let mut numerator = u128::from(lamports)
+        .checked_mul(u128::from(sol_upper))
+        .and_then(|value| value.checked_mul(token_scale))
+        .ok_or_else(|| "stablecoin external-cost numerator overflow".to_owned())?;
+
+    let mut denominator = 1_000_000_000u128
+        .checked_mul(u128::from(stable_lower))
+        .ok_or_else(|| "stablecoin external-cost denominator overflow".to_owned())?;
+
+    let exponent_delta = i64::from(sol_usd.exponent) - i64::from(stable_usd.exponent);
+
+    if exponent_delta > 0 {
+        let exponent = u32::try_from(exponent_delta)
+            .map_err(|_| "positive USD exponent delta conversion failed".to_owned())?;
+        numerator = numerator
+            .checked_mul(checked_pow10_u128(exponent)?)
+            .ok_or_else(|| "stablecoin external-cost exponent numerator overflow".to_owned())?;
+    } else if exponent_delta < 0 {
+        let magnitude = exponent_delta
+            .checked_neg()
+            .ok_or_else(|| "negative USD exponent delta overflow".to_owned())?;
+        let exponent = u32::try_from(magnitude)
+            .map_err(|_| "negative USD exponent delta conversion failed".to_owned())?;
+        denominator = denominator
+            .checked_mul(checked_pow10_u128(exponent)?)
+            .ok_or_else(|| "stablecoin external-cost exponent denominator overflow".to_owned())?;
+    }
+
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+
+    let raw = if remainder == 0 {
+        quotient
+    } else {
+        quotient
+            .checked_add(1)
+            .ok_or_else(|| "stablecoin external-cost ceiling division overflow".to_owned())?
+    };
+
+    u64::try_from(raw)
+        .map_err(|_| "stablecoin external-cost conversion exceeded u64 raw units".to_owned())
 }
 
 #[cfg(test)]
@@ -863,6 +990,17 @@ mod tests {
     const TEST_POOL: &str = "11111111111111111111111111111111";
     const TEST_VAULT_A: &str = "SysvarC1ock11111111111111111111111111111111";
     const TEST_VAULT_B: &str = "SysvarRent111111111111111111111111111111111";
+
+    fn usd_price(price: u64, confidence: u64, exponent: i32) -> SolUsdPrice {
+        SolUsdPrice {
+            price,
+            confidence,
+            exponent,
+            publish_time: 1_700_000_000,
+            posted_slot: 123_456,
+            rpc_slot: 123_456,
+        }
+    }
 
     #[test]
     fn footprint_sorts_and_deduplicates_accounts() -> Result<(), String> {
@@ -1125,14 +1263,156 @@ mod tests {
 
     #[test]
     fn wsol_external_cost_conversion_is_one_to_one() -> Result<(), String> {
-        assert_eq!(lamports_to_anchor_raw(5_000, WRAPPED_SOL_MINT, 9)?, 5_000);
+        assert_eq!(
+            lamports_to_anchor_raw(5_000, WRAPPED_SOL_MINT, 9, None)?,
+            5_000
+        );
         Ok(())
     }
 
     #[test]
-    fn stablecoin_external_cost_conversion_fails_closed() {
-        assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6).is_err());
-        assert!(lamports_to_anchor_raw(5_000, USDT_MINT, 6).is_err());
+    fn stablecoin_external_cost_conversion_fails_closed_without_prices() {
+        assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, None).is_err());
+        assert!(lamports_to_anchor_raw(5_000, USDT_MINT, 6, None).is_err());
+    }
+
+    #[test]
+    fn usdc_external_cost_conversion_uses_observed_cross_price() -> Result<(), String> {
+        let sol = usd_price(20_000_000_000, 0, -8);
+        let usdc = usd_price(100_000_000, 0, -8);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: Some(&usdc),
+            usdt_usd: None,
+        };
+
+        assert_eq!(
+            lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices))?,
+            1_000
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn usdt_external_cost_conversion_respects_depeg() -> Result<(), String> {
+        let sol = usd_price(20_000_000_000, 0, -8);
+        let usdt = usd_price(80_000_000, 0, -8);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: None,
+            usdt_usd: Some(&usdt),
+        };
+
+        assert_eq!(
+            lamports_to_anchor_raw(5_000, USDT_MINT, 6, Some(&prices))?,
+            1_250
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stablecoin_external_cost_conversion_uses_conservative_confidence_bounds(
+    ) -> Result<(), String> {
+        let sol = usd_price(20_000_000_000, 100_000_000, -8);
+        let usdc = usd_price(100_000_000, 1_000_000, -8);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: Some(&usdc),
+            usdt_usd: None,
+        };
+
+        assert_eq!(
+            lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices))?,
+            1_016
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stablecoin_external_cost_conversion_normalizes_exponents() -> Result<(), String> {
+        let sol = usd_price(20_000, 0, -2);
+        let usdc = usd_price(1_000_000, 0, -6);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: Some(&usdc),
+            usdt_usd: None,
+        };
+
+        assert_eq!(
+            lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices))?,
+            1_000
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stablecoin_external_cost_conversion_rejects_nonpositive_lower_bound() {
+        let sol = usd_price(20_000_000_000, 0, -8);
+        let usdc = usd_price(100_000_000, 100_000_000, -8);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: Some(&usdc),
+            usdt_usd: None,
+        };
+
+        assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices)).is_err());
+    }
+
+    #[test]
+    fn stablecoin_external_cost_conversion_requires_matching_feed() {
+        let sol = usd_price(20_000_000_000, 0, -8);
+        let usdt = usd_price(100_000_000, 0, -8);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: None,
+            usdt_usd: Some(&usdt),
+        };
+
+        assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices)).is_err());
+    }
+
+    #[test]
+    fn stablecoin_external_cost_conversion_rejects_wrong_decimals() {
+        let sol = usd_price(20_000_000_000, 0, -8);
+        let usdc = usd_price(100_000_000, 0, -8);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: Some(&usdc),
+            usdt_usd: None,
+        };
+
+        assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 9, Some(&prices)).is_err());
+        assert!(lamports_to_anchor_raw(5_000, USDT_MINT, 9, Some(&prices)).is_err());
+    }
+
+    #[test]
+    fn stablecoin_external_cost_conversion_rejects_unbounded_exponent_delta() {
+        let sol = usd_price(20_000_000_000, 0, 100);
+        let usdc = usd_price(100_000_000, 0, -8);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: Some(&usdc),
+            usdt_usd: None,
+        };
+
+        assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices)).is_err());
+    }
+
+    #[test]
+    fn stablecoin_external_cost_conversion_rejects_sol_upper_bound_overflow() {
+        let sol = usd_price(u64::MAX, 1, -8);
+        let usdc = usd_price(100_000_000, 0, -8);
+        let prices = ExternalCostUsdPrices {
+            sol_usd: &sol,
+            usdc_usd: Some(&usdc),
+            usdt_usd: None,
+        };
+
+        assert!(lamports_to_anchor_raw(5_000, USDC_MINT, 6, Some(&prices)).is_err());
     }
 
     #[test]
