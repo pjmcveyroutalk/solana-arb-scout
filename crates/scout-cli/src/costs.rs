@@ -13,6 +13,8 @@ use std::str::FromStr;
 
 pub const RUNG11_V0_BASIS_ID: &str = "rung11-v0-single-signer-600k-cu";
 pub const PRIORITY_SELECTION_POLICY_ID: &str = "solana-local-p75-positive-v1";
+pub const PROJECT0_FLASH_PROVIDER_BASIS_ID: &str =
+    "project0-flashloan-zero-protocol-fee-v1";
 pub const MODELED_SIGNATURE_COUNT: u64 = 1;
 pub const MODELED_COMPUTE_UNIT_LIMIT: u64 = 600_000;
 pub const BASE_FEE_LAMPORTS_PER_SIGNATURE: u64 = 5_000;
@@ -754,10 +756,7 @@ pub fn economics_cost_model_with_usd_prices(
             )?,
         },
         FlashFundingCosts {
-            borrowing_cost: RequiredCost::unknown(
-                CostProvenanceKind::ModeledAssumption,
-                "flash_borrowing_cost unknown: no flash borrowing-cost model has been adopted",
-            )?,
+            borrowing_cost: project0_flash_borrowing_cost()?,
         },
     )
 }
@@ -880,6 +879,21 @@ fn submission_cost_unknown(
     };
 
     RequiredCost::unknown(CostProvenanceKind::ModeledAssumption, reason)
+}
+
+fn project0_flash_borrowing_cost() -> Result<RequiredCost, String> {
+    RequiredCost::known(
+        0,
+        CostProvenanceKind::ModeledAssumption,
+        format!(
+            concat!(
+                "provider_basis={} provider=Project0 protocol_flashloan_fee_raw=0 ",
+                "scope=provider-protocol-fee-only excludes=network-priority-submission-jito-",
+                "failure-safety-reserve-execution-overhead source=Project0-official-documentation"
+            ),
+            PROJECT0_FLASH_PROVIDER_BASIS_ID
+        ),
+    )
 }
 
 fn lamports_to_anchor_raw(
@@ -1569,7 +1583,49 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_external_costs_remain_explicitly_unknown() -> Result<(), String> {
+    fn project0_flash_provider_cost_is_known_zero_and_anchor_independent() -> Result<(), String> {
+        for (anchor_mint, anchor_decimals) in [
+            (WRAPPED_SOL_MINT, 9),
+            (USDC_MINT, 6),
+            (USDT_MINT, 6),
+        ] {
+            let model = economics_cost_model(
+                anchor_mint,
+                anchor_decimals,
+                &PriorityObservationState::Unavailable("fixture unavailable".to_owned()),
+                &JitoObservationState::Unavailable("fixture unavailable".to_owned()),
+            )?;
+
+            match model.flash.borrowing_cost {
+                RequiredCost::Known(cost) => {
+                    assert_eq!(cost.amount_anchor_raw(), 0);
+                    assert_eq!(
+                        cost.provenance_kind(),
+                        CostProvenanceKind::ModeledAssumption
+                    );
+                    assert!(cost
+                        .provenance()
+                        .contains(PROJECT0_FLASH_PROVIDER_BASIS_ID));
+                    assert!(cost
+                        .provenance()
+                        .contains("scope=provider-protocol-fee-only"));
+                    assert!(cost
+                        .provenance()
+                        .contains("source=Project0-official-documentation"));
+                }
+                RequiredCost::Unknown { .. } => {
+                    return Err(format!(
+                        "expected known Project 0 flash provider fee for anchor {anchor_mint}"
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_unresolved_external_costs_stay_explicitly_unknown() -> Result<(), String> {
         let model = economics_cost_model(
             WRAPPED_SOL_MINT,
             9,
@@ -1597,10 +1653,18 @@ mod tests {
             model.treasury.capital_cost,
             RequiredCost::Unknown { .. }
         ));
-        assert!(matches!(
-            model.flash.borrowing_cost,
-            RequiredCost::Unknown { .. }
-        ));
+
+        match model.flash.borrowing_cost {
+            RequiredCost::Known(cost) => {
+                assert_eq!(cost.amount_anchor_raw(), 0);
+                assert!(cost
+                    .provenance()
+                    .contains(PROJECT0_FLASH_PROVIDER_BASIS_ID));
+            }
+            RequiredCost::Unknown { .. } => {
+                return Err("expected known Project 0 flash provider fee".to_owned());
+            }
+        }
 
         Ok(())
     }
