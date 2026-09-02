@@ -388,29 +388,35 @@ async fn discover_deterministic_cross_venue_overlap(
                 "PumpSwap exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
             );
 
-            let pumpswap_payload =
-                match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        println!(
-                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            anchor_mint, intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+            let pumpswap_payload = match fetch_program_accounts(
+                rpc_client,
+                &pumpswap_request,
+                &label,
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!(
+                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
 
-            let pumpswap_observations =
-                match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
-                    Ok(observations) => observations,
-                    Err(error) => {
-                        println!(
-                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            anchor_mint, intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+            let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
+                &pumpswap_payload,
+            ) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    println!(
+                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
 
             println!(
                 "deterministic_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -605,8 +611,10 @@ async fn discover_deterministic_cross_venue_overlap(
                 raydium_contexts.insert(raydium_normalized.pool_id.clone(), raydium_snapshot);
 
                 let mut pumpswap_contexts = BTreeMap::new();
-                pumpswap_contexts
-                    .insert(pumpswap_normalized.pool_id.clone(), pumpswap_snapshot.clone());
+                pumpswap_contexts.insert(
+                    pumpswap_normalized.pool_id.clone(),
+                    pumpswap_snapshot.clone(),
+                );
 
                 return Ok((
                     vec![raydium_normalized],
@@ -1052,7 +1060,10 @@ async fn validate_registry_routes_and_sizes(
                 Ok(route_quote) => {
                     route_grid_quotes += 1;
                     successful_grid_quotes += 1;
-                    println!("rung10_grid_quote: usd=${dollars} {}", route_quote.summary());
+                    println!(
+                        "rung10_grid_quote: usd=${dollars} {}",
+                        route_quote.summary()
+                    );
                     rung11c_quote_records.push((
                         route_index,
                         dollars,
@@ -1090,8 +1101,7 @@ async fn validate_registry_routes_and_sizes(
 
     let jito_observation = observe_jito_tip_floor(rpc_client).await;
     let mut priority_cache = BTreeMap::<Vec<String>, costs::PriorityObservationState>::new();
-    let mut route_priority_observations =
-        BTreeMap::<usize, costs::PriorityObservationState>::new();
+    let mut route_priority_observations = BTreeMap::<usize, costs::PriorityObservationState>::new();
     let mut rung11c_route_scope_attempts = 0usize;
 
     let successful_route_indices = rung11c_quote_records
