@@ -1019,7 +1019,10 @@ mod tests {
         )?;
 
         assert_eq!(footprint.accounts().len(), 3);
-        assert!(footprint.accounts().windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(footprint
+            .accounts()
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
 
         Ok(())
     }
