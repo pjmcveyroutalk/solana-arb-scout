@@ -1116,7 +1116,10 @@ mod tests {
         assert_eq!(state.token_1_mint, bs58::encode([7u8; 32]).into_string());
         assert_eq!(state.token_0_program, bs58::encode([8u8; 32]).into_string());
         assert_eq!(state.token_1_program, bs58::encode([9u8; 32]).into_string());
-        assert_eq!(state.observation_key, bs58::encode([10u8; 32]).into_string());
+        assert_eq!(
+            state.observation_key,
+            bs58::encode([10u8; 32]).into_string()
+        );
         assert_eq!(state.status, 0);
         assert_eq!(state.lp_mint_decimals, 9);
         assert_eq!(state.mint_0_decimals, 6);
