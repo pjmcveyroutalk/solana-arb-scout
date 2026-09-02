@@ -1075,8 +1075,7 @@ async fn validate_registry_routes_and_sizes(
 
     let jito_observation = observe_jito_tip_floor(rpc_client).await;
     let mut priority_cache = BTreeMap::<Vec<String>, costs::PriorityObservationState>::new();
-    let mut route_priority_observations =
-        BTreeMap::<usize, costs::PriorityObservationState>::new();
+    let mut route_priority_observations = BTreeMap::<usize, costs::PriorityObservationState>::new();
     let mut rung11c_route_scope_attempts = 0usize;
 
     let successful_route_indices = rung11c_quote_records
@@ -1146,7 +1145,6 @@ async fn validate_registry_routes_and_sizes(
         let Some(route_candidate) = route_candidates.get(*route_index) else {
             continue;
         };
-
         let Some(priority_observation) = route_priority_observations.get(route_index) else {
             println!(
                 "rung11c_cost_model_rejected: route=[{}] reason=missing priority observation state",
@@ -1175,11 +1173,8 @@ async fn validate_registry_routes_and_sizes(
             economics::FundingMode::Treasury,
             economics::FundingMode::Flash,
         ] {
-            match economics::evaluate_expected_net_for_mode(
-                route_quote,
-                &cost_model,
-                funding_mode,
-            ) {
+            match economics::evaluate_expected_net_for_mode(route_quote, &cost_model, funding_mode)
+            {
                 Ok(result) => {
                     println!("rung11c_expected_net: usd=${dollars} {}", result.summary());
                 }
@@ -1265,7 +1260,6 @@ fn context_mint_decimals(context: &VenueQuoteContext<'_>, mint: &str) -> Result<
 
 async fn observe_jito_tip_floor(rpc_client: &Client) -> costs::JitoObservationState {
     let started_at = Instant::now();
-
     let response = match rpc_client.get(costs::JITO_TIP_FLOOR_URL).send().await {
         Ok(response) => response,
         Err(error) => {
@@ -1279,7 +1273,6 @@ async fn observe_jito_tip_floor(rpc_client: &Client) -> costs::JitoObservationSt
     };
 
     let status = response.status();
-
     if !status.is_success() {
         let reason = format!(
             "Jito tip-floor HTTP status {status} after {} ms",
@@ -1325,7 +1318,6 @@ async fn route_priority_observation(
         VenueQuoteContext::Raydium { snapshot, .. } => Some(*snapshot),
         VenueQuoteContext::PumpSwap { .. } => None,
     };
-
     let leg_2_raydium = match leg_2_context {
         VenueQuoteContext::Raydium { snapshot, .. } => Some(*snapshot),
         VenueQuoteContext::PumpSwap { .. } => None,
@@ -1361,7 +1353,6 @@ async fn route_priority_observation(
     println!("rung11c_priority_scope: {}", footprint.summary());
 
     let cache_key = footprint.accounts().to_vec();
-
     if let Some(cached) = cache.get(&cache_key) {
         println!(
             "rung11c_priority_observation_cache_hit: account_count={}",
@@ -1403,7 +1394,6 @@ async fn fetch_localized_priority_observation(
     };
 
     let status = response.status();
-
     if !status.is_success() {
         let reason = format!(
             "localized priority RPC returned HTTP status {status} after {} ms",
