@@ -1,5 +1,4 @@
 use crate::raydium::{self, RaydiumCpmmAccountObservation};
-use crate::route::{USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
 use serde_json::{json, Value};
 
 const RAYDIUM_POOL_STATE_LEN: usize = 637;
@@ -7,25 +6,21 @@ const RAYDIUM_POOL_STATE_DISCRIMINATOR_B58: &str = "iUE1qg7KXeV";
 const RAYDIUM_TOKEN_0_MINT_OFFSET: usize = 168;
 const RAYDIUM_TOKEN_1_MINT_OFFSET: usize = 200;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaydiumRouteDiscoveryCandidate {
-    pub anchor_mint: String,
-    pub intermediate_mint: String,
-    pub observation: RaydiumCpmmAccountObservation,
-}
-
-pub fn raydium_anchor_lookup_requests() -> [Value; 6] {
+pub fn raydium_pair_lookup_requests(
+    anchor_mint: &str,
+    intermediate_mint: &str,
+) -> [Value; 2] {
     [
-        raydium_anchor_lookup_request(9, WRAPPED_SOL_MINT, RAYDIUM_TOKEN_0_MINT_OFFSET),
-        raydium_anchor_lookup_request(10, WRAPPED_SOL_MINT, RAYDIUM_TOKEN_1_MINT_OFFSET),
-        raydium_anchor_lookup_request(11, USDC_MINT, RAYDIUM_TOKEN_0_MINT_OFFSET),
-        raydium_anchor_lookup_request(12, USDC_MINT, RAYDIUM_TOKEN_1_MINT_OFFSET),
-        raydium_anchor_lookup_request(13, USDT_MINT, RAYDIUM_TOKEN_0_MINT_OFFSET),
-        raydium_anchor_lookup_request(14, USDT_MINT, RAYDIUM_TOKEN_1_MINT_OFFSET),
+        raydium_pair_lookup_request(9, anchor_mint, intermediate_mint),
+        raydium_pair_lookup_request(10, intermediate_mint, anchor_mint),
     ]
 }
 
-fn raydium_anchor_lookup_request(request_id: u64, anchor_mint: &str, mint_offset: usize) -> Value {
+fn raydium_pair_lookup_request(
+    request_id: u64,
+    token_0_mint: &str,
+    token_1_mint: &str,
+) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": request_id,
@@ -48,8 +43,14 @@ fn raydium_anchor_lookup_request(request_id: u64, anchor_mint: &str, mint_offset
                     },
                     {
                         "memcmp": {
-                            "offset": mint_offset,
-                            "bytes": anchor_mint
+                            "offset": RAYDIUM_TOKEN_0_MINT_OFFSET,
+                            "bytes": token_0_mint
+                        }
+                    },
+                    {
+                        "memcmp": {
+                            "offset": RAYDIUM_TOKEN_1_MINT_OFFSET,
+                            "bytes": token_1_mint
                         }
                     }
                 ]
@@ -58,24 +59,28 @@ fn raydium_anchor_lookup_request(request_id: u64, anchor_mint: &str, mint_offset
     })
 }
 
-pub fn parse_raydium_anchor_lookup_response(
+pub fn parse_raydium_pair_lookup_response(
     payload: &Value,
 ) -> Result<Vec<RaydiumCpmmAccountObservation>, String> {
     if let Some(error) = payload.get("error") {
         return Err(format!(
-            "Raydium getProgramAccounts returned an RPC error: {error}"
+            "Raydium exact-pair getProgramAccounts returned an RPC error: {error}"
         ));
     }
 
     let slot = payload
         .pointer("/result/context/slot")
         .and_then(Value::as_u64)
-        .ok_or_else(|| "Raydium getProgramAccounts response missing context slot".to_owned())?;
+        .ok_or_else(|| {
+            "Raydium exact-pair getProgramAccounts response missing context slot".to_owned()
+        })?;
 
     let accounts = payload
         .pointer("/result/value")
         .and_then(Value::as_array)
-        .ok_or_else(|| "Raydium getProgramAccounts response missing account array".to_owned())?;
+        .ok_or_else(|| {
+            "Raydium exact-pair getProgramAccounts response missing account array".to_owned()
+        })?;
 
     let mut observations = Vec::with_capacity(accounts.len());
 
@@ -83,10 +88,12 @@ pub fn parse_raydium_anchor_lookup_response(
         let pubkey = entry
             .get("pubkey")
             .and_then(Value::as_str)
-            .ok_or_else(|| "Raydium getProgramAccounts entry missing pubkey".to_owned())?;
-        let account = entry
-            .get("account")
-            .ok_or_else(|| "Raydium getProgramAccounts entry missing account".to_owned())?;
+            .ok_or_else(|| {
+                "Raydium exact-pair getProgramAccounts entry missing pubkey".to_owned()
+            })?;
+        let account = entry.get("account").ok_or_else(|| {
+            "Raydium exact-pair getProgramAccounts entry missing account".to_owned()
+        })?;
 
         let notification = json!({
             "method": "programNotification",
@@ -104,11 +111,13 @@ pub fn parse_raydium_anchor_lookup_response(
         });
 
         let observation = raydium::parse_program_notification(&notification)?
-            .ok_or_else(|| "Raydium anchor lookup account did not decode".to_owned())?;
+            .ok_or_else(|| "Raydium exact-pair lookup account did not decode".to_owned())?;
 
         if observations
             .iter()
-            .any(|existing: &RaydiumCpmmAccountObservation| existing.pubkey == observation.pubkey)
+            .any(|existing: &RaydiumCpmmAccountObservation| {
+                existing.pubkey == observation.pubkey
+            })
         {
             continue;
         }
@@ -119,56 +128,27 @@ pub fn parse_raydium_anchor_lookup_response(
     Ok(observations)
 }
 
-pub fn route_candidate_from_observation(
-    observation: RaydiumCpmmAccountObservation,
-) -> Option<RaydiumRouteDiscoveryCandidate> {
-    for anchor_mint in [WRAPPED_SOL_MINT, USDC_MINT, USDT_MINT] {
-        if observation.pool_state.token_0_mint == anchor_mint
-            && observation.pool_state.token_1_mint != anchor_mint
-        {
-            return Some(RaydiumRouteDiscoveryCandidate {
-                anchor_mint: anchor_mint.to_owned(),
-                intermediate_mint: observation.pool_state.token_1_mint.clone(),
-                observation,
-            });
-        }
-
-        if observation.pool_state.token_1_mint == anchor_mint
-            && observation.pool_state.token_0_mint != anchor_mint
-        {
-            return Some(RaydiumRouteDiscoveryCandidate {
-                anchor_mint: anchor_mint.to_owned(),
-                intermediate_mint: observation.pool_state.token_0_mint.clone(),
-                observation,
-            });
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::route::{USDC_MINT, WRAPPED_SOL_MINT};
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
     const TEST_INTERMEDIATE_MINT: &str = USDC_MINT;
 
     #[test]
-    fn lookup_requests_cover_all_anchor_mint_positions() {
-        let requests = raydium_anchor_lookup_requests();
-        assert_eq!(requests.len(), 6);
+    fn pair_lookup_requests_cover_both_orientations_and_both_mints() {
+        let requests =
+            raydium_pair_lookup_requests(WRAPPED_SOL_MINT, TEST_INTERMEDIATE_MINT);
+
+        assert_eq!(requests.len(), 2);
 
         let expected = [
-            (WRAPPED_SOL_MINT, RAYDIUM_TOKEN_0_MINT_OFFSET),
-            (WRAPPED_SOL_MINT, RAYDIUM_TOKEN_1_MINT_OFFSET),
-            (USDC_MINT, RAYDIUM_TOKEN_0_MINT_OFFSET),
-            (USDC_MINT, RAYDIUM_TOKEN_1_MINT_OFFSET),
-            (USDT_MINT, RAYDIUM_TOKEN_0_MINT_OFFSET),
-            (USDT_MINT, RAYDIUM_TOKEN_1_MINT_OFFSET),
+            (WRAPPED_SOL_MINT, TEST_INTERMEDIATE_MINT),
+            (TEST_INTERMEDIATE_MINT, WRAPPED_SOL_MINT),
         ];
 
-        for (request, (anchor_mint, offset)) in requests.iter().zip(expected) {
+        for (request, (token_0_mint, token_1_mint)) in requests.iter().zip(expected) {
             assert_eq!(
                 request.get("method").and_then(Value::as_str),
                 Some("getProgramAccounts")
@@ -177,6 +157,18 @@ mod tests {
                 request.pointer("/params/0").and_then(Value::as_str),
                 Some(raydium::RAYDIUM_CPMM_PROGRAM_ID)
             );
+
+            let filters = request
+                .pointer("/params/1/filters")
+                .and_then(Value::as_array)
+                .expect("Raydium pair lookup must contain filters");
+
+            assert_eq!(
+                filters.len(),
+                4,
+                "exact-pair lookup must never degrade to an anchor-only scan"
+            );
+
             assert_eq!(
                 request
                     .pointer("/params/1/filters/0/dataSize")
@@ -193,13 +185,25 @@ mod tests {
                 request
                     .pointer("/params/1/filters/2/memcmp/offset")
                     .and_then(Value::as_u64),
-                Some(offset as u64)
+                Some(RAYDIUM_TOKEN_0_MINT_OFFSET as u64)
             );
             assert_eq!(
                 request
                     .pointer("/params/1/filters/2/memcmp/bytes")
                     .and_then(Value::as_str),
-                Some(anchor_mint)
+                Some(token_0_mint)
+            );
+            assert_eq!(
+                request
+                    .pointer("/params/1/filters/3/memcmp/offset")
+                    .and_then(Value::as_u64),
+                Some(RAYDIUM_TOKEN_1_MINT_OFFSET as u64)
+            );
+            assert_eq!(
+                request
+                    .pointer("/params/1/filters/3/memcmp/bytes")
+                    .and_then(Value::as_str),
+                Some(token_1_mint)
             );
         }
     }
@@ -244,19 +248,18 @@ mod tests {
             "id": 9
         });
 
-        let observations = parse_raydium_anchor_lookup_response(&payload)?;
+        let observations = parse_raydium_pair_lookup_response(&payload)?;
+
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0].slot, 777);
-        assert_eq!(observations[0].pool_state.token_0_mint, WRAPPED_SOL_MINT);
+        assert_eq!(
+            observations[0].pool_state.token_0_mint,
+            WRAPPED_SOL_MINT
+        );
         assert_eq!(
             observations[0].pool_state.token_1_mint,
             TEST_INTERMEDIATE_MINT
         );
-
-        let candidate = route_candidate_from_observation(observations[0].clone())
-            .ok_or_else(|| "test observation did not produce route candidate".to_owned())?;
-        assert_eq!(candidate.anchor_mint, WRAPPED_SOL_MINT);
-        assert_eq!(candidate.intermediate_mint, TEST_INTERMEDIATE_MINT);
 
         Ok(())
     }
