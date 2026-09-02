@@ -20,8 +20,8 @@ use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL
 use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
 use serde_json::{json, Value};
 use sizing::{
-    parse_sol_usd_price, sol_usd_price_request, usd_dollars_to_anchor_raw, SolUsdPrice,
-    USD_SIZE_GRID,
+    parse_pyth_usd_price, pyth_usd_price_request, usd_dollars_to_anchor_raw, PythUsdFeed,
+    SolUsdPrice, USD_SIZE_GRID,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -41,6 +41,13 @@ const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
 const MAX_TARGETED_ROUTE_LOOKUPS: usize = 15;
+
+#[derive(Debug)]
+struct PythUsdPrices {
+    sol: SolUsdPrice,
+    usdc: Option<SolUsdPrice>,
+    usdt: Option<SolUsdPrice>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -151,7 +158,7 @@ async fn main() -> Result<(), String> {
         merge_quote_contexts(&mut pumpswap_quote_contexts, discovered_pumpswap_contexts);
     }
 
-    let sol_usd_price = fetch_sol_usd_price(&rpc_client).await?;
+    let usd_prices = fetch_pyth_usd_prices(&rpc_client).await?;
 
     validate_registry_routes_and_sizes(
         &rpc_client,
@@ -159,7 +166,7 @@ async fn main() -> Result<(), String> {
         pumpswap_states,
         &raydium_quote_contexts,
         &pumpswap_quote_contexts,
-        &sol_usd_price,
+        &usd_prices,
     )
     .await
 }
@@ -380,35 +387,29 @@ async fn discover_deterministic_cross_venue_overlap(
                 "PumpSwap exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
             );
 
-            let pumpswap_payload = match fetch_program_accounts(
-                rpc_client,
-                &pumpswap_request,
-                &label,
-            )
-            .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    println!(
-                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let pumpswap_payload =
+                match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        continue;
+                    }
+                };
 
-            let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
-                &pumpswap_payload,
-            ) {
-                Ok(observations) => observations,
-                Err(error) => {
-                    println!(
-                        "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                        anchor_mint, intermediate_mint
-                    );
-                    continue;
-                }
-            };
+            let pumpswap_observations =
+                match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
+                    Ok(observations) => observations,
+                    Err(error) => {
+                        println!(
+                            "deterministic_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                            anchor_mint, intermediate_mint
+                        );
+                        continue;
+                    }
+                };
 
             println!(
                 "deterministic_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -568,37 +569,31 @@ async fn discover_deterministic_cross_venue_overlap(
                     discovery_candidate.anchor_mint, discovery_candidate.intermediate_mint
                 );
 
-                let pumpswap_payload = match fetch_program_accounts(
-                    rpc_client,
-                    &pumpswap_request,
-                    &label,
-                )
-                .await
-                {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        println!(
-                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            discovery_candidate.anchor_mint,
-                            discovery_candidate.intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+                let pumpswap_payload =
+                    match fetch_program_accounts(rpc_client, &pumpswap_request, &label).await {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            println!(
+                                "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                                discovery_candidate.anchor_mint,
+                                discovery_candidate.intermediate_mint
+                            );
+                            continue;
+                        }
+                    };
 
-                let pumpswap_observations = match pumpswap::parse_pair_lookup_response(
-                    &pumpswap_payload,
-                ) {
-                    Ok(observations) => observations,
-                    Err(error) => {
-                        println!(
-                            "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
-                            discovery_candidate.anchor_mint,
-                            discovery_candidate.intermediate_mint
-                        );
-                        continue;
-                    }
-                };
+                let pumpswap_observations =
+                    match pumpswap::parse_pair_lookup_response(&pumpswap_payload) {
+                        Ok(observations) => observations,
+                        Err(error) => {
+                            println!(
+                                "targeted_pumpswap_lookup_rejected: anchor={} intermediate={} reason={error}",
+                                discovery_candidate.anchor_mint,
+                                discovery_candidate.intermediate_mint
+                            );
+                            continue;
+                        }
+                    };
 
                 println!(
                     "targeted_pumpswap_lookup_parsed: anchor={} intermediate={} observation_count={}",
@@ -675,8 +670,7 @@ async fn discover_deterministic_cross_venue_overlap(
     }
 
     Err(
-        "Rung 9 deterministic discovery found no live Raydium-PumpSwap same-pair overlap"
-            .to_owned(),
+        "Rung 9 deterministic discovery found no live Raydium-PumpSwap same-pair overlap".to_owned(),
     )
 }
 
@@ -783,10 +777,11 @@ async fn fetch_program_accounts(
     Ok(payload)
 }
 
-async fn fetch_sol_usd_price(rpc_client: &Client) -> Result<SolUsdPrice, String> {
-    println!("\nRung 10 sizing oracle: Pyth SOL/USD");
-
-    let request = sol_usd_price_request();
+async fn fetch_pyth_usd_price(
+    rpc_client: &Client,
+    feed: PythUsdFeed,
+) -> Result<SolUsdPrice, String> {
+    let request = pyth_usd_price_request(feed);
     let request_id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
     let method = request
         .get("method")
@@ -794,7 +789,12 @@ async fn fetch_sol_usd_price(rpc_client: &Client) -> Result<SolUsdPrice, String>
         .unwrap_or("unknown");
     let started_at = Instant::now();
 
-    println!("rpc_request_start: label=Pyth SOL/USD id={request_id} method={method}");
+    println!(
+        "rpc_request_start: label=Pyth {} id={} method={}",
+        feed.label(),
+        request_id,
+        method
+    );
 
     let response = rpc_client
         .post(SOLANA_RPC_URL)
@@ -803,7 +803,8 @@ async fn fetch_sol_usd_price(rpc_client: &Client) -> Result<SolUsdPrice, String>
         .await
         .map_err(|error| {
             format!(
-                "Pyth SOL/USD RPC request failed after {} ms: {error}",
+                "Pyth {} RPC request failed after {} ms: {error}",
+                feed.label(),
                 started_at.elapsed().as_millis()
             )
         })?;
@@ -812,20 +813,24 @@ async fn fetch_sol_usd_price(rpc_client: &Client) -> Result<SolUsdPrice, String>
 
     if !status.is_success() {
         return Err(format!(
-            "Pyth SOL/USD RPC returned HTTP status {status} after {} ms",
+            "Pyth {} RPC returned HTTP status {} after {} ms",
+            feed.label(),
+            status,
             started_at.elapsed().as_millis()
         ));
     }
 
     let payload = response.json::<Value>().await.map_err(|error| {
         format!(
-            "Pyth SOL/USD RPC returned invalid JSON after {} ms: {error}",
+            "Pyth {} RPC returned invalid JSON after {} ms: {error}",
+            feed.label(),
             started_at.elapsed().as_millis()
         )
     })?;
 
     println!(
-        "rpc_request_finish: label=Pyth SOL/USD id={} status={} elapsed_ms={} rpc_error={}",
+        "rpc_request_finish: label=Pyth {} id={} status={} elapsed_ms={} rpc_error={}",
+        feed.label(),
         request_id,
         status,
         started_at.elapsed().as_millis(),
@@ -833,12 +838,51 @@ async fn fetch_sol_usd_price(rpc_client: &Client) -> Result<SolUsdPrice, String>
     );
 
     let now = unix_time_seconds_now()?;
-    let price = parse_sol_usd_price(&payload, now)?;
+    parse_pyth_usd_price(&payload, now, feed)
+}
 
-    println!("sol_usd_price: {}", price.summary());
+async fn fetch_pyth_usd_prices(rpc_client: &Client) -> Result<PythUsdPrices, String> {
+    println!("\nRung 10 sizing oracle: Pyth SOL/USD");
+
+    let sol = fetch_pyth_usd_price(rpc_client, PythUsdFeed::Sol).await?;
+    println!("sol_usd_price: {}", sol.summary());
     println!("READ-ONLY PYTH SOL/USD VALIDATION PASS");
 
-    Ok(price)
+    println!("\nRung 11D stablecoin external-cost conversion oracle");
+
+    let usdc = match fetch_pyth_usd_price(rpc_client, PythUsdFeed::Usdc).await {
+        Ok(price) => {
+            println!("usdc_usd_price: {}", price.summary());
+            Some(price)
+        }
+        Err(error) => {
+            println!("rung11d_usdc_usd_observation_unavailable: {error}");
+            None
+        }
+    };
+
+    let usdt = match fetch_pyth_usd_price(rpc_client, PythUsdFeed::Usdt).await {
+        Ok(price) => {
+            println!("usdt_usd_price: {}", price.summary());
+            Some(price)
+        }
+        Err(error) => {
+            println!("rung11d_usdt_usd_observation_unavailable: {error}");
+            None
+        }
+    };
+
+    if usdc.is_some() && usdt.is_some() {
+        println!("READ-ONLY RUNG 11D STABLECOIN USD OBSERVATION PASS");
+    } else {
+        println!(
+            "rung11d_stablecoin_usd_observation_incomplete: usdc_available={} usdt_available={}",
+            usdc.is_some(),
+            usdt.is_some()
+        );
+    }
+
+    Ok(PythUsdPrices { sol, usdc, usdt })
 }
 
 fn merge_normalized_states(
@@ -912,7 +956,7 @@ async fn validate_registry_routes_and_sizes(
     pumpswap_states: Vec<NormalizedPoolState>,
     raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
-    sol_usd_price: &SolUsdPrice,
+    usd_prices: &PythUsdPrices,
 ) -> Result<(), String> {
     println!("\nRegistry: Active Mint");
 
@@ -1013,7 +1057,7 @@ async fn validate_registry_routes_and_sizes(
                 dollars,
                 route_candidate.anchor_mint(),
                 anchor_decimals,
-                Some(sol_usd_price),
+                Some(&usd_prices.sol),
             ) {
                 Ok(amount) => amount,
                 Err(error) => {
@@ -1141,6 +1185,12 @@ async fn validate_registry_routes_and_sizes(
         route_priority_observations.insert(route_index, priority_observation);
     }
 
+    let external_cost_usd_prices = costs::ExternalCostUsdPrices::new(
+        &usd_prices.sol,
+        usd_prices.usdc.as_ref(),
+        usd_prices.usdt.as_ref(),
+    );
+
     for (route_index, dollars, anchor_decimals, route_quote) in &rung11c_quote_records {
         let Some(route_candidate) = route_candidates.get(*route_index) else {
             continue;
@@ -1153,11 +1203,12 @@ async fn validate_registry_routes_and_sizes(
             continue;
         };
 
-        let cost_model = match costs::economics_cost_model(
+        let cost_model = match costs::economics_cost_model_with_usd_prices(
             route_candidate.anchor_mint(),
             *anchor_decimals,
             priority_observation,
             &jito_observation,
+            Some(&external_cost_usd_prices),
         ) {
             Ok(model) => model,
             Err(error) => {
