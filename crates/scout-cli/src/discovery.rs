@@ -125,7 +125,7 @@ mod tests {
     const TEST_INTERMEDIATE_MINT: &str = USDC_MINT;
 
     #[test]
-    fn pair_lookup_requests_cover_both_orientations_and_both_mints() {
+    fn pair_lookup_requests_cover_both_orientations_and_both_mints() -> Result<(), String> {
         let requests = raydium_pair_lookup_requests(WRAPPED_SOL_MINT, TEST_INTERMEDIATE_MINT);
 
         assert_eq!(requests.len(), 2);
@@ -148,7 +148,7 @@ mod tests {
             let filters = request
                 .pointer("/params/1/filters")
                 .and_then(Value::as_array)
-                .expect("Raydium pair lookup must contain filters");
+                .ok_or_else(|| "Raydium pair lookup must contain filters".to_owned())?;
 
             assert_eq!(
                 filters.len(),
@@ -193,6 +193,8 @@ mod tests {
                 Some(token_1_mint)
             );
         }
+
+        Ok(())
     }
 
     #[test]
