@@ -704,6 +704,7 @@ fn checked_pow10_u128(exponent: u32) -> Result<u128, String> {
     Ok(value)
 }
 
+#[cfg(test)]
 pub fn economics_cost_model(
     anchor_mint: &str,
     anchor_decimals: u8,
