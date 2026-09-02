@@ -882,7 +882,10 @@ mod tests {
         )?;
 
         assert_eq!(footprint.accounts().len(), 3);
-        assert!(footprint.accounts().windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(footprint
+            .accounts()
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
 
         Ok(())
     }
@@ -898,8 +901,8 @@ mod tests {
 
     #[test]
     fn raydium_footprint_requires_stored_observation_key_to_match_pda() -> Result<(), String> {
-        let pool =
-            Pubkey::from_str(TEST_POOL).map_err(|error| format!("invalid test pool pubkey: {error}"))?;
+        let pool = Pubkey::from_str(TEST_POOL)
+            .map_err(|error| format!("invalid test pool pubkey: {error}"))?;
         let program = Pubkey::from_str(RAYDIUM_CPMM_PROGRAM_ID)
             .map_err(|error| format!("invalid Raydium program pubkey: {error}"))?;
         let (observation, _) =
