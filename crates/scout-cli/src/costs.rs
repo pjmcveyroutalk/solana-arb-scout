@@ -1499,9 +1499,9 @@ mod tests {
         match model.common.base_fee {
             RequiredCost::Known(cost) => {
                 assert_eq!(cost.amount_anchor_raw(), 1_000);
-                assert!(cost.provenance().contains(
-                    "Pyth-conservative-SOLUSD-cross-stableUSD-confidence-bounds-ceil"
-                ));
+                assert!(cost
+                    .provenance()
+                    .contains("Pyth-conservative-SOLUSD-cross-stableUSD-confidence-bounds-ceil"));
             }
             RequiredCost::Unknown { .. } => {
                 return Err("expected modeled known USDC base fee".to_owned());
@@ -1511,9 +1511,9 @@ mod tests {
         match model.common.priority_fee {
             RequiredCost::Known(cost) => {
                 assert_eq!(cost.amount_anchor_raw(), 1_200);
-                assert!(cost.provenance().contains(
-                    "Pyth-conservative-SOLUSD-cross-stableUSD-confidence-bounds-ceil"
-                ));
+                assert!(cost
+                    .provenance()
+                    .contains("Pyth-conservative-SOLUSD-cross-stableUSD-confidence-bounds-ceil"));
             }
             RequiredCost::Unknown { .. } => {
                 return Err("expected modeled known USDC priority fee".to_owned());
