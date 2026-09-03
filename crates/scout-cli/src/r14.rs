@@ -83,10 +83,8 @@ pub fn analyze_requested_lock_neighborhood(
         let other_roles = requested_role_sets(&parsed.accounts);
 
         let write_write = intersection(&target_roles.writable, &other_roles.writable);
-        let target_write_other_read =
-            intersection(&target_roles.writable, &other_roles.readonly);
-        let target_read_other_write =
-            intersection(&target_roles.readonly, &other_roles.writable);
+        let target_write_other_read = intersection(&target_roles.writable, &other_roles.readonly);
+        let target_read_other_write = intersection(&target_roles.readonly, &other_roles.writable);
 
         if write_write.is_empty()
             && target_write_other_read.is_empty()
@@ -122,33 +120,26 @@ fn parse_requested_lock_transaction(
 ) -> Result<RequestedLockTransaction, String> {
     validate_supported_version(&evidence.value)?;
 
-    let transaction = evidence
-        .value
-        .get("transaction")
-        .ok_or_else(|| {
-            format!(
-                "R14 block transaction {} missing transaction object",
-                evidence.block_index
-            )
-        })?;
+    let transaction = evidence.value.get("transaction").ok_or_else(|| {
+        format!(
+            "R14 block transaction {} missing transaction object",
+            evidence.block_index
+        )
+    })?;
 
-    let message = transaction
-        .get("message")
-        .ok_or_else(|| {
-            format!(
-                "R14 block transaction {} missing message",
-                evidence.block_index
-            )
-        })?;
+    let message = transaction.get("message").ok_or_else(|| {
+        format!(
+            "R14 block transaction {} missing message",
+            evidence.block_index
+        )
+    })?;
 
-    let header = message
-        .get("header")
-        .ok_or_else(|| {
-            format!(
-                "R14 block transaction {} missing message header",
-                evidence.block_index
-            )
-        })?;
+    let header = message.get("header").ok_or_else(|| {
+        format!(
+            "R14 block transaction {} missing message header",
+            evidence.block_index
+        )
+    })?;
 
     let static_keys = message
         .get("accountKeys")
@@ -234,21 +225,14 @@ fn parse_requested_lock_transaction(
         ));
     }
 
-    let fee_lamports = meta
-        .get("fee")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            format!(
-                "R14 block transaction {} missing or invalid fee",
-                evidence.block_index
-            )
-        })?;
+    let fee_lamports = meta.get("fee").and_then(Value::as_u64).ok_or_else(|| {
+        format!(
+            "R14 block transaction {} missing or invalid fee",
+            evidence.block_index
+        )
+    })?;
 
-    let compute_units_consumed = optional_u64(
-        meta,
-        "computeUnitsConsumed",
-        evidence.block_index,
-    )?;
+    let compute_units_consumed = optional_u64(meta, "computeUnitsConsumed", evidence.block_index)?;
 
     let err = meta.get("err").ok_or_else(|| {
         format!(
@@ -326,14 +310,9 @@ fn append_loaded_account_array(
     writable: bool,
     block_index: usize,
 ) -> Result<(), String> {
-    let values = loaded
-        .get(field)
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!(
-                "R14 block transaction {block_index} loadedAddresses.{field} missing or invalid"
-            )
-        })?;
+    let values = loaded.get(field).and_then(Value::as_array).ok_or_else(|| {
+        format!("R14 block transaction {block_index} loadedAddresses.{field} missing or invalid")
+    })?;
 
     for (index, value) in values.iter().enumerate() {
         let address = value.as_str().ok_or_else(|| {
@@ -388,9 +367,7 @@ fn intersection(left: &BTreeSet<String>, right: &BTreeSet<String>) -> BTreeSet<S
 
 fn required_usize(value: &Value, field: &str, block_index: usize) -> Result<usize, String> {
     let raw = value.get(field).and_then(Value::as_u64).ok_or_else(|| {
-        format!(
-            "R14 block transaction {block_index} missing or invalid header field {field}"
-        )
+        format!("R14 block transaction {block_index} missing or invalid header field {field}")
     })?;
 
     usize::try_from(raw).map_err(|_| {
@@ -398,11 +375,7 @@ fn required_usize(value: &Value, field: &str, block_index: usize) -> Result<usiz
     })
 }
 
-fn optional_u64(
-    value: &Value,
-    field: &str,
-    block_index: usize,
-) -> Result<Option<u64>, String> {
+fn optional_u64(value: &Value, field: &str, block_index: usize) -> Result<Option<u64>, String> {
     match value.get(field) {
         None | Some(Value::Null) => Ok(None),
         Some(other) => other.as_u64().map(Some).ok_or_else(|| {
@@ -496,7 +469,12 @@ mod tests {
         let evidence = legacy_block_transaction(
             0,
             "target",
-            vec!["signer-write", "signer-read", "unsigned-write", "unsigned-read"],
+            vec![
+                "signer-write",
+                "signer-read",
+                "unsigned-write",
+                "unsigned-read",
+            ],
             2,
             1,
             1,
@@ -719,16 +697,7 @@ mod tests {
 
     #[test]
     fn transaction_metadata_is_preserved() -> Result<(), String> {
-        let evidence = block_transaction(
-            4,
-            "sig",
-            vec!["payer"],
-            1,
-            0,
-            0,
-            Vec::new(),
-            Vec::new(),
-        );
+        let evidence = block_transaction(4, "sig", vec!["payer"], 1, 0, 0, Vec::new(), Vec::new());
 
         let parsed = parse_requested_lock_transaction(&evidence)?;
 
@@ -743,28 +712,14 @@ mod tests {
 
     #[test]
     fn malformed_header_fails_closed() {
-        let evidence = legacy_block_transaction(
-            0,
-            "bad",
-            vec!["only-key"],
-            2,
-            0,
-            0,
-        );
+        let evidence = legacy_block_transaction(0, "bad", vec!["only-key"], 2, 0, 0);
 
         assert!(parse_requested_lock_transaction(&evidence).is_err());
     }
 
     #[test]
     fn unsupported_transaction_version_fails_closed() {
-        let mut evidence = legacy_block_transaction(
-            0,
-            "bad",
-            vec!["payer"],
-            1,
-            0,
-            0,
-        );
+        let mut evidence = legacy_block_transaction(0, "bad", vec!["payer"], 1, 0, 0);
         evidence.value["version"] = json!(1);
 
         assert!(parse_requested_lock_transaction(&evidence).is_err());
@@ -772,14 +727,7 @@ mod tests {
 
     #[test]
     fn target_identity_mismatch_fails_closed() {
-        let transaction = legacy_block_transaction(
-            0,
-            "actual",
-            vec!["payer"],
-            1,
-            0,
-            0,
-        );
+        let transaction = legacy_block_transaction(0, "actual", vec!["payer"], 1, 0, 0);
 
         let block = test_block(vec![transaction], 0, "declared");
 
