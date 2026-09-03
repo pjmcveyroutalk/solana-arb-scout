@@ -213,8 +213,12 @@ impl GithubActionsProvenance {
 }
 
 pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
-    let bytes = fs::read(path)
-        .map_err(|error| format!("could not read completed R12 evidence {}: {error}", path.display()))?;
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "could not read completed R12 evidence {}: {error}",
+            path.display()
+        )
+    })?;
     if bytes.is_empty() {
         return Err("R13 source R12 evidence is empty".to_owned());
     }
@@ -263,7 +267,9 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
         match source_github_actions.as_ref() {
             None => source_github_actions = Some(github.clone()),
             Some(expected) if expected == &github => {}
-            Some(_) => return Err("R13 source R12 GitHub provenance changed within file".to_owned()),
+            Some(_) => {
+                return Err("R13 source R12 GitHub provenance changed within file".to_owned())
+            }
         }
 
         let event_type = required_str(&record, "event_type")?;
@@ -301,7 +307,11 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
                 }
                 saw_end = true;
             }
-            other => return Err(format!("R13 source contains unsupported R12 event type {other}")),
+            other => {
+                return Err(format!(
+                    "R13 source contains unsupported R12 event type {other}"
+                ))
+            }
         }
     }
 
@@ -634,8 +644,7 @@ fn match_transaction(
     let fee_lamports = required_u64(meta, "fee")?;
     let compute_units_consumed = optional_u64(meta, "computeUnitsConsumed")?;
 
-    let amount_evidence =
-        reconstruct_amount_evidence(route, &first, &second, meta, &account_keys)?;
+    let amount_evidence = reconstruct_amount_evidence(route, &first, &second, meta, &account_keys)?;
 
     Ok(Some(TransactionMatch {
         signature: evidence.signature.clone(),
@@ -663,8 +672,7 @@ fn match_leg(
 
     match leg.venue.as_str() {
         "raydium_cpmm" => {
-            if discriminator != RAYDIUM_SWAP_BASE_INPUT
-                && discriminator != RAYDIUM_SWAP_BASE_OUTPUT
+            if discriminator != RAYDIUM_SWAP_BASE_INPUT && discriminator != RAYDIUM_SWAP_BASE_OUTPUT
             {
                 return Ok(None);
             }
@@ -1188,9 +1196,7 @@ impl R13Writer {
         if self.records_written >= MAX_RECORDS_PER_RUN {
             return Err("R13 recorder capacity exhausted".to_owned());
         }
-        if event_type != "forensics_run_end"
-            && self.records_written >= MAX_RECORDS_PER_RUN - 1
-        {
+        if event_type != "forensics_run_end" && self.records_written >= MAX_RECORDS_PER_RUN - 1 {
             return Err("R13 recorder capacity reserved for forensics_run_end".to_owned());
         }
         let record = json!({
@@ -1306,7 +1312,10 @@ pub fn validate_r13_jsonl(
                     return Err("R13 replay route_search_result outside lifecycle".to_owned());
                 }
                 route_results += 1;
-                validate_status(required_str(required_object(&record, "payload")?, "status")?)?;
+                validate_status(required_str(
+                    required_object(&record, "payload")?,
+                    "status",
+                )?)?;
             }
             "transaction_match" => {
                 if !saw_start || saw_end {
@@ -1424,9 +1433,7 @@ fn unix_time_ms_now() -> Result<u64, String> {
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn required_object<'a>(value: &'a Value, field: &str) -> Result<&'a Value, String> {
