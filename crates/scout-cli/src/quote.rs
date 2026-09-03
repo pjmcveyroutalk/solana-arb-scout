@@ -1,12 +1,9 @@
 use crate::pumpswap::{self, PumpSwapHydrationSnapshot};
 use crate::raydium::{self, RaydiumHydrationSnapshot};
 use crate::route::{RouteLeg, TwoLegRouteCandidate};
-use scout_core::Venue;
-
-#[cfg(test)]
 use scout_core::{
     AdapterCapabilities, AuxiliaryStateKind, CapabilityState, ContentionFootprintState,
-    LiquidityModel,
+    LiquidityModel, Venue,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +119,27 @@ pub enum VenueQuoteContext<'a> {
     },
 }
 
+trait ExactInputQuoteAdapter {
+    fn venue(&self) -> Venue;
+
+    fn pool_id(&self) -> &str;
+
+    fn source_slot(&self) -> u64;
+
+    fn capabilities(&self) -> AdapterCapabilities;
+
+    fn contains_pair(&self, input_mint: &str, output_mint: &str) -> bool;
+
+    #[cfg(test)]
+    fn mint_decimals(&self, mint: &str) -> Result<u8, String>;
+
+    fn quote_exact_input(
+        &self,
+        input_mint: &str,
+        amount_in_raw: u64,
+    ) -> Result<VenueLegQuote, String>;
+}
+
 struct RaydiumCpmmQuoteAdapter<'a> {
     pool_id: &'a str,
     snapshot: &'a RaydiumHydrationSnapshot,
@@ -130,6 +148,55 @@ struct RaydiumCpmmQuoteAdapter<'a> {
 impl<'a> RaydiumCpmmQuoteAdapter<'a> {
     fn new(pool_id: &'a str, snapshot: &'a RaydiumHydrationSnapshot) -> Self {
         Self { pool_id, snapshot }
+    }
+
+    fn adapter_capabilities() -> AdapterCapabilities {
+        AdapterCapabilities {
+            liquidity_model: LiquidityModel::Cpmm,
+            exact_input_quote: CapabilityState::Supported,
+            spl_token: CapabilityState::Supported,
+            token_2022: CapabilityState::RequiresHydration,
+            transfer_fee: CapabilityState::RequiresHydration,
+            auxiliary_state: AuxiliaryStateKind::None,
+            contention_footprint: ContentionFootprintState::Complete,
+        }
+    }
+}
+
+impl ExactInputQuoteAdapter for RaydiumCpmmQuoteAdapter<'_> {
+    fn venue(&self) -> Venue {
+        Venue::RaydiumCpmm
+    }
+
+    fn pool_id(&self) -> &str {
+        self.pool_id
+    }
+
+    fn source_slot(&self) -> u64 {
+        self.snapshot.slot
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        Self::adapter_capabilities()
+    }
+
+    fn contains_pair(&self, input_mint: &str, output_mint: &str) -> bool {
+        let mint_a = self.snapshot.pool_state.token_0_mint.as_str();
+        let mint_b = self.snapshot.pool_state.token_1_mint.as_str();
+
+        (mint_a == input_mint && mint_b == output_mint)
+            || (mint_b == input_mint && mint_a == output_mint)
+    }
+
+    #[cfg(test)]
+    fn mint_decimals(&self, mint: &str) -> Result<u8, String> {
+        if mint == self.snapshot.pool_state.token_0_mint {
+            Ok(self.snapshot.pool_state.mint_0_decimals)
+        } else if mint == self.snapshot.pool_state.token_1_mint {
+            Ok(self.snapshot.pool_state.mint_1_decimals)
+        } else {
+            Err(format!("mint {mint} is not in Raydium quote context"))
+        }
     }
 
     fn quote_exact_input(
@@ -155,19 +222,6 @@ impl<'a> RaydiumCpmmQuoteAdapter<'a> {
             quote_source_slot: quote.source_slot,
         })
     }
-
-    #[cfg(test)]
-    fn capabilities() -> AdapterCapabilities {
-        AdapterCapabilities {
-            liquidity_model: LiquidityModel::Cpmm,
-            exact_input_quote: CapabilityState::Supported,
-            spl_token: CapabilityState::Supported,
-            token_2022: CapabilityState::RequiresHydration,
-            transfer_fee: CapabilityState::RequiresHydration,
-            auxiliary_state: AuxiliaryStateKind::None,
-            contention_footprint: ContentionFootprintState::Complete,
-        }
-    }
 }
 
 struct PumpSwapQuoteAdapter<'a> {
@@ -178,6 +232,55 @@ struct PumpSwapQuoteAdapter<'a> {
 impl<'a> PumpSwapQuoteAdapter<'a> {
     fn new(pool_id: &'a str, snapshot: &'a PumpSwapHydrationSnapshot) -> Self {
         Self { pool_id, snapshot }
+    }
+
+    fn adapter_capabilities() -> AdapterCapabilities {
+        AdapterCapabilities {
+            liquidity_model: LiquidityModel::Cpmm,
+            exact_input_quote: CapabilityState::Supported,
+            spl_token: CapabilityState::Supported,
+            token_2022: CapabilityState::RequiresHydration,
+            transfer_fee: CapabilityState::RequiresHydration,
+            auxiliary_state: AuxiliaryStateKind::None,
+            contention_footprint: ContentionFootprintState::Incomplete,
+        }
+    }
+}
+
+impl ExactInputQuoteAdapter for PumpSwapQuoteAdapter<'_> {
+    fn venue(&self) -> Venue {
+        Venue::PumpSwap
+    }
+
+    fn pool_id(&self) -> &str {
+        self.pool_id
+    }
+
+    fn source_slot(&self) -> u64 {
+        self.snapshot.slot
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        Self::adapter_capabilities()
+    }
+
+    fn contains_pair(&self, input_mint: &str, output_mint: &str) -> bool {
+        let mint_a = self.snapshot.pool_state.base_mint.as_str();
+        let mint_b = self.snapshot.pool_state.quote_mint.as_str();
+
+        (mint_a == input_mint && mint_b == output_mint)
+            || (mint_b == input_mint && mint_a == output_mint)
+    }
+
+    #[cfg(test)]
+    fn mint_decimals(&self, mint: &str) -> Result<u8, String> {
+        if mint == self.snapshot.pool_state.base_mint {
+            Ok(self.snapshot.base_decimals)
+        } else if mint == self.snapshot.pool_state.quote_mint {
+            Ok(self.snapshot.quote_decimals)
+        } else {
+            Err(format!("mint {mint} is not in PumpSwap quote context"))
+        }
     }
 
     fn quote_exact_input(
@@ -202,18 +305,37 @@ impl<'a> PumpSwapQuoteAdapter<'a> {
             quote_source_slot: quote.source_slot,
         })
     }
+}
 
-    #[cfg(test)]
-    fn capabilities() -> AdapterCapabilities {
-        AdapterCapabilities {
-            liquidity_model: LiquidityModel::Cpmm,
-            exact_input_quote: CapabilityState::Supported,
-            spl_token: CapabilityState::Supported,
-            token_2022: CapabilityState::RequiresHydration,
-            transfer_fee: CapabilityState::RequiresHydration,
-            auxiliary_state: AuxiliaryStateKind::None,
-            contention_footprint: ContentionFootprintState::Incomplete,
+fn with_quote_adapter<T>(
+    context: &VenueQuoteContext<'_>,
+    operation: impl FnOnce(&dyn ExactInputQuoteAdapter) -> T,
+) -> T {
+    match context {
+        VenueQuoteContext::Raydium { pool_id, snapshot } => {
+            let adapter = RaydiumCpmmQuoteAdapter::new(pool_id.as_str(), snapshot);
+            operation(&adapter)
         }
+        VenueQuoteContext::PumpSwap { pool_id, snapshot } => {
+            let adapter = PumpSwapQuoteAdapter::new(pool_id.as_str(), snapshot);
+            operation(&adapter)
+        }
+    }
+}
+
+fn ensure_exact_input_quote_supported(
+    adapter: &dyn ExactInputQuoteAdapter,
+) -> Result<(), String> {
+    match adapter.capabilities().exact_input_quote {
+        CapabilityState::Supported => Ok(()),
+        CapabilityState::Unsupported => Err(format!(
+            "{} adapter does not support exact-input quoting",
+            adapter.venue().label()
+        )),
+        CapabilityState::RequiresHydration => Err(format!(
+            "{} adapter requires additional hydration before exact-input quoting",
+            adapter.venue().label()
+        )),
     }
 }
 
@@ -278,117 +400,53 @@ fn quote_leg(
     amount_in_raw: u64,
     context: &VenueQuoteContext<'_>,
 ) -> Result<VenueLegQuote, String> {
-    match context {
-        VenueQuoteContext::Raydium { pool_id, snapshot } => {
-            let adapter = RaydiumCpmmQuoteAdapter::new(pool_id.as_str(), snapshot);
-            adapter.quote_exact_input(leg.input_mint(), amount_in_raw)
-        }
-        VenueQuoteContext::PumpSwap { pool_id, snapshot } => {
-            let adapter = PumpSwapQuoteAdapter::new(pool_id.as_str(), snapshot);
-            adapter.quote_exact_input(leg.input_mint(), amount_in_raw)
-        }
-    }
+    with_quote_adapter(context, |adapter| {
+        ensure_exact_input_quote_supported(adapter)?;
+        adapter.quote_exact_input(leg.input_mint(), amount_in_raw)
+    })
 }
 
 fn validate_context(leg: &RouteLeg, context: &VenueQuoteContext<'_>) -> Result<(), String> {
-    if leg.venue() != context_venue(context) {
-        return Err(format!(
-            "route/context venue mismatch: route={} context={}",
-            leg.venue().label(),
-            context_venue(context).label()
-        ));
-    }
+    with_quote_adapter(context, |adapter| {
+        if leg.venue() != adapter.venue() {
+            return Err(format!(
+                "route/context venue mismatch: route={} context={}",
+                leg.venue().label(),
+                adapter.venue().label()
+            ));
+        }
 
-    if leg.pool_id() != context_pool_id(context) {
-        return Err(format!(
-            "route/context pool mismatch: route={} context={}",
-            leg.pool_id(),
-            context_pool_id(context)
-        ));
-    }
+        if leg.pool_id() != adapter.pool_id() {
+            return Err(format!(
+                "route/context pool mismatch: route={} context={}",
+                leg.pool_id(),
+                adapter.pool_id()
+            ));
+        }
 
-    let context_slot = context_source_slot(context);
-    if context_slot < leg.source_slot() {
-        return Err(format!(
-            "stale quote context: route_slot={} quote_slot={context_slot}",
-            leg.source_slot()
-        ));
-    }
+        let context_slot = adapter.source_slot();
+        if context_slot < leg.source_slot() {
+            return Err(format!(
+                "stale quote context: route_slot={} quote_slot={context_slot}",
+                leg.source_slot()
+            ));
+        }
 
-    if !context_contains_pair(context, leg.input_mint(), leg.output_mint()) {
-        return Err(format!(
-            "quote context does not contain route pair {}/{}",
-            leg.input_mint(),
-            leg.output_mint()
-        ));
-    }
+        if !adapter.contains_pair(leg.input_mint(), leg.output_mint()) {
+            return Err(format!(
+                "quote context does not contain route pair {}/{}",
+                leg.input_mint(),
+                leg.output_mint()
+            ));
+        }
 
-    Ok(())
-}
-
-fn context_venue(context: &VenueQuoteContext<'_>) -> Venue {
-    match context {
-        VenueQuoteContext::Raydium { .. } => Venue::RaydiumCpmm,
-        VenueQuoteContext::PumpSwap { .. } => Venue::PumpSwap,
-    }
-}
-
-fn context_pool_id<'a>(context: &'a VenueQuoteContext<'_>) -> &'a str {
-    match context {
-        VenueQuoteContext::Raydium { pool_id, .. }
-        | VenueQuoteContext::PumpSwap { pool_id, .. } => pool_id.as_str(),
-    }
-}
-
-fn context_source_slot(context: &VenueQuoteContext<'_>) -> u64 {
-    match context {
-        VenueQuoteContext::Raydium { snapshot, .. } => snapshot.slot,
-        VenueQuoteContext::PumpSwap { snapshot, .. } => snapshot.slot,
-    }
-}
-
-fn context_contains_pair(
-    context: &VenueQuoteContext<'_>,
-    input_mint: &str,
-    output_mint: &str,
-) -> bool {
-    let (mint_a, mint_b) = match context {
-        VenueQuoteContext::Raydium { snapshot, .. } => (
-            snapshot.pool_state.token_0_mint.as_str(),
-            snapshot.pool_state.token_1_mint.as_str(),
-        ),
-        VenueQuoteContext::PumpSwap { snapshot, .. } => (
-            snapshot.pool_state.base_mint.as_str(),
-            snapshot.pool_state.quote_mint.as_str(),
-        ),
-    };
-
-    (mint_a == input_mint && mint_b == output_mint)
-        || (mint_b == input_mint && mint_a == output_mint)
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 fn context_mint_decimals(context: &VenueQuoteContext<'_>, mint: &str) -> Result<u8, String> {
-    match context {
-        VenueQuoteContext::Raydium { snapshot, .. } => {
-            if mint == snapshot.pool_state.token_0_mint {
-                Ok(snapshot.pool_state.mint_0_decimals)
-            } else if mint == snapshot.pool_state.token_1_mint {
-                Ok(snapshot.pool_state.mint_1_decimals)
-            } else {
-                Err(format!("mint {mint} is not in Raydium quote context"))
-            }
-        }
-        VenueQuoteContext::PumpSwap { snapshot, .. } => {
-            if mint == snapshot.pool_state.base_mint {
-                Ok(snapshot.base_decimals)
-            } else if mint == snapshot.pool_state.quote_mint {
-                Ok(snapshot.quote_decimals)
-            } else {
-                Err(format!("mint {mint} is not in PumpSwap quote context"))
-            }
-        }
-    }
+    with_quote_adapter(context, |adapter| adapter.mint_decimals(mint))
 }
 
 #[cfg(test)]
@@ -585,7 +643,7 @@ mod tests {
         assert_eq!(adapted, expected);
 
         assert_eq!(
-            RaydiumCpmmQuoteAdapter::capabilities(),
+            RaydiumCpmmQuoteAdapter::adapter_capabilities(),
             AdapterCapabilities {
                 liquidity_model: LiquidityModel::Cpmm,
                 exact_input_quote: CapabilityState::Supported,
@@ -631,7 +689,7 @@ mod tests {
         }
 
         assert_eq!(
-            PumpSwapQuoteAdapter::capabilities(),
+            PumpSwapQuoteAdapter::adapter_capabilities(),
             AdapterCapabilities {
                 liquidity_model: LiquidityModel::Cpmm,
                 exact_input_quote: CapabilityState::Supported,
@@ -644,6 +702,35 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn universal_dispatch_exposes_both_adapter_capability_contracts() {
+        let ray = raydium_snapshot();
+        let pump = pumpswap_snapshot();
+
+        let ray_context = VenueQuoteContext::Raydium {
+            pool_id: "raydium-pool".to_owned(),
+            snapshot: &ray,
+        };
+        let pump_context = VenueQuoteContext::PumpSwap {
+            pool_id: "pumpswap-pool".to_owned(),
+            snapshot: &pump,
+        };
+
+        let ray_capabilities =
+            with_quote_adapter(&ray_context, ExactInputQuoteAdapter::capabilities);
+        let pump_capabilities =
+            with_quote_adapter(&pump_context, ExactInputQuoteAdapter::capabilities);
+
+        assert_eq!(
+            ray_capabilities,
+            RaydiumCpmmQuoteAdapter::adapter_capabilities()
+        );
+        assert_eq!(
+            pump_capabilities,
+            PumpSwapQuoteAdapter::adapter_capabilities()
+        );
     }
 
     #[test]
@@ -694,6 +781,74 @@ mod tests {
             quote.leg_2.amount_out_raw + quote.anchor_input_unspent_raw
         );
         assert!(quote.anchor_output_raw > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn universal_route_dispatch_quotes_both_venue_directions() -> Result<(), String> {
+        let routes = route_candidates();
+        let pump = pumpswap_snapshot();
+        let ray = raydium_snapshot();
+        let mut raydium_first_seen = false;
+        let mut pumpswap_first_seen = false;
+
+        for route in routes {
+            let quote = match route.leg_1().venue() {
+                Venue::RaydiumCpmm => {
+                    raydium_first_seen = true;
+                    let leg_1_context = VenueQuoteContext::Raydium {
+                        pool_id: "raydium-pool".to_owned(),
+                        snapshot: &ray,
+                    };
+                    let leg_2_context = VenueQuoteContext::PumpSwap {
+                        pool_id: "pumpswap-pool".to_owned(),
+                        snapshot: &pump,
+                    };
+
+                    quote_two_leg_exact_input(
+                        &route,
+                        1_000_000_000,
+                        &leg_1_context,
+                        &leg_2_context,
+                    )?
+                }
+                Venue::PumpSwap => {
+                    pumpswap_first_seen = true;
+                    let leg_1_context = VenueQuoteContext::PumpSwap {
+                        pool_id: "pumpswap-pool".to_owned(),
+                        snapshot: &pump,
+                    };
+                    let leg_2_context = VenueQuoteContext::Raydium {
+                        pool_id: "raydium-pool".to_owned(),
+                        snapshot: &ray,
+                    };
+
+                    quote_two_leg_exact_input(
+                        &route,
+                        1_000_000_000,
+                        &leg_1_context,
+                        &leg_2_context,
+                    )?
+                }
+                venue => {
+                    return Err(format!(
+                        "unexpected venue {} in universal dispatch fixture",
+                        venue.label()
+                    ));
+                }
+            };
+
+            assert_eq!(quote.leg_1.venue, route.leg_1().venue());
+            assert_eq!(quote.leg_2.venue, route.leg_2().venue());
+            assert_eq!(
+                quote.leg_2.amount_in_requested_raw,
+                quote.leg_1.amount_out_raw
+            );
+        }
+
+        assert!(raydium_first_seen);
+        assert!(pumpswap_first_seen);
 
         Ok(())
     }
