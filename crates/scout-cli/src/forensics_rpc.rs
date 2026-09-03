@@ -332,9 +332,9 @@ pub async fn acquire_block_for_signature(
                 .incomplete_reasons
                 .push(format!("R14 block evidence invalid: {error}")),
         },
-        Ok(None) => acquisition.incomplete_reasons.push(format!(
-            "getBlock returned null for requested slot {slot}"
-        )),
+        Ok(None) => acquisition
+            .incomplete_reasons
+            .push(format!("getBlock returned null for requested slot {slot}")),
         Err(error) => acquisition.incomplete_reasons.push(format!(
             "getBlock failed for requested slot {slot}: {error}"
         )),
@@ -488,11 +488,7 @@ async fn fetch_transaction(
     }
 }
 
-async fn fetch_block(
-    client: &Client,
-    rpc_url: &str,
-    slot: u64,
-) -> Result<Option<Value>, String> {
+async fn fetch_block(client: &Client, rpc_url: &str, slot: u64) -> Result<Option<Value>, String> {
     let result = rpc_request(
         client,
         rpc_url,
@@ -554,16 +550,12 @@ fn parse_block_evidence(
         let signatures = transaction
             .get("signatures")
             .and_then(Value::as_array)
-            .ok_or_else(|| {
-                format!("block transaction {block_index} missing signatures array")
-            })?;
+            .ok_or_else(|| format!("block transaction {block_index} missing signatures array"))?;
 
         let signature = signatures
             .first()
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!("block transaction {block_index} missing primary signature")
-            })?;
+            .ok_or_else(|| format!("block transaction {block_index} missing primary signature"))?;
 
         if signature.trim().is_empty() {
             return Err(format!(
@@ -951,8 +943,7 @@ mod tests {
 
     #[test]
     fn block_parser_fails_closed_above_transaction_cap() {
-        let transactions =
-            vec![test_block_transaction("other"); MAX_BLOCK_TRANSACTIONS + 1];
+        let transactions = vec![test_block_transaction("other"); MAX_BLOCK_TRANSACTIONS + 1];
         let block = test_block(transactions);
 
         assert!(parse_block_evidence(123, "target", &block).is_err());
