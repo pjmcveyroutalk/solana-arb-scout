@@ -13,12 +13,14 @@ pub struct HistoryRequest {
     pub end_slot: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SignatureObservation {
     pub signature: String,
     pub slot: u64,
-    pub succeeded: bool,
+    pub err: Value,
+    pub memo: Option<String>,
     pub block_time: Option<i64>,
+    pub confirmation_status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,14 +71,14 @@ pub async fn acquire_histories(
     rpc_url: &str,
     requests: &[HistoryRequest],
 ) -> HistoryAcquisition {
-    let unique_requests = requests.iter().cloned().collect::<BTreeSet<_>>();
+    let requested = requests.iter().cloned().collect::<BTreeSet<_>>();
     let mut acquisition = HistoryAcquisition {
         confirmed_tip_slot: None,
         histories: BTreeMap::new(),
         incomplete_reasons: Vec::new(),
     };
 
-    if unique_requests.is_empty() {
+    if requested.is_empty() {
         return acquisition;
     }
 
@@ -93,39 +95,49 @@ pub async fn acquire_histories(
         }
     };
 
-    for request in unique_requests {
+    let mut union_by_address: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for request in &requested {
         if request.start_slot > request.end_slot {
-            let reason = format!(
-                "invalid history window: start_slot={} end_slot={}",
-                request.start_slot, request.end_slot
-            );
-            acquisition
-                .incomplete_reasons
-                .push(format!("address={} {reason}", request.address));
-            acquisition.histories.insert(
+            insert_incomplete_history(
+                &mut acquisition,
                 request.clone(),
-                AddressHistory {
-                    request,
-                    observations: Vec::new(),
-                    complete_through_start_slot: false,
-                    reason: Some(reason),
-                },
+                format!(
+                    "invalid history window: start_slot={} end_slot={}",
+                    request.start_slot, request.end_slot
+                ),
             );
             continue;
         }
 
-        if confirmed_tip_slot < request.end_slot {
+        union_by_address
+            .entry(request.address.clone())
+            .and_modify(|window| {
+                window.0 = window.0.min(request.start_slot);
+                window.1 = window.1.max(request.end_slot);
+            })
+            .or_insert((request.start_slot, request.end_slot));
+    }
+
+    let mut union_histories = BTreeMap::new();
+    for (address, (start_slot, end_slot)) in union_by_address {
+        let union_request = HistoryRequest {
+            address: address.clone(),
+            start_slot,
+            end_slot,
+        };
+
+        if confirmed_tip_slot < end_slot {
             let reason = format!(
                 "confirmed chain tip precedes requested end slot: confirmed_tip={} end_slot={}",
-                confirmed_tip_slot, request.end_slot
+                confirmed_tip_slot, end_slot
             );
             acquisition
                 .incomplete_reasons
-                .push(format!("address={} {reason}", request.address));
-            acquisition.histories.insert(
-                request.clone(),
+                .push(format!("address={address} {reason}"));
+            union_histories.insert(
+                address,
                 AddressHistory {
-                    request,
+                    request: union_request,
                     observations: Vec::new(),
                     complete_through_start_slot: false,
                     reason: Some(reason),
@@ -134,28 +146,28 @@ pub async fn acquire_histories(
             continue;
         }
 
-        match fetch_address_history(client, rpc_url, &request).await {
+        match fetch_address_history(client, rpc_url, &union_request).await {
             Ok(history) => {
                 if !history.complete_through_start_slot {
                     acquisition.incomplete_reasons.push(format!(
                         "history incomplete: address={} start_slot={} end_slot={} reason={}",
-                        request.address,
-                        request.start_slot,
-                        request.end_slot,
+                        history.request.address,
+                        history.request.start_slot,
+                        history.request.end_slot,
                         history.reason.as_deref().unwrap_or("unknown")
                     ));
                 }
-                acquisition.histories.insert(request, history);
+                union_histories.insert(address, history);
             }
             Err(error) => {
                 acquisition.incomplete_reasons.push(format!(
                     "history RPC failed: address={} start_slot={} end_slot={} error={error}",
-                    request.address, request.start_slot, request.end_slot
+                    union_request.address, union_request.start_slot, union_request.end_slot
                 ));
-                acquisition.histories.insert(
-                    request.clone(),
+                union_histories.insert(
+                    address,
                     AddressHistory {
-                        request,
+                        request: union_request,
                         observations: Vec::new(),
                         complete_through_start_slot: false,
                         reason: Some(error),
@@ -165,7 +177,61 @@ pub async fn acquire_histories(
         }
     }
 
+    for request in requested {
+        if acquisition.histories.contains_key(&request) {
+            continue;
+        }
+
+        let Some(union_history) = union_histories.get(&request.address) else {
+            insert_incomplete_history(
+                &mut acquisition,
+                request,
+                "union history unavailable for requested address".to_owned(),
+            );
+            continue;
+        };
+
+        let observations = union_history
+            .observations
+            .iter()
+            .filter(|observation| {
+                observation.slot >= request.start_slot && observation.slot <= request.end_slot
+            })
+            .cloned()
+            .collect();
+
+        acquisition.histories.insert(
+            request.clone(),
+            AddressHistory {
+                request,
+                observations,
+                complete_through_start_slot: union_history.complete_through_start_slot,
+                reason: union_history.reason.clone(),
+            },
+        );
+    }
+
     acquisition
+}
+
+fn insert_incomplete_history(
+    acquisition: &mut HistoryAcquisition,
+    request: HistoryRequest,
+    reason: String,
+) {
+    acquisition.incomplete_reasons.push(format!(
+        "address={} start_slot={} end_slot={} {reason}",
+        request.address, request.start_slot, request.end_slot
+    ));
+    acquisition.histories.insert(
+        request.clone(),
+        AddressHistory {
+            request,
+            observations: Vec::new(),
+            complete_through_start_slot: false,
+            reason: Some(reason),
+        },
+    );
 }
 
 pub async fn acquire_transactions(
@@ -308,11 +374,18 @@ async fn fetch_address_history(
 }
 
 fn parse_signature_observation(value: &Value) -> Result<SignatureObservation, String> {
+    let err = value
+        .get("err")
+        .cloned()
+        .ok_or_else(|| "missing err field".to_owned())?;
+
     Ok(SignatureObservation {
         signature: required_str(value, "signature")?.to_owned(),
         slot: required_u64(value, "slot")?,
-        succeeded: value.get("err").is_some_and(Value::is_null),
+        err,
+        memo: optional_string(value, "memo")?,
         block_time: optional_i64(value, "blockTime")?,
+        confirmation_status: optional_string(value, "confirmationStatus")?,
     })
 }
 
@@ -405,36 +478,93 @@ fn optional_i64(value: &Value, field: &str) -> Result<Option<i64>, String> {
     }
 }
 
+fn optional_string(value: &Value, field: &str) -> Result<Option<String>, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(other) => other
+            .as_str()
+            .map(|text| Some(text.to_owned()))
+            .ok_or_else(|| format!("invalid optional string field {field}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn signature_parser_accepts_nullable_block_time_and_success() {
+    fn signature_parser_preserves_raw_rpc_evidence() {
+        let error = json!({"InstructionError": [1, {"Custom": 6001}]});
         let value = json!({
             "signature": "sig",
             "slot": 123,
-            "err": null,
-            "blockTime": null
+            "err": error,
+            "memo": "memo",
+            "blockTime": null,
+            "confirmationStatus": "confirmed"
         });
 
         let observation = parse_signature_observation(&value).expect("signature must parse");
         assert_eq!(observation.signature, "sig");
         assert_eq!(observation.slot, 123);
-        assert!(observation.succeeded);
+        assert_eq!(observation.err, error);
+        assert_eq!(observation.memo.as_deref(), Some("memo"));
         assert_eq!(observation.block_time, None);
+        assert_eq!(observation.confirmation_status.as_deref(), Some("confirmed"));
     }
 
     #[test]
-    fn signature_parser_rejects_invalid_block_time() {
+    fn signature_parser_preserves_null_error() {
         let value = json!({
             "signature": "sig",
             "slot": 123,
             "err": null,
-            "blockTime": "not-an-integer"
+            "memo": null,
+            "blockTime": 1_700_000_000,
+            "confirmationStatus": null
+        });
+
+        let observation = parse_signature_observation(&value).expect("signature must parse");
+        assert!(observation.err.is_null());
+        assert_eq!(observation.memo, None);
+        assert_eq!(observation.block_time, Some(1_700_000_000));
+        assert_eq!(observation.confirmation_status, None);
+    }
+
+    #[test]
+    fn signature_parser_rejects_missing_error_field() {
+        let value = json!({
+            "signature": "sig",
+            "slot": 123,
+            "memo": null,
+            "blockTime": null,
+            "confirmationStatus": "confirmed"
         });
 
         assert!(parse_signature_observation(&value).is_err());
+    }
+
+    #[test]
+    fn signature_parser_rejects_invalid_optional_fields() {
+        let invalid_block_time = json!({
+            "signature": "sig",
+            "slot": 123,
+            "err": null,
+            "memo": null,
+            "blockTime": "not-an-integer",
+            "confirmationStatus": "confirmed"
+        });
+        assert!(parse_signature_observation(&invalid_block_time).is_err());
+
+        let invalid_memo = json!({
+            "signature": "sig",
+            "slot": 123,
+            "err": null,
+            "memo": 42,
+            "blockTime": null,
+            "confirmationStatus": "confirmed"
+        });
+        assert!(parse_signature_observation(&invalid_memo).is_err());
     }
 
     #[test]
