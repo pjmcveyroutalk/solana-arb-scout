@@ -39,6 +39,8 @@ const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DETERMINISTIC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(210);
 const GPA_REQUEST_PACING: Duration = Duration::from_millis(300);
 const GPA_RETRY_FALLBACK: Duration = Duration::from_secs(1);
+const R13_MATURITY_MAX_WAIT: Duration = Duration::from_secs(30);
+const R13_MATURITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_GPA_RETRIES: usize = 2;
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
@@ -1028,6 +1030,91 @@ fn normalized_pool_is_eligible(pool: &NormalizedPoolState) -> bool {
     )
 }
 
+async fn wait_for_r13_window_maturity(
+    rpc_client: &Client,
+    plan: &forensics::ForensicsPlan,
+) -> Result<forensics::EvidenceMaturity, String> {
+    let required_end_slot = plan.required_end_slot()?;
+    let started_at = Instant::now();
+
+    let mut initial_confirmed_tip = None;
+    let mut final_confirmed_tip = None;
+    let mut poll_attempts = 0u64;
+    let mut rpc_error_count = 0u64;
+
+    loop {
+        poll_attempts = poll_attempts
+            .checked_add(1)
+            .ok_or_else(|| "R13 maturity poll attempt overflow".to_owned())?;
+
+        match forensics_rpc::fetch_confirmed_slot(rpc_client, SOLANA_RPC_URL).await {
+            Ok(slot) => {
+                if initial_confirmed_tip.is_none() {
+                    initial_confirmed_tip = Some(slot);
+                }
+
+                final_confirmed_tip = Some(slot);
+
+                println!(
+                    concat!(
+                        "rung13_maturity_observation: attempt={} confirmed_tip={} ",
+                        "required_end_slot={} elapsed_ms={}"
+                    ),
+                    poll_attempts,
+                    slot,
+                    required_end_slot,
+                    started_at.elapsed().as_millis()
+                );
+
+                if slot >= required_end_slot {
+                    let wait_elapsed_ms =
+                        u64::try_from(started_at.elapsed().as_millis()).map_err(|_| {
+                            "R13 maturity elapsed milliseconds exceeded u64".to_owned()
+                        })?;
+
+                    return Ok(forensics::EvidenceMaturity {
+                        required_end_slot,
+                        initial_confirmed_tip,
+                        final_confirmed_tip,
+                        poll_attempts,
+                        rpc_error_count,
+                        wait_elapsed_ms,
+                        maturity_reached: true,
+                    });
+                }
+            }
+            Err(error) => {
+                rpc_error_count = rpc_error_count
+                    .checked_add(1)
+                    .ok_or_else(|| "R13 maturity RPC error count overflow".to_owned())?;
+
+                println!(
+                    "rung13_maturity_rpc_unavailable: attempt={} reason={error}",
+                    poll_attempts
+                );
+            }
+        }
+
+        if started_at.elapsed() >= R13_MATURITY_MAX_WAIT {
+            let wait_elapsed_ms = u64::try_from(started_at.elapsed().as_millis())
+                .map_err(|_| "R13 maturity elapsed milliseconds exceeded u64".to_owned())?;
+
+            return Ok(forensics::EvidenceMaturity {
+                required_end_slot,
+                initial_confirmed_tip,
+                final_confirmed_tip,
+                poll_attempts,
+                rpc_error_count,
+                wait_elapsed_ms,
+                maturity_reached: false,
+            });
+        }
+
+        let remaining = R13_MATURITY_MAX_WAIT.saturating_sub(started_at.elapsed());
+        sleep(R13_MATURITY_POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
 async fn validate_registry_routes_and_sizes(
     rpc_client: &Client,
     raydium_states: Vec<NormalizedPoolState>,
@@ -1339,41 +1426,41 @@ async fn validate_registry_routes_and_sizes(
             continue;
         };
 
-        let priority_observation = if let Some(observation) =
-            route_priority_observations.get(&record.route_index)
-        {
-            observation
-        } else {
-            let reason = "missing priority observation state";
-            println!(
-                "rung11c_cost_model_rejected: route=[{}] reason={reason}",
-                route_candidate.summary()
-            );
-            let missing_priority = costs::PriorityObservationState::Unavailable(reason.to_owned());
-            let economics_complete_at_unix_ms = unix_time_ms_now()?;
-            shadow_recorder.record_economics_evaluation(
-                route_candidate,
-                record.dollars,
-                record.anchor_decimals,
-                &record.route_quote,
-                None,
-                Some(reason),
-                None,
-                None,
-                &missing_priority,
-                &jito_observation,
-                recorder::CandidateTiming {
-                    candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
-                    quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
-                    economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
-                    hypothetical_ready_at_unix_ms: None,
-                },
-                &usd_prices.sol,
-                usd_prices.usdc.as_ref(),
-                usd_prices.usdt.as_ref(),
-            )?;
-            continue;
-        };
+        let priority_observation =
+            if let Some(observation) = route_priority_observations.get(&record.route_index) {
+                observation
+            } else {
+                let reason = "missing priority observation state";
+                println!(
+                    "rung11c_cost_model_rejected: route=[{}] reason={reason}",
+                    route_candidate.summary()
+                );
+                let missing_priority =
+                    costs::PriorityObservationState::Unavailable(reason.to_owned());
+                let economics_complete_at_unix_ms = unix_time_ms_now()?;
+                shadow_recorder.record_economics_evaluation(
+                    route_candidate,
+                    record.dollars,
+                    record.anchor_decimals,
+                    &record.route_quote,
+                    None,
+                    Some(reason),
+                    None,
+                    None,
+                    &missing_priority,
+                    &jito_observation,
+                    recorder::CandidateTiming {
+                        candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
+                        quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
+                        economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
+                        hypothetical_ready_at_unix_ms: None,
+                    },
+                    &usd_prices.sol,
+                    usd_prices.usdc.as_ref(),
+                    usd_prices.usdt.as_ref(),
+                )?;
+                continue;
+            };
 
         let cost_model = match costs::economics_cost_model_with_usd_prices(
             route_candidate.anchor_mint(),
@@ -1419,6 +1506,7 @@ async fn validate_registry_routes_and_sizes(
             &cost_model,
             economics::FundingMode::Treasury,
         );
+
         match &treasury_result {
             Ok(result) => {
                 println!(
@@ -1446,6 +1534,7 @@ async fn validate_registry_routes_and_sizes(
             &cost_model,
             economics::FundingMode::Flash,
         );
+
         match &flash_result {
             Ok(result) => {
                 println!(
@@ -1504,7 +1593,10 @@ async fn validate_registry_routes_and_sizes(
     }
 
     let shadow_output = shadow_recorder.finish()?;
-    println!("rung12_shadow_output_complete: {}", shadow_output.display());
+    println!(
+        "rung12_shadow_output_complete: {}",
+        shadow_output.display()
+    );
     recorder::validate_jsonl_replay(&shadow_output)?;
     println!("READ-ONLY RUNG 12 SHADOW RECORDER PASS");
 
@@ -1518,6 +1610,62 @@ async fn validate_registry_routes_and_sizes(
         forensics_plan.routes.len(),
         forensics_plan.history_requests.len()
     );
+
+    let maturity = wait_for_r13_window_maturity(rpc_client, &forensics_plan).await?;
+
+    println!(
+        concat!(
+            "rung13_maturity_result: required_end_slot={} initial_confirmed_tip={:?} ",
+            "final_confirmed_tip={:?} poll_attempts={} rpc_error_count={} ",
+            "wait_elapsed_ms={} maturity_reached={}"
+        ),
+        maturity.required_end_slot,
+        maturity.initial_confirmed_tip,
+        maturity.final_confirmed_tip,
+        maturity.poll_attempts,
+        maturity.rpc_error_count,
+        maturity.wait_elapsed_ms,
+        maturity.maturity_reached
+    );
+
+    if !maturity.maturity_reached {
+        let rung13_result =
+            forensics::write_forensics_artifact(&forensics_plan, &maturity, None, None)?;
+
+        println!(
+            concat!(
+                "rung13_forensics_output_complete: path={} routes={} candidates={} ",
+                "transaction_matches={} search_incomplete={} complete_no_atomic_match={} ",
+                "atomic_route_match={} amounts_unresolved={} outcome_resolved={} ",
+                "window_not_mature_candidates={} maturity_reached={}"
+            ),
+            rung13_result.output_path.display(),
+            rung13_result.route_count,
+            rung13_result.candidate_count,
+            rung13_result.transaction_match_count,
+            rung13_result.search_incomplete_count,
+            rung13_result.no_atomic_match_complete_count,
+            rung13_result.atomic_route_match_count,
+            rung13_result.atomic_route_amounts_unresolved_count,
+            rung13_result.atomic_route_outcome_resolved_count,
+            rung13_result.window_not_mature_candidate_count,
+            rung13_result.maturity_reached
+        );
+
+        return Err(format!(
+            concat!(
+                "Rung 13 evidence window did not mature within bounded wait: ",
+                "required_end_slot={} final_confirmed_tip={:?} poll_attempts={} ",
+                "rpc_error_count={} wait_elapsed_ms={} artifact={}"
+            ),
+            maturity.required_end_slot,
+            maturity.final_confirmed_tip,
+            maturity.poll_attempts,
+            maturity.rpc_error_count,
+            maturity.wait_elapsed_ms,
+            rung13_result.output_path.display()
+        ));
+    }
 
     let history_acquisition = forensics_rpc::acquire_histories(
         rpc_client,
@@ -1567,14 +1715,20 @@ async fn validate_registry_routes_and_sizes(
 
     let analyses =
         forensics::analyze_transactions(&forensics_plan, &intersections, &transaction_acquisition)?;
-    let rung13_result =
-        forensics::write_forensics_artifact(&forensics_plan, &intersections, &analyses)?;
+
+    let rung13_result = forensics::write_forensics_artifact(
+        &forensics_plan,
+        &maturity,
+        Some(&intersections),
+        Some(&analyses),
+    )?;
 
     println!(
         concat!(
             "rung13_forensics_output_complete: path={} routes={} candidates={} ",
             "transaction_matches={} search_incomplete={} complete_no_atomic_match={} ",
-            "atomic_route_match={} amounts_unresolved={} outcome_resolved={}"
+            "atomic_route_match={} amounts_unresolved={} outcome_resolved={} ",
+            "window_not_mature_candidates={} maturity_reached={}"
         ),
         rung13_result.output_path.display(),
         rung13_result.route_count,
@@ -1584,7 +1738,9 @@ async fn validate_registry_routes_and_sizes(
         rung13_result.no_atomic_match_complete_count,
         rung13_result.atomic_route_match_count,
         rung13_result.atomic_route_amounts_unresolved_count,
-        rung13_result.atomic_route_outcome_resolved_count
+        rung13_result.atomic_route_outcome_resolved_count,
+        rung13_result.window_not_mature_candidate_count,
+        rung13_result.maturity_reached
     );
 
     if rung13_result.search_incomplete_count > 0
