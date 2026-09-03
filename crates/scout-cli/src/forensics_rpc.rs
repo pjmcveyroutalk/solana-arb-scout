@@ -275,7 +275,7 @@ pub async fn acquire_transactions(
     acquisition
 }
 
-async fn fetch_confirmed_slot(client: &Client, rpc_url: &str) -> Result<u64, String> {
+pub async fn fetch_confirmed_slot(client: &Client, rpc_url: &str) -> Result<u64, String> {
     let result = rpc_request(
         client,
         rpc_url,
