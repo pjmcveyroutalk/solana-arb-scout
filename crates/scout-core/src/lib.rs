@@ -21,6 +21,121 @@ impl Venue {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiquidityModel {
+    Cpmm,
+    Clmm,
+    Dlmm,
+}
+
+impl LiquidityModel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpmm => "cpmm",
+            Self::Clmm => "clmm",
+            Self::Dlmm => "dlmm",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenProgramKind {
+    SplToken,
+    Token2022,
+}
+
+impl TokenProgramKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SplToken => "spl_token",
+            Self::Token2022 => "token_2022",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CapabilityState {
+    Supported,
+    Unsupported,
+    RequiresHydration,
+}
+
+impl CapabilityState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::Unsupported => "unsupported",
+            Self::RequiresHydration => "requires_hydration",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuxiliaryStateKind {
+    None,
+    Ticks,
+    Bins,
+}
+
+impl AuxiliaryStateKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Ticks => "ticks",
+            Self::Bins => "bins",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContentionFootprintState {
+    Complete,
+    Incomplete,
+}
+
+impl ContentionFootprintState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterCapabilities {
+    pub liquidity_model: LiquidityModel,
+    pub exact_input_quote: CapabilityState,
+    pub spl_token: CapabilityState,
+    pub token_2022: CapabilityState,
+    pub transfer_fee: CapabilityState,
+    pub auxiliary_state: AuxiliaryStateKind,
+    pub contention_footprint: ContentionFootprintState,
+}
+
+impl AdapterCapabilities {
+    pub fn summary(&self) -> String {
+        format!(
+            concat!(
+                "liquidity_model={} ",
+                "exact_input_quote={} ",
+                "spl_token={} ",
+                "token_2022={} ",
+                "transfer_fee={} ",
+                "auxiliary_state={} ",
+                "contention_footprint={}"
+            ),
+            self.liquidity_model.label(),
+            self.exact_input_quote.label(),
+            self.spl_token.label(),
+            self.token_2022.label(),
+            self.transfer_fee.label(),
+            self.auxiliary_state.label(),
+            self.contention_footprint.label(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PoolTradingState {
     Tradable,
     NotYetOpen,
@@ -172,6 +287,79 @@ mod tests {
             account_update_received_at_unix_ms: 1_000,
             normalized_at_unix_ms: 1_001,
         }
+    }
+
+    #[test]
+    fn adapter_capabilities_preserve_explicit_truth_states() {
+        let capabilities = AdapterCapabilities {
+            liquidity_model: LiquidityModel::Cpmm,
+            exact_input_quote: CapabilityState::Supported,
+            spl_token: CapabilityState::Supported,
+            token_2022: CapabilityState::RequiresHydration,
+            transfer_fee: CapabilityState::RequiresHydration,
+            auxiliary_state: AuxiliaryStateKind::None,
+            contention_footprint: ContentionFootprintState::Incomplete,
+        };
+
+        assert_eq!(capabilities.liquidity_model, LiquidityModel::Cpmm);
+        assert_eq!(
+            capabilities.token_2022,
+            CapabilityState::RequiresHydration
+        );
+        assert_eq!(
+            capabilities.transfer_fee,
+            CapabilityState::RequiresHydration
+        );
+        assert_eq!(
+            capabilities.contention_footprint,
+            ContentionFootprintState::Incomplete
+        );
+    }
+
+    #[test]
+    fn adapter_capability_summary_is_deterministic() {
+        let capabilities = AdapterCapabilities {
+            liquidity_model: LiquidityModel::Clmm,
+            exact_input_quote: CapabilityState::Supported,
+            spl_token: CapabilityState::Supported,
+            token_2022: CapabilityState::Supported,
+            transfer_fee: CapabilityState::RequiresHydration,
+            auxiliary_state: AuxiliaryStateKind::Ticks,
+            contention_footprint: ContentionFootprintState::Complete,
+        };
+
+        assert_eq!(
+            capabilities.summary(),
+            concat!(
+                "liquidity_model=clmm ",
+                "exact_input_quote=supported ",
+                "spl_token=supported ",
+                "token_2022=supported ",
+                "transfer_fee=requires_hydration ",
+                "auxiliary_state=ticks ",
+                "contention_footprint=complete"
+            )
+        );
+    }
+
+    #[test]
+    fn capability_labels_do_not_collapse_incomplete_into_unsupported() {
+        assert_eq!(CapabilityState::Supported.label(), "supported");
+        assert_eq!(CapabilityState::Unsupported.label(), "unsupported");
+        assert_eq!(
+            CapabilityState::RequiresHydration.label(),
+            "requires_hydration"
+        );
+    }
+
+    #[test]
+    fn liquidity_models_preserve_distinct_pool_mechanics() {
+        assert_eq!(LiquidityModel::Cpmm.label(), "cpmm");
+        assert_eq!(LiquidityModel::Clmm.label(), "clmm");
+        assert_eq!(LiquidityModel::Dlmm.label(), "dlmm");
+        assert_eq!(AuxiliaryStateKind::None.label(), "none");
+        assert_eq!(AuxiliaryStateKind::Ticks.label(), "ticks");
+        assert_eq!(AuxiliaryStateKind::Bins.label(), "bins");
     }
 
     #[test]
