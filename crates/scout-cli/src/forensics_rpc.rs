@@ -2,9 +2,9 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-const SIGNATURE_PAGE_LIMIT: usize = 100;
-const MAX_SIGNATURE_PAGES_PER_POOL: usize = 2;
-const MAX_TRANSACTION_FETCHES: usize = 32;
+pub const SIGNATURE_PAGE_LIMIT: usize = 100;
+pub const MAX_SIGNATURE_PAGES_PER_ADDRESS: usize = 2;
+pub const MAX_TRANSACTION_FETCHES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HistoryRequest {
@@ -30,20 +30,13 @@ pub struct AddressHistory {
 }
 
 #[derive(Debug, Clone)]
-pub struct TransactionEvidence {
-    pub signature: String,
-    pub value: Value,
-}
-
-#[derive(Debug, Clone)]
-pub struct AcquisitionBundle {
+pub struct HistoryAcquisition {
     pub confirmed_tip_slot: Option<u64>,
     pub histories: BTreeMap<HistoryRequest, AddressHistory>,
-    pub transactions: BTreeMap<String, TransactionEvidence>,
     pub incomplete_reasons: Vec<String>,
 }
 
-impl AcquisitionBundle {
+impl HistoryAcquisition {
     pub fn is_complete(&self) -> bool {
         self.incomplete_reasons.is_empty()
             && self
@@ -53,45 +46,89 @@ impl AcquisitionBundle {
     }
 }
 
-pub async fn acquire(
+#[derive(Debug, Clone)]
+pub struct TransactionEvidence {
+    pub signature: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionAcquisition {
+    pub transactions: BTreeMap<String, TransactionEvidence>,
+    pub incomplete_reasons: Vec<String>,
+}
+
+impl TransactionAcquisition {
+    pub fn is_complete(&self) -> bool {
+        self.incomplete_reasons.is_empty()
+    }
+}
+
+pub async fn acquire_histories(
     client: &Client,
     rpc_url: &str,
     requests: &[HistoryRequest],
-) -> AcquisitionBundle {
+) -> HistoryAcquisition {
     let unique_requests = requests.iter().cloned().collect::<BTreeSet<_>>();
-    let mut bundle = AcquisitionBundle {
+    let mut acquisition = HistoryAcquisition {
         confirmed_tip_slot: None,
         histories: BTreeMap::new(),
-        transactions: BTreeMap::new(),
         incomplete_reasons: Vec::new(),
     };
 
+    if unique_requests.is_empty() {
+        return acquisition;
+    }
+
     let confirmed_tip_slot = match fetch_confirmed_slot(client, rpc_url).await {
         Ok(slot) => {
-            bundle.confirmed_tip_slot = Some(slot);
+            acquisition.confirmed_tip_slot = Some(slot);
             slot
         }
         Err(error) => {
-            bundle
+            acquisition
                 .incomplete_reasons
                 .push(format!("confirmed tip unavailable: {error}"));
-            return bundle;
+            return acquisition;
         }
     };
 
     for request in unique_requests {
-        if confirmed_tip_slot < request.end_slot {
-            bundle.incomplete_reasons.push(format!(
-                "chain has not reached requested end slot: address={} confirmed_tip={} end_slot={}",
-                request.address, confirmed_tip_slot, request.end_slot
-            ));
-            bundle.histories.insert(
+        if request.start_slot > request.end_slot {
+            let reason = format!(
+                "invalid history window: start_slot={} end_slot={}",
+                request.start_slot, request.end_slot
+            );
+            acquisition
+                .incomplete_reasons
+                .push(format!("address={} {reason}", request.address));
+            acquisition.histories.insert(
                 request.clone(),
                 AddressHistory {
                     request,
                     observations: Vec::new(),
                     complete_through_start_slot: false,
-                    reason: Some("confirmed chain tip precedes requested end slot".to_owned()),
+                    reason: Some(reason),
+                },
+            );
+            continue;
+        }
+
+        if confirmed_tip_slot < request.end_slot {
+            let reason = format!(
+                "confirmed chain tip precedes requested end slot: confirmed_tip={} end_slot={}",
+                confirmed_tip_slot, request.end_slot
+            );
+            acquisition
+                .incomplete_reasons
+                .push(format!("address={} {reason}", request.address));
+            acquisition.histories.insert(
+                request.clone(),
+                AddressHistory {
+                    request,
+                    observations: Vec::new(),
+                    complete_through_start_slot: false,
+                    reason: Some(reason),
                 },
             );
             continue;
@@ -100,7 +137,7 @@ pub async fn acquire(
         match fetch_address_history(client, rpc_url, &request).await {
             Ok(history) => {
                 if !history.complete_through_start_slot {
-                    bundle.incomplete_reasons.push(format!(
+                    acquisition.incomplete_reasons.push(format!(
                         "history incomplete: address={} start_slot={} end_slot={} reason={}",
                         request.address,
                         request.start_slot,
@@ -108,14 +145,14 @@ pub async fn acquire(
                         history.reason.as_deref().unwrap_or("unknown")
                     ));
                 }
-                bundle.histories.insert(request, history);
+                acquisition.histories.insert(request, history);
             }
             Err(error) => {
-                bundle.incomplete_reasons.push(format!(
+                acquisition.incomplete_reasons.push(format!(
                     "history RPC failed: address={} start_slot={} end_slot={} error={error}",
                     request.address, request.start_slot, request.end_slot
                 ));
-                bundle.histories.insert(
+                acquisition.histories.insert(
                     request.clone(),
                     AddressHistory {
                         request,
@@ -128,59 +165,48 @@ pub async fn acquire(
         }
     }
 
-    let signatures = candidate_signatures(&bundle.histories);
+    acquisition
+}
+
+pub async fn acquire_transactions(
+    client: &Client,
+    rpc_url: &str,
+    signatures: &BTreeSet<String>,
+) -> TransactionAcquisition {
+    let mut acquisition = TransactionAcquisition {
+        transactions: BTreeMap::new(),
+        incomplete_reasons: Vec::new(),
+    };
+
     if signatures.len() > MAX_TRANSACTION_FETCHES {
-        bundle.incomplete_reasons.push(format!(
+        acquisition.incomplete_reasons.push(format!(
             "transaction candidate cap exceeded: count={} cap={MAX_TRANSACTION_FETCHES}",
             signatures.len()
         ));
-        return bundle;
+        return acquisition;
     }
 
     for signature in signatures {
-        match fetch_transaction(client, rpc_url, &signature).await {
+        match fetch_transaction(client, rpc_url, signature).await {
             Ok(Some(value)) => {
-                bundle.transactions.insert(
+                acquisition.transactions.insert(
                     signature.clone(),
-                    TransactionEvidence { signature, value },
+                    TransactionEvidence {
+                        signature: signature.clone(),
+                        value,
+                    },
                 );
             }
-            Ok(None) => bundle.incomplete_reasons.push(format!(
-                "getTransaction returned null for intersecting signature {signature}"
+            Ok(None) => acquisition.incomplete_reasons.push(format!(
+                "getTransaction returned null for requested signature {signature}"
             )),
-            Err(error) => bundle.incomplete_reasons.push(format!(
-                "getTransaction failed for intersecting signature {signature}: {error}"
+            Err(error) => acquisition.incomplete_reasons.push(format!(
+                "getTransaction failed for requested signature {signature}: {error}"
             )),
         }
     }
 
-    bundle
-}
-
-fn candidate_signatures(
-    histories: &BTreeMap<HistoryRequest, AddressHistory>,
-) -> BTreeSet<String> {
-    let mut occurrence_count = BTreeMap::<String, usize>::new();
-
-    for history in histories.values() {
-        let mut seen_in_history = BTreeSet::new();
-        for observation in &history.observations {
-            if observation.succeeded
-                && observation.slot >= history.request.start_slot
-                && observation.slot <= history.request.end_slot
-            {
-                seen_in_history.insert(observation.signature.clone());
-            }
-        }
-        for signature in seen_in_history {
-            *occurrence_count.entry(signature).or_default() += 1;
-        }
-    }
-
-    occurrence_count
-        .into_iter()
-        .filter_map(|(signature, count)| (count >= 2).then_some(signature))
-        .collect()
+    acquisition
 }
 
 async fn fetch_confirmed_slot(client: &Client, rpc_url: &str) -> Result<u64, String> {
@@ -207,11 +233,12 @@ async fn fetch_address_history(
     let mut complete = false;
     let mut reason = None;
 
-    for page_index in 0..MAX_SIGNATURE_PAGES_PER_POOL {
+    for page_index in 0..MAX_SIGNATURE_PAGES_PER_ADDRESS {
         let mut config = json!({
             "commitment": "confirmed",
             "limit": SIGNATURE_PAGE_LIMIT
         });
+
         if let Some(cursor) = before.as_deref() {
             config["before"] = Value::String(cursor.to_owned());
         }
@@ -234,21 +261,13 @@ async fn fetch_address_history(
         }
 
         for entry in entries {
-            let signature = required_str(entry, "signature")?.to_owned();
-            let slot = required_u64(entry, "slot")?;
-            observations.push(SignatureObservation {
-                signature,
-                slot,
-                succeeded: entry.get("err").is_some_and(Value::is_null),
-                block_time: optional_i64(entry, "blockTime")?,
-            });
+            observations.push(parse_signature_observation(entry)?);
         }
 
-        let oldest_slot = entries
+        let oldest = entries
             .last()
-            .and_then(|entry| entry.get("slot"))
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "signature page missing oldest slot".to_owned())?;
+            .ok_or_else(|| "signature page unexpectedly empty".to_owned())?;
+        let oldest_slot = required_u64(oldest, "slot")?;
 
         if oldest_slot <= request.start_slot {
             complete = true;
@@ -260,25 +279,19 @@ async fn fetch_address_history(
             break;
         }
 
-        before = entries
-            .last()
-            .and_then(|entry| entry.get("signature"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+        before = Some(required_str(oldest, "signature")?.to_owned());
 
-        if before.is_none() {
-            reason = Some("pagination cursor unavailable".to_owned());
-            break;
-        }
-
-        if page_index + 1 == MAX_SIGNATURE_PAGES_PER_POOL {
+        if page_index + 1 == MAX_SIGNATURE_PAGES_PER_ADDRESS {
             reason = Some(format!(
-                "pagination saturated before start_slot={}",
+                "pagination saturated before reaching start_slot={}",
                 request.start_slot
             ));
         }
     }
 
+    observations.retain(|observation| {
+        observation.slot >= request.start_slot && observation.slot <= request.end_slot
+    });
     observations.sort_by(|left, right| {
         left.slot
             .cmp(&right.slot)
@@ -291,6 +304,15 @@ async fn fetch_address_history(
         observations,
         complete_through_start_slot: complete,
         reason,
+    })
+}
+
+fn parse_signature_observation(value: &Value) -> Result<SignatureObservation, String> {
+    Ok(SignatureObservation {
+        signature: required_str(value, "signature")?.to_owned(),
+        slot: required_u64(value, "slot")?,
+        succeeded: value.get("err").is_some_and(Value::is_null),
+        block_time: optional_i64(value, "blockTime")?,
     })
 }
 
@@ -387,65 +409,36 @@ fn optional_i64(value: &Value, field: &str) -> Result<Option<i64>, String> {
 mod tests {
     use super::*;
 
-    fn history(
-        address: &str,
-        signatures: &[(&str, u64, bool)],
-    ) -> (HistoryRequest, AddressHistory) {
-        let request = HistoryRequest {
-            address: address.to_owned(),
-            start_slot: 100,
-            end_slot: 132,
-        };
-        let observations = signatures
-            .iter()
-            .map(|(signature, slot, succeeded)| SignatureObservation {
-                signature: (*signature).to_owned(),
-                slot: *slot,
-                succeeded: *succeeded,
-                block_time: None,
-            })
-            .collect();
+    #[test]
+    fn signature_parser_accepts_nullable_block_time_and_success() {
+        let value = json!({
+            "signature": "sig",
+            "slot": 123,
+            "err": null,
+            "blockTime": null
+        });
 
-        (
-            request.clone(),
-            AddressHistory {
-                request,
-                observations,
-                complete_through_start_slot: true,
-                reason: None,
-            },
-        )
+        let observation = parse_signature_observation(&value).expect("signature must parse");
+        assert_eq!(observation.signature, "sig");
+        assert_eq!(observation.slot, 123);
+        assert!(observation.succeeded);
+        assert_eq!(observation.block_time, None);
     }
 
     #[test]
-    fn candidate_signatures_require_two_distinct_histories() {
-        let mut histories = BTreeMap::new();
-        let (left_request, left) =
-            history("left", &[("shared", 110, true), ("left-only", 111, true)]);
-        let (right_request, right) =
-            history("right", &[("shared", 110, true), ("right-only", 112, true)]);
-        histories.insert(left_request, left);
-        histories.insert(right_request, right);
+    fn signature_parser_rejects_invalid_block_time() {
+        let value = json!({
+            "signature": "sig",
+            "slot": 123,
+            "err": null,
+            "blockTime": "not-an-integer"
+        });
 
-        assert_eq!(
-            candidate_signatures(&histories),
-            BTreeSet::from(["shared".to_owned()])
-        );
+        assert!(parse_signature_observation(&value).is_err());
     }
 
     #[test]
-    fn failed_signatures_do_not_become_transaction_candidates() {
-        let mut histories = BTreeMap::new();
-        let (left_request, left) = history("left", &[("failed", 110, false)]);
-        let (right_request, right) = history("right", &[("failed", 110, false)]);
-        histories.insert(left_request, left);
-        histories.insert(right_request, right);
-
-        assert!(candidate_signatures(&histories).is_empty());
-    }
-
-    #[test]
-    fn bundle_is_incomplete_when_any_history_is_incomplete() {
+    fn history_acquisition_requires_every_history_complete() {
         let request = HistoryRequest {
             address: "pool".to_owned(),
             start_slot: 100,
@@ -458,16 +451,33 @@ mod tests {
                 request,
                 observations: Vec::new(),
                 complete_through_start_slot: false,
-                reason: Some("saturated".to_owned()),
+                reason: Some("pagination saturated".to_owned()),
             },
         );
 
-        let bundle = AcquisitionBundle {
+        let acquisition = HistoryAcquisition {
             confirmed_tip_slot: Some(200),
             histories,
-            transactions: BTreeMap::new(),
             incomplete_reasons: vec!["history incomplete".to_owned()],
         };
-        assert!(!bundle.is_complete());
+        assert!(!acquisition.is_complete());
+    }
+
+    #[test]
+    fn transaction_acquisition_is_incomplete_when_any_fetch_is_unresolved() {
+        let acquisition = TransactionAcquisition {
+            transactions: BTreeMap::new(),
+            incomplete_reasons: vec!["getTransaction returned null".to_owned()],
+        };
+        assert!(!acquisition.is_complete());
+    }
+
+    #[test]
+    fn transaction_acquisition_can_be_complete_with_no_requested_signatures() {
+        let acquisition = TransactionAcquisition {
+            transactions: BTreeMap::new(),
+            incomplete_reasons: Vec::new(),
+        };
+        assert!(acquisition.is_complete());
     }
 }
