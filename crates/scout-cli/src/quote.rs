@@ -170,6 +170,53 @@ impl<'a> RaydiumCpmmQuoteAdapter<'a> {
     }
 }
 
+struct PumpSwapQuoteAdapter<'a> {
+    pool_id: &'a str,
+    snapshot: &'a PumpSwapHydrationSnapshot,
+}
+
+impl<'a> PumpSwapQuoteAdapter<'a> {
+    fn new(pool_id: &'a str, snapshot: &'a PumpSwapHydrationSnapshot) -> Self {
+        Self { pool_id, snapshot }
+    }
+
+    fn quote_exact_input(
+        &self,
+        input_mint: &str,
+        amount_in_raw: u64,
+    ) -> Result<VenueLegQuote, String> {
+        let quote = pumpswap::quote_exact_input(self.snapshot, input_mint, amount_in_raw)?;
+
+        Ok(VenueLegQuote {
+            venue: Venue::PumpSwap,
+            pool_id: self.pool_id.to_owned(),
+            amount_in_requested_raw: quote.amount_in_requested_raw,
+            amount_in_consumed_raw: quote.amount_in_consumed_raw,
+            amount_in_unspent_raw: quote.amount_in_unspent_raw,
+            amount_out_raw: quote.amount_out_raw,
+            fees: VenueFeeComponents::PumpSwap {
+                lp_fee_raw: quote.lp_fee_raw,
+                protocol_fee_raw: quote.protocol_fee_raw,
+                creator_fee_raw: quote.creator_fee_raw,
+            },
+            quote_source_slot: quote.source_slot,
+        })
+    }
+
+    #[cfg(test)]
+    fn capabilities() -> AdapterCapabilities {
+        AdapterCapabilities {
+            liquidity_model: LiquidityModel::Cpmm,
+            exact_input_quote: CapabilityState::Supported,
+            spl_token: CapabilityState::Supported,
+            token_2022: CapabilityState::RequiresHydration,
+            transfer_fee: CapabilityState::RequiresHydration,
+            auxiliary_state: AuxiliaryStateKind::None,
+            contention_footprint: ContentionFootprintState::Incomplete,
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn one_whole_anchor_input_raw(
     route: &TwoLegRouteCandidate,
@@ -237,22 +284,8 @@ fn quote_leg(
             adapter.quote_exact_input(leg.input_mint(), amount_in_raw)
         }
         VenueQuoteContext::PumpSwap { pool_id, snapshot } => {
-            let quote = pumpswap::quote_exact_input(snapshot, leg.input_mint(), amount_in_raw)?;
-
-            Ok(VenueLegQuote {
-                venue: Venue::PumpSwap,
-                pool_id: pool_id.clone(),
-                amount_in_requested_raw: quote.amount_in_requested_raw,
-                amount_in_consumed_raw: quote.amount_in_consumed_raw,
-                amount_in_unspent_raw: quote.amount_in_unspent_raw,
-                amount_out_raw: quote.amount_out_raw,
-                fees: VenueFeeComponents::PumpSwap {
-                    lp_fee_raw: quote.lp_fee_raw,
-                    protocol_fee_raw: quote.protocol_fee_raw,
-                    creator_fee_raw: quote.creator_fee_raw,
-                },
-                quote_source_slot: quote.source_slot,
-            })
+            let adapter = PumpSwapQuoteAdapter::new(pool_id.as_str(), snapshot);
+            adapter.quote_exact_input(leg.input_mint(), amount_in_raw)
         }
     }
 }
@@ -561,6 +594,52 @@ mod tests {
                 transfer_fee: CapabilityState::RequiresHydration,
                 auxiliary_state: AuxiliaryStateKind::None,
                 contention_footprint: ContentionFootprintState::Complete,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn pumpswap_adapter_preserves_native_quotes_and_capabilities() -> Result<(), String> {
+        let snapshot = pumpswap_snapshot();
+        let adapter = PumpSwapQuoteAdapter::new("pumpswap-pool", &snapshot);
+
+        for (input_mint, amount_in_raw) in [
+            (TEST_MINT, 1_000_000_u64),
+            (WRAPPED_SOL_MINT, 1_000_000_000_u64),
+        ] {
+            let native = pumpswap::quote_exact_input(&snapshot, input_mint, amount_in_raw)?;
+            let adapted = adapter.quote_exact_input(input_mint, amount_in_raw)?;
+
+            let expected = VenueLegQuote {
+                venue: Venue::PumpSwap,
+                pool_id: "pumpswap-pool".to_owned(),
+                amount_in_requested_raw: native.amount_in_requested_raw,
+                amount_in_consumed_raw: native.amount_in_consumed_raw,
+                amount_in_unspent_raw: native.amount_in_unspent_raw,
+                amount_out_raw: native.amount_out_raw,
+                fees: VenueFeeComponents::PumpSwap {
+                    lp_fee_raw: native.lp_fee_raw,
+                    protocol_fee_raw: native.protocol_fee_raw,
+                    creator_fee_raw: native.creator_fee_raw,
+                },
+                quote_source_slot: native.source_slot,
+            };
+
+            assert_eq!(adapted, expected);
+        }
+
+        assert_eq!(
+            PumpSwapQuoteAdapter::capabilities(),
+            AdapterCapabilities {
+                liquidity_model: LiquidityModel::Cpmm,
+                exact_input_quote: CapabilityState::Supported,
+                spl_token: CapabilityState::Supported,
+                token_2022: CapabilityState::RequiresHydration,
+                transfer_fee: CapabilityState::RequiresHydration,
+                auxiliary_state: AuxiliaryStateKind::None,
+                contention_footprint: ContentionFootprintState::Incomplete,
             }
         );
 
