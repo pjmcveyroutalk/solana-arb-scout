@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SIGNATURE_PAGE_LIMIT: usize = 100;
 pub const MAX_SIGNATURE_PAGES_PER_ADDRESS: usize = 2;
 pub const MAX_TRANSACTION_FETCHES: usize = 32;
+
+#[allow(dead_code)]
 pub const MAX_BLOCK_TRANSACTIONS: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -307,6 +309,7 @@ pub async fn acquire_transactions(
     acquisition
 }
 
+#[allow(dead_code)]
 pub async fn acquire_block_for_signature(
     client: &Client,
     rpc_url: &str,
@@ -488,6 +491,7 @@ async fn fetch_transaction(
     }
 }
 
+#[allow(dead_code)]
 async fn fetch_block(client: &Client, rpc_url: &str, slot: u64) -> Result<Option<Value>, String> {
     let result = rpc_request(
         client,
@@ -513,6 +517,7 @@ async fn fetch_block(client: &Client, rpc_url: &str, slot: u64) -> Result<Option
     }
 }
 
+#[allow(dead_code)]
 fn parse_block_evidence(
     slot: u64,
     target_signature: &str,
@@ -833,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn block_acquisition_requires_evidence_and_no_incomplete_reason() {
+    fn block_acquisition_requires_evidence_and_no_incomplete_reason() -> Result<(), String> {
         let incomplete = BlockAcquisition {
             block: None,
             incomplete_reasons: Vec::new(),
@@ -844,8 +849,7 @@ mod tests {
             123,
             "target",
             &test_block(vec![test_block_transaction("target")]),
-        )
-        .expect("fixture must parse");
+        )?;
 
         let complete = BlockAcquisition {
             block: Some(block),
@@ -858,6 +862,8 @@ mod tests {
             incomplete_reasons: vec!["unresolved".to_owned()],
         };
         assert!(!unresolved.is_complete());
+
+        Ok(())
     }
 
     #[test]
