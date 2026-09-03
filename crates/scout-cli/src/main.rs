@@ -1,6 +1,8 @@
 mod costs;
 mod discovery;
 pub mod economics;
+mod forensics;
+mod forensics_rpc;
 mod pumpswap;
 mod quote;
 mod raydium;
@@ -1337,41 +1339,41 @@ async fn validate_registry_routes_and_sizes(
             continue;
         };
 
-        let priority_observation = if let Some(observation) =
-            route_priority_observations.get(&record.route_index)
-        {
-            observation
-        } else {
-            let reason = "missing priority observation state";
-            println!(
-                "rung11c_cost_model_rejected: route=[{}] reason={reason}",
-                route_candidate.summary()
-            );
-            let missing_priority = costs::PriorityObservationState::Unavailable(reason.to_owned());
-            let economics_complete_at_unix_ms = unix_time_ms_now()?;
-            shadow_recorder.record_economics_evaluation(
-                route_candidate,
-                record.dollars,
-                record.anchor_decimals,
-                &record.route_quote,
-                None,
-                Some(reason),
-                None,
-                None,
-                &missing_priority,
-                &jito_observation,
-                recorder::CandidateTiming {
-                    candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
-                    quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
-                    economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
-                    hypothetical_ready_at_unix_ms: None,
-                },
-                &usd_prices.sol,
-                usd_prices.usdc.as_ref(),
-                usd_prices.usdt.as_ref(),
-            )?;
-            continue;
-        };
+        let priority_observation =
+            if let Some(observation) = route_priority_observations.get(&record.route_index) {
+                observation
+            } else {
+                let reason = "missing priority observation state";
+                println!(
+                    "rung11c_cost_model_rejected: route=[{}] reason={reason}",
+                    route_candidate.summary()
+                );
+                let missing_priority =
+                    costs::PriorityObservationState::Unavailable(reason.to_owned());
+                let economics_complete_at_unix_ms = unix_time_ms_now()?;
+                shadow_recorder.record_economics_evaluation(
+                    route_candidate,
+                    record.dollars,
+                    record.anchor_decimals,
+                    &record.route_quote,
+                    None,
+                    Some(reason),
+                    None,
+                    None,
+                    &missing_priority,
+                    &jito_observation,
+                    recorder::CandidateTiming {
+                        candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
+                        quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
+                        economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
+                        hypothetical_ready_at_unix_ms: None,
+                    },
+                    &usd_prices.sol,
+                    usd_prices.usdc.as_ref(),
+                    usd_prices.usdt.as_ref(),
+                )?;
+                continue;
+            };
 
         let cost_model = match costs::economics_cost_model_with_usd_prices(
             route_candidate.anchor_mint(),
@@ -1502,9 +1504,109 @@ async fn validate_registry_routes_and_sizes(
     }
 
     let shadow_output = shadow_recorder.finish()?;
-    println!("rung12_shadow_output_complete: {}", shadow_output.display());
+    println!(
+        "rung12_shadow_output_complete: {}",
+        shadow_output.display()
+    );
+    recorder::validate_jsonl_replay(&shadow_output)?;
     println!("READ-ONLY RUNG 12 SHADOW RECORDER PASS");
 
+    println!("\nRung 13 captureability forensics");
+
+    let forensics_plan = forensics::load_plan(&shadow_output)?;
+    println!(
+        "rung13_plan: source_run_id={} candidate_count={} route_count={} history_request_count={}",
+        forensics_plan.source_run_id,
+        forensics_plan.candidates.len(),
+        forensics_plan.routes.len(),
+        forensics_plan.history_requests.len()
+    );
+
+    let history_acquisition = forensics_rpc::acquire_histories(
+        rpc_client,
+        SOLANA_RPC_URL,
+        &forensics_plan.history_requests,
+    )
+    .await;
+
+    println!(
+        "rung13_history_acquisition: confirmed_tip_slot={:?} history_count={} complete={} incomplete_reason_count={}",
+        history_acquisition.confirmed_tip_slot,
+        history_acquisition.histories.len(),
+        history_acquisition.is_complete(),
+        history_acquisition.incomplete_reasons.len()
+    );
+
+    for reason in &history_acquisition.incomplete_reasons {
+        println!("rung13_history_incomplete: {reason}");
+    }
+
+    let intersections =
+        forensics::intersect_route_histories(&forensics_plan, &history_acquisition)?;
+
+    println!(
+        "rung13_intersection: route_count={} required_signature_count={}",
+        intersections.routes.len(),
+        intersections.required_signatures.len()
+    );
+
+    let transaction_acquisition = forensics_rpc::acquire_transactions(
+        rpc_client,
+        SOLANA_RPC_URL,
+        &intersections.required_signatures,
+    )
+    .await;
+
+    println!(
+        "rung13_transaction_acquisition: transaction_count={} complete={} incomplete_reason_count={}",
+        transaction_acquisition.transactions.len(),
+        transaction_acquisition.is_complete(),
+        transaction_acquisition.incomplete_reasons.len()
+    );
+
+    for reason in &transaction_acquisition.incomplete_reasons {
+        println!("rung13_transaction_incomplete: {reason}");
+    }
+
+    let analyses =
+        forensics::analyze_transactions(&forensics_plan, &intersections, &transaction_acquisition)?;
+    let rung13_result =
+        forensics::write_forensics_artifact(&forensics_plan, &intersections, &analyses)?;
+
+    println!(
+        concat!(
+            "rung13_forensics_output_complete: path={} routes={} candidates={} ",
+            "transaction_matches={} search_incomplete={} complete_no_atomic_match={} ",
+            "atomic_route_match={} amounts_unresolved={} outcome_resolved={}"
+        ),
+        rung13_result.output_path.display(),
+        rung13_result.route_count,
+        rung13_result.candidate_count,
+        rung13_result.transaction_match_count,
+        rung13_result.search_incomplete_count,
+        rung13_result.no_atomic_match_complete_count,
+        rung13_result.atomic_route_match_count,
+        rung13_result.atomic_route_amounts_unresolved_count,
+        rung13_result.atomic_route_outcome_resolved_count
+    );
+
+    if rung13_result.search_incomplete_count > 0
+        || !history_acquisition.is_complete()
+        || !transaction_acquisition.is_complete()
+    {
+        return Err(format!(
+            concat!(
+                "Rung 13 search incomplete: route_search_incomplete_count={} ",
+                "history_complete={} transaction_complete={} artifact={}"
+            ),
+            rung13_result.search_incomplete_count,
+            history_acquisition.is_complete(),
+            transaction_acquisition.is_complete(),
+            rung13_result.output_path.display()
+        ));
+    }
+
+    println!("READ-ONLY RUNG 13 CAPTUREABILITY FORENSICS PASS");
     Ok(())
 }
 
