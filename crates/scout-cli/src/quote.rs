@@ -3,6 +3,12 @@ use crate::raydium::{self, RaydiumHydrationSnapshot};
 use crate::route::{RouteLeg, TwoLegRouteCandidate};
 use scout_core::Venue;
 
+#[cfg(test)]
+use scout_core::{
+    AdapterCapabilities, AuxiliaryStateKind, CapabilityState, ContentionFootprintState,
+    LiquidityModel,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VenueFeeComponents {
     RaydiumCpmm {
@@ -116,6 +122,54 @@ pub enum VenueQuoteContext<'a> {
     },
 }
 
+struct RaydiumCpmmQuoteAdapter<'a> {
+    pool_id: &'a str,
+    snapshot: &'a RaydiumHydrationSnapshot,
+}
+
+impl<'a> RaydiumCpmmQuoteAdapter<'a> {
+    fn new(pool_id: &'a str, snapshot: &'a RaydiumHydrationSnapshot) -> Self {
+        Self { pool_id, snapshot }
+    }
+
+    fn quote_exact_input(
+        &self,
+        input_mint: &str,
+        amount_in_raw: u64,
+    ) -> Result<VenueLegQuote, String> {
+        let quote = raydium::quote_exact_input(self.snapshot, input_mint, amount_in_raw)?;
+
+        Ok(VenueLegQuote {
+            venue: Venue::RaydiumCpmm,
+            pool_id: self.pool_id.to_owned(),
+            amount_in_requested_raw: quote.amount_in_raw,
+            amount_in_consumed_raw: quote.amount_in_raw,
+            amount_in_unspent_raw: 0,
+            amount_out_raw: quote.amount_out_raw,
+            fees: VenueFeeComponents::RaydiumCpmm {
+                trade_fee_raw: quote.trade_fee_raw,
+                protocol_fee_raw: quote.protocol_fee_raw,
+                fund_fee_raw: quote.fund_fee_raw,
+                creator_fee_raw: quote.creator_fee_raw,
+            },
+            quote_source_slot: quote.source_slot,
+        })
+    }
+
+    #[cfg(test)]
+    fn capabilities() -> AdapterCapabilities {
+        AdapterCapabilities {
+            liquidity_model: LiquidityModel::Cpmm,
+            exact_input_quote: CapabilityState::Supported,
+            spl_token: CapabilityState::Supported,
+            token_2022: CapabilityState::RequiresHydration,
+            transfer_fee: CapabilityState::RequiresHydration,
+            auxiliary_state: AuxiliaryStateKind::None,
+            contention_footprint: ContentionFootprintState::Complete,
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn one_whole_anchor_input_raw(
     route: &TwoLegRouteCandidate,
@@ -179,23 +233,8 @@ fn quote_leg(
 ) -> Result<VenueLegQuote, String> {
     match context {
         VenueQuoteContext::Raydium { pool_id, snapshot } => {
-            let quote = raydium::quote_exact_input(snapshot, leg.input_mint(), amount_in_raw)?;
-
-            Ok(VenueLegQuote {
-                venue: Venue::RaydiumCpmm,
-                pool_id: pool_id.clone(),
-                amount_in_requested_raw: quote.amount_in_raw,
-                amount_in_consumed_raw: quote.amount_in_raw,
-                amount_in_unspent_raw: 0,
-                amount_out_raw: quote.amount_out_raw,
-                fees: VenueFeeComponents::RaydiumCpmm {
-                    trade_fee_raw: quote.trade_fee_raw,
-                    protocol_fee_raw: quote.protocol_fee_raw,
-                    fund_fee_raw: quote.fund_fee_raw,
-                    creator_fee_raw: quote.creator_fee_raw,
-                },
-                quote_source_slot: quote.source_slot,
-            })
+            let adapter = RaydiumCpmmQuoteAdapter::new(pool_id.as_str(), snapshot);
+            adapter.quote_exact_input(leg.input_mint(), amount_in_raw)
         }
         VenueQuoteContext::PumpSwap { pool_id, snapshot } => {
             let quote = pumpswap::quote_exact_input(snapshot, leg.input_mint(), amount_in_raw)?;
@@ -484,6 +523,49 @@ mod tests {
                 100,
             ),
         ])
+    }
+
+    #[test]
+    fn raydium_adapter_preserves_native_quote_and_capabilities() -> Result<(), String> {
+        let snapshot = raydium_snapshot();
+        let amount_in_raw = 1_000_000_000;
+        let native =
+            raydium::quote_exact_input(&snapshot, WRAPPED_SOL_MINT, amount_in_raw)?;
+        let adapter = RaydiumCpmmQuoteAdapter::new("raydium-pool", &snapshot);
+        let adapted = adapter.quote_exact_input(WRAPPED_SOL_MINT, amount_in_raw)?;
+
+        let expected = VenueLegQuote {
+            venue: Venue::RaydiumCpmm,
+            pool_id: "raydium-pool".to_owned(),
+            amount_in_requested_raw: native.amount_in_raw,
+            amount_in_consumed_raw: native.amount_in_raw,
+            amount_in_unspent_raw: 0,
+            amount_out_raw: native.amount_out_raw,
+            fees: VenueFeeComponents::RaydiumCpmm {
+                trade_fee_raw: native.trade_fee_raw,
+                protocol_fee_raw: native.protocol_fee_raw,
+                fund_fee_raw: native.fund_fee_raw,
+                creator_fee_raw: native.creator_fee_raw,
+            },
+            quote_source_slot: native.source_slot,
+        };
+
+        assert_eq!(adapted, expected);
+
+        assert_eq!(
+            RaydiumCpmmQuoteAdapter::capabilities(),
+            AdapterCapabilities {
+                liquidity_model: LiquidityModel::Cpmm,
+                exact_input_quote: CapabilityState::Supported,
+                spl_token: CapabilityState::Supported,
+                token_2022: CapabilityState::RequiresHydration,
+                transfer_fee: CapabilityState::RequiresHydration,
+                auxiliary_state: AuxiliaryStateKind::None,
+                contention_footprint: ContentionFootprintState::Complete,
+            }
+        );
+
+        Ok(())
     }
 
     #[test]
