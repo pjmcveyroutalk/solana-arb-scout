@@ -323,9 +323,7 @@ fn with_quote_adapter<T>(
     }
 }
 
-fn ensure_exact_input_quote_supported(
-    adapter: &dyn ExactInputQuoteAdapter,
-) -> Result<(), String> {
+fn ensure_exact_input_quote_supported(adapter: &dyn ExactInputQuoteAdapter) -> Result<(), String> {
     match adapter.capabilities().exact_input_quote {
         CapabilityState::Supported => Ok(()),
         CapabilityState::Unsupported => Err(format!(
