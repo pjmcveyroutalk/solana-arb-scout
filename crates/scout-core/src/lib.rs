@@ -302,10 +302,7 @@ mod tests {
         };
 
         assert_eq!(capabilities.liquidity_model, LiquidityModel::Cpmm);
-        assert_eq!(
-            capabilities.token_2022,
-            CapabilityState::RequiresHydration
-        );
+        assert_eq!(capabilities.token_2022, CapabilityState::RequiresHydration);
         assert_eq!(
             capabilities.transfer_fee,
             CapabilityState::RequiresHydration
