@@ -716,10 +716,8 @@ mod tests {
             snapshot: &pump,
         };
 
-        let ray_capabilities =
-            with_quote_adapter(&ray_context, |adapter| adapter.capabilities());
-        let pump_capabilities =
-            with_quote_adapter(&pump_context, |adapter| adapter.capabilities());
+        let ray_capabilities = with_quote_adapter(&ray_context, |adapter| adapter.capabilities());
+        let pump_capabilities = with_quote_adapter(&pump_context, |adapter| adapter.capabilities());
 
         assert_eq!(
             ray_capabilities,
