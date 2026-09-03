@@ -142,9 +142,9 @@ impl EvidenceMaturity {
         }
 
         if self.maturity_reached {
-            let final_tip = self.final_confirmed_tip.ok_or_else(|| {
-                "R13 mature evidence requires a final confirmed tip".to_owned()
-            })?;
+            let final_tip = self
+                .final_confirmed_tip
+                .ok_or_else(|| "R13 mature evidence requires a final confirmed tip".to_owned())?;
 
             if final_tip < self.required_end_slot {
                 return Err(format!(
@@ -1248,20 +1248,11 @@ fn write_forensics_artifact_in_directory(
         }),
     )?;
 
-    writer.write_event(
-        "maturity_result",
-        unix_time_ms_now()?,
-        maturity.as_json(),
-    )?;
+    writer.write_event("maturity_result", unix_time_ms_now()?, maturity.as_json())?;
 
     if !maturity.maturity_reached {
         for candidate in &plan.candidates {
-            write_candidate_annotation(
-                &mut writer,
-                candidate,
-                "window_not_mature",
-                &[],
-            )?;
+            write_candidate_annotation(&mut writer, candidate, "window_not_mature", &[])?;
         }
 
         writer.write_event(
@@ -1340,11 +1331,7 @@ fn write_forensics_artifact_in_directory(
             other => return Err(format!("R13 unsupported analysis status {other}")),
         }
 
-        let intersecting_signatures = intersection
-            .signatures
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let intersecting_signatures = intersection.signatures.iter().cloned().collect::<Vec<_>>();
 
         writer.write_event(
             "route_search_result",
@@ -1693,7 +1680,7 @@ pub fn validate_r13_jsonl(
 
                 if maturity_reached != Some(true) {
                     return Err(
-                        "R13 replay route search exists before evidence window matured".to_owned()
+                        "R13 replay route search exists before evidence window matured".to_owned(),
                     );
                 }
 
@@ -1707,12 +1694,8 @@ pub fn validate_r13_jsonl(
                     "search_incomplete" => search_incomplete_count += 1,
                     "no_atomic_match_complete" => no_atomic_match_complete_count += 1,
                     "atomic_route_match" => atomic_route_match_count += 1,
-                    "atomic_route_amounts_unresolved" => {
-                        atomic_route_amounts_unresolved_count += 1
-                    }
-                    "atomic_route_outcome_resolved" => {
-                        atomic_route_outcome_resolved_count += 1
-                    }
+                    "atomic_route_amounts_unresolved" => atomic_route_amounts_unresolved_count += 1,
+                    "atomic_route_outcome_resolved" => atomic_route_outcome_resolved_count += 1,
                     _ => {}
                 }
 
@@ -1780,8 +1763,7 @@ pub fn validate_r13_jsonl(
                 match maturity_reached {
                     Some(true) if status == "window_not_mature" => {
                         return Err(
-                            "R13 replay mature run contains window_not_mature candidate"
-                                .to_owned(),
+                            "R13 replay mature run contains window_not_mature candidate".to_owned()
                         )
                     }
                     Some(false) if status != "window_not_mature" => {
@@ -1827,8 +1809,7 @@ pub fn validate_r13_jsonl(
                 }
 
                 if required_u64(payload, "route_count")? as usize != expected_route_count
-                    || required_u64(payload, "route_search_result_count")? as usize
-                        != route_results
+                    || required_u64(payload, "route_search_result_count")? as usize != route_results
                     || required_u64(payload, "candidate_annotation_count")? as usize
                         != expected_candidate_count
                     || required_u64(payload, "transaction_match_count")? as usize
@@ -2464,9 +2445,7 @@ mod tests {
                 retained.insert(
                     signature
                         .as_str()
-                        .ok_or_else(|| {
-                            "R13 mature test retained non-string signature".to_owned()
-                        })?
+                        .ok_or_else(|| "R13 mature test retained non-string signature".to_owned())?
                         .to_owned(),
                 );
             }
