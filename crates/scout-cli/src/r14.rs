@@ -119,9 +119,11 @@ pub fn build_opportunity_cohort(
         candidate.quote_complete_at_unix_ms,
         candidate.economics_complete_at_unix_ms,
     ) {
-        (Some(quote), Some(economics)) => Some(economics.checked_sub(quote).ok_or_else(|| {
-            "R14B economics completion precedes quote completion".to_owned()
-        })?),
+        (Some(quote), Some(economics)) => Some(
+            economics
+                .checked_sub(quote)
+                .ok_or_else(|| "R14B economics completion precedes quote completion".to_owned())?,
+        ),
         _ => None,
     };
 
@@ -166,9 +168,7 @@ fn validate_candidate_identity(candidate: &CandidateEvidence) -> Result<(), Stri
     Ok(())
 }
 
-fn economics_completeness(
-    candidate: &CandidateEvidence,
-) -> Result<EconomicsCompleteness, String> {
+fn economics_completeness(candidate: &CandidateEvidence) -> Result<EconomicsCompleteness, String> {
     match candidate.source_status.as_str() {
         "quote_rejected" => {
             if candidate.economics_complete_at_unix_ms.is_some()
@@ -241,7 +241,9 @@ fn capture_completeness(analysis: &RouteAnalysis) -> Result<CaptureCompleteness,
     match analysis.status.as_str() {
         "search_incomplete" => {
             if !analysis.matches.is_empty() {
-                return Err("R14B incomplete search unexpectedly contains landed matches".to_owned());
+                return Err(
+                    "R14B incomplete search unexpectedly contains landed matches".to_owned(),
+                );
             }
 
             Ok(CaptureCompleteness::Incomplete)
@@ -1067,11 +1069,9 @@ mod cohort_tests {
         let mut route_analysis = analysis("no_atomic_match_complete");
         route_analysis.route_id = "other-route".to_owned();
 
-        assert!(build_opportunity_cohort(
-            &candidate("economics_unresolved"),
-            &route_analysis
-        )
-        .is_err());
+        assert!(
+            build_opportunity_cohort(&candidate("economics_unresolved"), &route_analysis).is_err()
+        );
     }
 
     #[test]
