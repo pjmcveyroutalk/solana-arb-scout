@@ -378,6 +378,7 @@ fn parse_route(value: &Value) -> Result<RouteEvidence, String> {
         leg_1: parse_leg(required_object(value, "leg_1")?)?,
         leg_2: parse_leg(required_object(value, "leg_2")?)?,
     };
+
     if route.leg_1.input_mint != route.anchor_mint
         || route.leg_1.output_mint != route.intermediate_mint
         || route.leg_2.input_mint != route.intermediate_mint
@@ -388,12 +389,14 @@ fn parse_route(value: &Value) -> Result<RouteEvidence, String> {
             route.route_id
         ));
     }
+
     if route.leg_1.pool_id == route.leg_2.pool_id {
         return Err(format!(
             "R13 source route unexpectedly reuses one pool for both legs: {}",
             route.route_id
         ));
     }
+
     Ok(route)
 }
 
@@ -442,6 +445,7 @@ pub fn intersect_route_histories(
                 left.reason.as_deref().unwrap_or("complete=false"),
                 right.reason.as_deref().unwrap_or("complete=false")
             );
+
             routes.insert(
                 route.route_id.clone(),
                 RouteIntersection {
@@ -456,10 +460,12 @@ pub fn intersect_route_histories(
 
         let left_signatures = observed_signatures(left);
         let right_signatures = observed_signatures(right);
+
         let signatures = left_signatures
             .intersection(&right_signatures)
             .cloned()
             .collect::<BTreeSet<_>>();
+
         required_signatures.extend(signatures.iter().cloned());
 
         routes.insert(
@@ -528,11 +534,13 @@ pub fn analyze_transactions(
 
         let mut missing = Vec::new();
         let mut matches = Vec::new();
+
         for signature in &intersection.signatures {
             let Some(evidence) = transactions.transactions.get(signature) else {
                 missing.push(signature.clone());
                 continue;
             };
+
             match match_transaction(route, evidence) {
                 Ok(Some(matched)) => matches.push(matched),
                 Ok(None) => {}
@@ -575,6 +583,7 @@ pub fn analyze_transactions(
         }
 
         let outcome_resolved = matches.iter().any(|matched| matched.outcome_resolved);
+
         analyses.insert(
             route.route_id.clone(),
             RouteAnalysis {
@@ -606,6 +615,7 @@ fn match_transaction(
 ) -> Result<Option<TransactionMatch>, String> {
     let transaction = &evidence.value;
     let meta = required_object(transaction, "meta")?;
+
     if !meta.get("err").is_some_and(Value::is_null) {
         return Ok(None);
     }
@@ -617,12 +627,14 @@ fn match_transaction(
         .iter()
         .filter_map(|instruction| match_leg(&route.leg_1, instruction).transpose())
         .collect::<Result<Vec<_>, _>>()?;
+
     let leg_2 = instructions
         .iter()
         .filter_map(|instruction| match_leg(&route.leg_2, instruction).transpose())
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut ordered_pair: Option<(MatchedLeg, MatchedLeg)> = None;
+
     for first in &leg_1 {
         for second in &leg_2 {
             if coordinate_precedes(&first.coordinate, &second.coordinate) {
@@ -630,6 +642,7 @@ fn match_transaction(
                 break;
             }
         }
+
         if ordered_pair.is_some() {
             break;
         }
@@ -644,7 +657,8 @@ fn match_transaction(
     let fee_lamports = required_u64(meta, "fee")?;
     let compute_units_consumed = optional_u64(meta, "computeUnitsConsumed")?;
 
-    let amount_evidence = reconstruct_amount_evidence(route, &first, &second, meta, &account_keys)?;
+    let amount_evidence =
+        reconstruct_amount_evidence(route, &first, &second, meta, &account_keys)?;
 
     Ok(Some(TransactionMatch {
         signature: evidence.signature.clone(),
@@ -666,25 +680,30 @@ fn match_leg(
     if instruction.program_id != venue_program_id(&leg.venue)? {
         return Ok(None);
     }
+
     let Some(discriminator) = instruction.data.get(..8) else {
         return Ok(None);
     };
 
     match leg.venue.as_str() {
         "raydium_cpmm" => {
-            if discriminator != RAYDIUM_SWAP_BASE_INPUT && discriminator != RAYDIUM_SWAP_BASE_OUTPUT
+            if discriminator != RAYDIUM_SWAP_BASE_INPUT
+                && discriminator != RAYDIUM_SWAP_BASE_OUTPUT
             {
                 return Ok(None);
             }
+
             if instruction.account_keys.len() < 13 {
                 return Ok(None);
             }
+
             if instruction.account_keys[3] != leg.pool_id
                 || instruction.account_keys[10] != leg.input_mint
                 || instruction.account_keys[11] != leg.output_mint
             {
                 return Ok(None);
             }
+
             Ok(Some(MatchedLeg {
                 coordinate: instruction.coordinate.clone(),
                 venue: leg.venue.clone(),
@@ -696,14 +715,10 @@ fn match_leg(
             }))
         }
         "pumpswap" => {
-            // Current official PumpSwap IDL keeps the route-critical prefix stable:
-            // pool[0], user[1], global_config[2], base_mint[3], quote_mint[4],
-            // user_base_token_account[5], user_quote_token_account[6],
-            // pool_base_token_account[7], pool_quote_token_account[8].
-            // Later fee/cashback accounts are intentionally not count-pinned here.
             if instruction.account_keys.len() < 9 || instruction.account_keys[0] != leg.pool_id {
                 return Ok(None);
             }
+
             let base_mint = &instruction.account_keys[3];
             let quote_mint = &instruction.account_keys[4];
 
@@ -711,6 +726,7 @@ fn match_leg(
                 if &leg.input_mint != quote_mint || &leg.output_mint != base_mint {
                     return Ok(None);
                 }
+
                 Ok(Some(MatchedLeg {
                     coordinate: instruction.coordinate.clone(),
                     venue: leg.venue.clone(),
@@ -724,6 +740,7 @@ fn match_leg(
                 if &leg.input_mint != base_mint || &leg.output_mint != quote_mint {
                     return Ok(None);
                 }
+
                 Ok(Some(MatchedLeg {
                     coordinate: instruction.coordinate.clone(),
                     venue: leg.venue.clone(),
@@ -782,17 +799,21 @@ fn reconstruct_amount_evidence(
         second.user_input_token_account.clone(),
         second.user_output_token_account.clone(),
     ]);
+
     let pre = token_balances_by_account(meta, "preTokenBalances", account_keys)?;
     let post = token_balances_by_account(meta, "postTokenBalances", account_keys)?;
 
     let mut accounts = Vec::new();
     let mut complete = true;
+
     for account in watched {
         let before = pre.get(&account);
         let after = post.get(&account);
+
         if before.is_none() || after.is_none() {
             complete = false;
         }
+
         accounts.push(json!({
             "account": account,
             "pre": before,
@@ -820,6 +841,7 @@ fn token_balances_by_account(
     account_keys: &[String],
 ) -> Result<BTreeMap<String, Value>, String> {
     let mut result = BTreeMap::new();
+
     let values = match meta.get(field) {
         None | Some(Value::Null) => return Ok(result),
         Some(value) => value
@@ -833,10 +855,12 @@ fn token_balances_by_account(
             .get(index)
             .ok_or_else(|| format!("R13 {field} accountIndex out of range"))?
             .clone();
+
         let mint = required_str(value, "mint")?;
         let token_amount = required_object(value, "uiTokenAmount")?;
         let amount = required_str(token_amount, "amount")?;
         let decimals = required_u64(token_amount, "decimals")?;
+
         result.insert(
             account,
             json!({
@@ -846,6 +870,7 @@ fn token_balances_by_account(
             }),
         );
     }
+
     Ok(result)
 }
 
@@ -853,12 +878,14 @@ fn resolved_account_keys(transaction: &Value, meta: &Value) -> Result<Vec<String
     let message = transaction
         .pointer("/transaction/message")
         .ok_or_else(|| "R13 transaction missing transaction.message".to_owned())?;
+
     let static_keys = message
         .get("accountKeys")
         .and_then(Value::as_array)
         .ok_or_else(|| "R13 raw transaction missing message.accountKeys".to_owned())?;
 
     let mut keys = Vec::new();
+
     for key in static_keys {
         keys.push(
             key.as_str()
@@ -873,6 +900,7 @@ fn resolved_account_keys(transaction: &Value, meta: &Value) -> Result<Vec<String
             append_string_array(&mut keys, loaded, "readonly")?;
         }
     }
+
     Ok(keys)
 }
 
@@ -885,6 +913,7 @@ fn append_string_array(
         .get(field)
         .and_then(Value::as_array)
         .ok_or_else(|| format!("R13 loadedAddresses.{field} missing or invalid"))?;
+
     for value in values {
         destination.push(
             value
@@ -893,6 +922,7 @@ fn append_string_array(
                 .to_owned(),
         );
     }
+
     Ok(())
 }
 
@@ -907,23 +937,27 @@ fn resolved_instructions(
         .ok_or_else(|| "R13 raw transaction missing compiled instructions".to_owned())?;
 
     let mut inner_by_outer: BTreeMap<usize, Vec<&Value>> = BTreeMap::new();
+
     if let Some(groups) = meta.get("innerInstructions") {
         if !groups.is_null() {
             let groups = groups
                 .as_array()
                 .ok_or_else(|| "R13 innerInstructions was not an array".to_owned())?;
+
             for group in groups {
                 let outer_index = required_u64(group, "index")? as usize;
                 let instructions = group
                     .get("instructions")
                     .and_then(Value::as_array)
                     .ok_or_else(|| "R13 inner instruction group missing instructions".to_owned())?;
+
                 inner_by_outer.insert(outer_index, instructions.iter().collect());
             }
         }
     }
 
     let mut resolved = Vec::new();
+
     for (outer_index, instruction) in outer.iter().enumerate() {
         resolved.push(resolve_instruction(
             instruction,
@@ -949,6 +983,7 @@ fn resolved_instructions(
             }
         }
     }
+
     Ok(resolved)
 }
 
@@ -958,20 +993,25 @@ fn resolve_instruction(
     coordinate: InstructionCoordinate,
 ) -> Result<ResolvedInstruction, String> {
     let program_index = required_u64(instruction, "programIdIndex")? as usize;
+
     let program_id = account_keys
         .get(program_index)
         .ok_or_else(|| "R13 programIdIndex out of range".to_owned())?
         .clone();
+
     let indexes = instruction
         .get("accounts")
         .and_then(Value::as_array)
         .ok_or_else(|| "R13 compiled instruction missing accounts".to_owned())?;
+
     let mut instruction_accounts = Vec::new();
+
     for index in indexes {
         let index = index
             .as_u64()
             .ok_or_else(|| "R13 instruction account index was not u64".to_owned())?
             as usize;
+
         instruction_accounts.push(
             account_keys
                 .get(index)
@@ -979,6 +1019,7 @@ fn resolve_instruction(
                 .clone(),
         );
     }
+
     let data = bs58::decode(required_str(instruction, "data")?)
         .into_vec()
         .map_err(|error| format!("R13 could not decode instruction data: {error}"))?;
@@ -1020,15 +1061,19 @@ fn write_forensics_artifact_in_directory(
 ) -> Result<R13RunResult, String> {
     create_dir_all(output_directory)
         .map_err(|error| format!("could not create R13 output directory: {error}"))?;
+
     let now = unix_time_ms_now()?;
     let run_id = build_run_id(now);
     let output_path = output_directory.join(format!("{run_id}.jsonl"));
+
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&output_path)
         .map_err(|error| format!("could not create immutable R13 artifact: {error}"))?;
+
     let github = GithubActionsProvenance::from_environment();
+
     let mut writer = R13Writer {
         run_id,
         writer: BufWriter::new(file),
@@ -1068,9 +1113,17 @@ fn write_forensics_artifact_in_directory(
             .routes
             .get(&route.route_id)
             .ok_or_else(|| format!("R13 missing intersection for {}", route.route_id))?;
+
         let analysis = analyses
             .get(&route.route_id)
             .ok_or_else(|| format!("R13 missing analysis for {}", route.route_id))?;
+
+        if analysis.route_id != route.route_id {
+            return Err(format!(
+                "R13 route analysis identity mismatch: expected={} actual={}",
+                route.route_id, analysis.route_id
+            ));
+        }
 
         match analysis.status.as_str() {
             "search_incomplete" => search_incomplete_count += 1,
@@ -1099,6 +1152,7 @@ fn write_forensics_artifact_in_directory(
 
         for matched in &analysis.matches {
             transaction_match_count += 1;
+
             writer.write_event(
                 "transaction_match",
                 unix_time_ms_now()?,
@@ -1122,6 +1176,7 @@ fn write_forensics_artifact_in_directory(
                 candidate.route.route_id
             )
         })?;
+
         writer.write_event(
             "candidate_annotation",
             unix_time_ms_now()?,
@@ -1135,7 +1190,11 @@ fn write_forensics_artifact_in_directory(
                 },
                 "route_id": candidate.route.route_id,
                 "captureability_status": analysis.status,
-                "matched_signatures": analysis.matches.iter().map(|item| item.signature.clone()).collect::<Vec<_>>(),
+                "matched_signatures": analysis
+                    .matches
+                    .iter()
+                    .map(|item| item.signature.clone())
+                    .collect::<Vec<_>>(),
                 "timing": {
                     "candidate_found_at_unix_ms": candidate.candidate_found_at_unix_ms,
                     "quote_complete_at_unix_ms": candidate.quote_complete_at_unix_ms,
@@ -1162,6 +1221,7 @@ fn write_forensics_artifact_in_directory(
             "atomic_route_outcome_resolved_count": atomic_route_outcome_resolved_count,
         }),
     )?;
+
     writer.finish()?;
     validate_r13_jsonl(&output_path, plan.candidates.len(), plan.routes.len())?;
 
@@ -1196,9 +1256,11 @@ impl R13Writer {
         if self.records_written >= MAX_RECORDS_PER_RUN {
             return Err("R13 recorder capacity exhausted".to_owned());
         }
+
         if event_type != "forensics_run_end" && self.records_written >= MAX_RECORDS_PER_RUN - 1 {
             return Err("R13 recorder capacity reserved for forensics_run_end".to_owned());
         }
+
         let record = json!({
             "schema_version": R13_SCHEMA_VERSION,
             "event_type": event_type,
@@ -1208,23 +1270,30 @@ impl R13Writer {
             "github_actions": self.github.as_json(),
             "payload": payload,
         });
+
         let mut bytes = serde_json::to_vec(&record)
             .map_err(|error| format!("could not serialize R13 record: {error}"))?;
+
         bytes.push(b'\n');
+
         self.writer
             .write_all(&bytes)
             .map_err(|error| format!("could not append R13 record: {error}"))?;
+
         self.writer
             .flush()
             .map_err(|error| format!("could not flush R13 record: {error}"))?;
+
         self.records_written = self
             .records_written
             .checked_add(1)
             .ok_or_else(|| "R13 record count overflow".to_owned())?;
+
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or_else(|| "R13 record sequence overflow".to_owned())?;
+
         Ok(())
     }
 
@@ -1232,6 +1301,7 @@ impl R13Writer {
         self.writer
             .flush()
             .map_err(|error| format!("could not flush R13 artifact: {error}"))?;
+
         self.writer
             .get_ref()
             .sync_all()
@@ -1245,10 +1315,12 @@ pub fn validate_r13_jsonl(
     expected_route_count: usize,
 ) -> Result<(), String> {
     let mut bytes = Vec::new();
+
     File::open(path)
         .map_err(|error| format!("could not open R13 artifact for replay: {error}"))?
         .read_to_end(&mut bytes)
         .map_err(|error| format!("could not read R13 artifact for replay: {error}"))?;
+
     if bytes.is_empty() || !bytes.ends_with(b"\n") {
         return Err("R13 replay requires non-empty newline-terminated JSONL".to_owned());
     }
@@ -1269,20 +1341,25 @@ pub fn validate_r13_jsonl(
     {
         let record: Value = serde_json::from_slice(line)
             .map_err(|error| format!("R13 replay malformed JSON: {error}"))?;
+
         if required_str(&record, "schema_version")? != R13_SCHEMA_VERSION {
             return Err("R13 replay schema mismatch".to_owned());
         }
+
         let sequence = required_u64(&record, "record_sequence")?;
+
         if sequence != expected_sequence {
             return Err(format!(
                 "R13 replay sequence mismatch: expected={expected_sequence} actual={sequence}"
             ));
         }
+
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or_else(|| "R13 replay sequence overflow".to_owned())?;
 
         let current_run_id = required_str(&record, "run_id")?.to_owned();
+
         match run_id.as_deref() {
             None => run_id = Some(current_run_id.clone()),
             Some(expected) if expected == current_run_id => {}
@@ -1293,6 +1370,7 @@ pub fn validate_r13_jsonl(
             .get("github_actions")
             .cloned()
             .ok_or_else(|| "R13 replay missing github_actions".to_owned())?;
+
         match github.as_ref() {
             None => github = Some(current_github.clone()),
             Some(expected) if expected == &current_github => {}
@@ -1300,18 +1378,22 @@ pub fn validate_r13_jsonl(
         }
 
         let event_type = required_str(&record, "event_type")?;
+
         match event_type {
             "forensics_run_start" => {
                 if saw_start || saw_end || sequence != 1 {
                     return Err("R13 replay invalid run_start lifecycle".to_owned());
                 }
+
                 saw_start = true;
             }
             "route_search_result" => {
                 if !saw_start || saw_end {
                     return Err("R13 replay route_search_result outside lifecycle".to_owned());
                 }
+
                 route_results += 1;
+
                 validate_status(required_str(
                     required_object(&record, "payload")?,
                     "status",
@@ -1321,14 +1403,18 @@ pub fn validate_r13_jsonl(
                 if !saw_start || saw_end {
                     return Err("R13 replay transaction_match outside lifecycle".to_owned());
                 }
+
                 transaction_matches += 1;
+
                 let payload = required_object(&record, "payload")?;
                 let status = required_str(payload, "status")?;
+
                 if status != "atomic_route_amounts_unresolved"
                     && status != "atomic_route_outcome_resolved"
                 {
                     return Err("R13 replay transaction_match status invalid".to_owned());
                 }
+
                 required_str(payload, "route_id")?;
                 required_object(payload, "transaction")?;
             }
@@ -1336,16 +1422,22 @@ pub fn validate_r13_jsonl(
                 if !saw_start || saw_end {
                     return Err("R13 replay candidate_annotation outside lifecycle".to_owned());
                 }
+
                 candidate_annotations += 1;
+
                 let payload = required_object(&record, "payload")?;
+
                 validate_status(required_str(payload, "captureability_status")?)?;
+
                 let source = required_object(payload, "source_r12")?;
+
                 let key = format!(
                     "{}:{}:{}",
                     required_str(source, "run_id")?,
                     required_u64(source, "record_sequence")?,
                     required_str(source, "candidate_id")?
                 );
+
                 if !annotated_candidates.insert(key) {
                     return Err("R13 replay duplicate candidate annotation".to_owned());
                 }
@@ -1354,8 +1446,11 @@ pub fn validate_r13_jsonl(
                 if !saw_start || saw_end {
                     return Err("R13 replay invalid run_end lifecycle".to_owned());
                 }
+
                 saw_end = true;
+
                 let payload = required_object(&record, "payload")?;
+
                 if required_u64(payload, "route_count")? as usize != expected_route_count
                     || required_u64(payload, "candidate_annotation_count")? as usize
                         != expected_candidate_count
@@ -1372,11 +1467,13 @@ pub fn validate_r13_jsonl(
     if !saw_start || !saw_end {
         return Err("R13 replay incomplete lifecycle".to_owned());
     }
+
     if route_results != expected_route_count {
         return Err(format!(
             "R13 replay route result count mismatch: expected={expected_route_count} actual={route_results}"
         ));
     }
+
     if candidate_annotations != expected_candidate_count
         || annotated_candidates.len() != expected_candidate_count
     {
@@ -1384,6 +1481,7 @@ pub fn validate_r13_jsonl(
             "R13 replay candidate annotation coverage mismatch: expected={expected_candidate_count} actual={candidate_annotations}"
         ));
     }
+
     Ok(())
 }
 
@@ -1421,6 +1519,7 @@ fn leg_json(leg: &LegEvidence) -> Value {
 fn build_run_id(now_ms: u64) -> String {
     let gha_run = env_nonempty("GITHUB_RUN_ID").unwrap_or_else(|| "local".to_owned());
     let gha_attempt = env_nonempty("GITHUB_RUN_ATTEMPT").unwrap_or_else(|| "0".to_owned());
+
     format!("r13-{gha_run}-{gha_attempt}-{now_ms}-{}", process::id())
 }
 
@@ -1428,6 +1527,7 @@ fn unix_time_ms_now() -> Result<u64, String> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("R13 system clock precedes Unix epoch: {error}"))?;
+
     u64::try_from(duration.as_millis())
         .map_err(|_| "R13 Unix millisecond timestamp overflow".to_owned())
 }
@@ -1503,17 +1603,22 @@ mod tests {
     }
 
     #[test]
-    fn search_window_uses_maximum_leg_slot() {
+    fn search_window_uses_maximum_leg_slot() -> Result<(), String> {
         let route = route();
+
         assert_eq!(route.start_slot(), 101);
-        assert_eq!(route.end_slot().expect("end slot"), 133);
+        assert_eq!(route.end_slot()?, 133);
+
+        Ok(())
     }
 
     #[test]
-    fn exact_route_intersection_uses_only_two_requested_pool_histories() {
+    fn exact_route_intersection_uses_only_two_requested_pool_histories() -> Result<(), String> {
         let route = route();
-        let left_request = route.history_request(&route.leg_1).expect("left request");
-        let right_request = route.history_request(&route.leg_2).expect("right request");
+
+        let left_request = route.history_request(&route.leg_1)?;
+        let right_request = route.history_request(&route.leg_2)?;
+
         let history = |request: HistoryRequest, signatures: &[&str]| AddressHistory {
             request,
             observations: signatures
@@ -1539,6 +1644,7 @@ mod tests {
             routes: BTreeMap::from([("route".to_owned(), route.clone())]),
             history_requests: vec![left_request.clone(), right_request.clone()],
         };
+
         let acquisition = HistoryAcquisition {
             confirmed_tip_slot: Some(200),
             histories: BTreeMap::from([
@@ -1554,18 +1660,23 @@ mod tests {
             incomplete_reasons: Vec::new(),
         };
 
-        let intersections = intersect_route_histories(&plan, &acquisition).expect("intersection");
+        let intersections = intersect_route_histories(&plan, &acquisition)?;
+
         assert_eq!(
             intersections.required_signatures,
             BTreeSet::from(["shared".to_owned()])
         );
+
+        Ok(())
     }
 
     #[test]
-    fn incomplete_history_never_becomes_complete_no_match() {
+    fn incomplete_history_never_becomes_complete_no_match() -> Result<(), String> {
         let route = route();
-        let left_request = route.history_request(&route.leg_1).expect("left request");
-        let right_request = route.history_request(&route.leg_2).expect("right request");
+
+        let left_request = route.history_request(&route.leg_1)?;
+        let right_request = route.history_request(&route.leg_2)?;
+
         let plan = ForensicsPlan {
             source_path: PathBuf::from("source"),
             source_run_id: "run".to_owned(),
@@ -1574,6 +1685,7 @@ mod tests {
             routes: BTreeMap::from([("route".to_owned(), route.clone())]),
             history_requests: vec![left_request.clone(), right_request.clone()],
         };
+
         let acquisition = HistoryAcquisition {
             confirmed_tip_slot: Some(200),
             histories: BTreeMap::from([
@@ -1598,8 +1710,12 @@ mod tests {
             ]),
             incomplete_reasons: vec!["saturated".to_owned()],
         };
-        let intersections = intersect_route_histories(&plan, &acquisition).expect("intersection");
+
+        let intersections = intersect_route_histories(&plan, &acquisition)?;
+
         assert!(!intersections.routes["route"].complete);
+
+        Ok(())
     }
 
     #[test]
@@ -1609,35 +1725,49 @@ mod tests {
             inner_index: None,
             stack_height: Some(1),
         };
+
         let inner = InstructionCoordinate {
             outer_index: 2,
             inner_index: Some(0),
             stack_height: Some(2),
         };
+
         let later = InstructionCoordinate {
             outer_index: 3,
             inner_index: None,
             stack_height: Some(1),
         };
+
         assert!(coordinate_precedes(&outer, &inner));
         assert!(coordinate_precedes(&inner, &later));
         assert!(!coordinate_precedes(&later, &inner));
     }
 
     #[test]
-    fn failed_transaction_is_not_a_route_match() {
+    fn failed_transaction_is_not_a_route_match() -> Result<(), String> {
         let evidence = TransactionEvidence {
             signature: "sig".to_owned(),
             value: json!({
                 "slot": 110,
                 "blockTime": null,
-                "transaction": {"message": {"accountKeys": [], "instructions": []}},
-                "meta": {"err": {"InstructionError": [0, "Custom"]}, "fee": 5000}
+                "transaction": {
+                    "message": {
+                        "accountKeys": [],
+                        "instructions": []
+                    }
+                },
+                "meta": {
+                    "err": {
+                        "InstructionError": [0, "Custom"]
+                    },
+                    "fee": 5000
+                }
             }),
         };
-        assert!(match_transaction(&route(), &evidence)
-            .expect("failed tx should be handled")
-            .is_none());
+
+        assert!(match_transaction(&route(), &evidence)?.is_none());
+
+        Ok(())
     }
 
     #[test]
