@@ -529,8 +529,7 @@ mod tests {
     fn raydium_adapter_preserves_native_quote_and_capabilities() -> Result<(), String> {
         let snapshot = raydium_snapshot();
         let amount_in_raw = 1_000_000_000;
-        let native =
-            raydium::quote_exact_input(&snapshot, WRAPPED_SOL_MINT, amount_in_raw)?;
+        let native = raydium::quote_exact_input(&snapshot, WRAPPED_SOL_MINT, amount_in_raw)?;
         let adapter = RaydiumCpmmQuoteAdapter::new("raydium-pool", &snapshot);
         let adapted = adapter.quote_exact_input(WRAPPED_SOL_MINT, amount_in_raw)?;
 
