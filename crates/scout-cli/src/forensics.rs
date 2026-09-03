@@ -657,8 +657,7 @@ fn match_transaction(
     let fee_lamports = required_u64(meta, "fee")?;
     let compute_units_consumed = optional_u64(meta, "computeUnitsConsumed")?;
 
-    let amount_evidence =
-        reconstruct_amount_evidence(route, &first, &second, meta, &account_keys)?;
+    let amount_evidence = reconstruct_amount_evidence(route, &first, &second, meta, &account_keys)?;
 
     Ok(Some(TransactionMatch {
         signature: evidence.signature.clone(),
@@ -687,8 +686,7 @@ fn match_leg(
 
     match leg.venue.as_str() {
         "raydium_cpmm" => {
-            if discriminator != RAYDIUM_SWAP_BASE_INPUT
-                && discriminator != RAYDIUM_SWAP_BASE_OUTPUT
+            if discriminator != RAYDIUM_SWAP_BASE_INPUT && discriminator != RAYDIUM_SWAP_BASE_OUTPUT
             {
                 return Ok(None);
             }
