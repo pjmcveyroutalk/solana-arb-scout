@@ -1067,10 +1067,8 @@ async fn wait_for_r13_window_maturity(
                 );
 
                 if slot >= required_end_slot {
-                    let wait_elapsed_ms =
-                        u64::try_from(started_at.elapsed().as_millis()).map_err(|_| {
-                            "R13 maturity elapsed milliseconds exceeded u64".to_owned()
-                        })?;
+                    let wait_elapsed_ms = u64::try_from(started_at.elapsed().as_millis())
+                        .map_err(|_| "R13 maturity elapsed milliseconds exceeded u64".to_owned())?;
 
                     return Ok(forensics::EvidenceMaturity {
                         required_end_slot,
@@ -1426,41 +1424,41 @@ async fn validate_registry_routes_and_sizes(
             continue;
         };
 
-        let priority_observation =
-            if let Some(observation) = route_priority_observations.get(&record.route_index) {
-                observation
-            } else {
-                let reason = "missing priority observation state";
-                println!(
-                    "rung11c_cost_model_rejected: route=[{}] reason={reason}",
-                    route_candidate.summary()
-                );
-                let missing_priority =
-                    costs::PriorityObservationState::Unavailable(reason.to_owned());
-                let economics_complete_at_unix_ms = unix_time_ms_now()?;
-                shadow_recorder.record_economics_evaluation(
-                    route_candidate,
-                    record.dollars,
-                    record.anchor_decimals,
-                    &record.route_quote,
-                    None,
-                    Some(reason),
-                    None,
-                    None,
-                    &missing_priority,
-                    &jito_observation,
-                    recorder::CandidateTiming {
-                        candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
-                        quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
-                        economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
-                        hypothetical_ready_at_unix_ms: None,
-                    },
-                    &usd_prices.sol,
-                    usd_prices.usdc.as_ref(),
-                    usd_prices.usdt.as_ref(),
-                )?;
-                continue;
-            };
+        let priority_observation = if let Some(observation) =
+            route_priority_observations.get(&record.route_index)
+        {
+            observation
+        } else {
+            let reason = "missing priority observation state";
+            println!(
+                "rung11c_cost_model_rejected: route=[{}] reason={reason}",
+                route_candidate.summary()
+            );
+            let missing_priority = costs::PriorityObservationState::Unavailable(reason.to_owned());
+            let economics_complete_at_unix_ms = unix_time_ms_now()?;
+            shadow_recorder.record_economics_evaluation(
+                route_candidate,
+                record.dollars,
+                record.anchor_decimals,
+                &record.route_quote,
+                None,
+                Some(reason),
+                None,
+                None,
+                &missing_priority,
+                &jito_observation,
+                recorder::CandidateTiming {
+                    candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
+                    quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
+                    economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
+                    hypothetical_ready_at_unix_ms: None,
+                },
+                &usd_prices.sol,
+                usd_prices.usdc.as_ref(),
+                usd_prices.usdt.as_ref(),
+            )?;
+            continue;
+        };
 
         let cost_model = match costs::economics_cost_model_with_usd_prices(
             route_candidate.anchor_mint(),
@@ -1593,10 +1591,7 @@ async fn validate_registry_routes_and_sizes(
     }
 
     let shadow_output = shadow_recorder.finish()?;
-    println!(
-        "rung12_shadow_output_complete: {}",
-        shadow_output.display()
-    );
+    println!("rung12_shadow_output_complete: {}", shadow_output.display());
     recorder::validate_jsonl_replay(&shadow_output)?;
     println!("READ-ONLY RUNG 12 SHADOW RECORDER PASS");
 
