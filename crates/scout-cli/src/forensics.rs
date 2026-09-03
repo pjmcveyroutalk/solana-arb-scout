@@ -16,6 +16,8 @@ pub const OUTPUT_DIRECTORY: &str = "artifacts/r13-forensics";
 pub const MAX_FORWARD_SLOTS: u64 = 32;
 pub const MAX_RECORDS_PER_RUN: u64 = 512;
 
+const MATURITY_POLICY_ID: &str = "r13-confirmed-slot-maturity-v1";
+
 const RAYDIUM_SWAP_BASE_INPUT: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
 const RAYDIUM_SWAP_BASE_OUTPUT: [u8; 8] = [55, 217, 98, 86, 163, 74, 180, 173];
 const PUMPSWAP_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
@@ -81,6 +83,129 @@ pub struct ForensicsPlan {
     pub candidates: Vec<CandidateEvidence>,
     pub routes: BTreeMap<String, RouteEvidence>,
     pub history_requests: Vec<HistoryRequest>,
+}
+
+impl ForensicsPlan {
+    pub fn required_end_slot(&self) -> Result<u64, String> {
+        let mut required_end_slot: Option<u64> = None;
+
+        for route in self.routes.values() {
+            let end_slot = route.end_slot()?;
+            required_end_slot = Some(match required_end_slot {
+                Some(current) => current.max(end_slot),
+                None => end_slot,
+            });
+        }
+
+        required_end_slot.ok_or_else(|| "R13 plan contains no route end slot".to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceMaturity {
+    pub required_end_slot: u64,
+    pub initial_confirmed_tip: Option<u64>,
+    pub final_confirmed_tip: Option<u64>,
+    pub poll_attempts: u64,
+    pub rpc_error_count: u64,
+    pub wait_elapsed_ms: u64,
+    pub maturity_reached: bool,
+}
+
+impl EvidenceMaturity {
+    fn validate_for_plan(&self, plan: &ForensicsPlan) -> Result<(), String> {
+        let expected_end_slot = plan.required_end_slot()?;
+
+        if self.required_end_slot != expected_end_slot {
+            return Err(format!(
+                "R13 maturity end-slot mismatch: expected={expected_end_slot} actual={}",
+                self.required_end_slot
+            ));
+        }
+
+        if self.poll_attempts == 0 {
+            return Err("R13 maturity evidence requires at least one poll attempt".to_owned());
+        }
+
+        if self.rpc_error_count > self.poll_attempts {
+            return Err(format!(
+                "R13 maturity RPC error count exceeds poll attempts: errors={} attempts={}",
+                self.rpc_error_count, self.poll_attempts
+            ));
+        }
+
+        if self.initial_confirmed_tip.is_none() && self.final_confirmed_tip.is_some() {
+            return Err(
+                "R13 maturity final confirmed tip cannot exist without an initial confirmed tip"
+                    .to_owned(),
+            );
+        }
+
+        if self.maturity_reached {
+            let final_tip = self.final_confirmed_tip.ok_or_else(|| {
+                "R13 mature evidence requires a final confirmed tip".to_owned()
+            })?;
+
+            if final_tip < self.required_end_slot {
+                return Err(format!(
+                    "R13 maturity marked reached below required end slot: final_tip={final_tip} required_end_slot={}",
+                    self.required_end_slot
+                ));
+            }
+        } else if self
+            .final_confirmed_tip
+            .is_some_and(|slot| slot >= self.required_end_slot)
+        {
+            return Err(format!(
+                "R13 maturity marked unresolved despite confirmed tip reaching end slot: final_tip={} required_end_slot={}",
+                self.final_confirmed_tip.unwrap_or_default(),
+                self.required_end_slot
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn status(&self) -> &'static str {
+        if self.maturity_reached {
+            "mature"
+        } else {
+            "window_not_mature"
+        }
+    }
+
+    fn reason(&self) -> Option<String> {
+        if self.maturity_reached {
+            None
+        } else {
+            Some(match self.final_confirmed_tip {
+                Some(slot) => format!(
+                    "confirmed chain tip did not reach required forensic end slot within bounded maturity wait: final_confirmed_tip={slot} required_end_slot={}",
+                    self.required_end_slot
+                ),
+                None => format!(
+                    "no confirmed chain tip was acquired within bounded maturity wait: required_end_slot={}",
+                    self.required_end_slot
+                ),
+            })
+        }
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "policy_id": MATURITY_POLICY_ID,
+            "required_end_slot": self.required_end_slot,
+            "initial_confirmed_tip": self.initial_confirmed_tip,
+            "final_confirmed_tip": self.final_confirmed_tip,
+            "poll_attempts": self.poll_attempts,
+            "rpc_error_count": self.rpc_error_count,
+            "wait_elapsed_ms": self.wait_elapsed_ms,
+            "maturity_reached": self.maturity_reached,
+            "status": self.status(),
+            "reason": self.reason(),
+            "authority": "Solana getSlot commitment=confirmed; slot numbers are authoritative and elapsed milliseconds are operational telemetry only",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +301,8 @@ pub struct R13RunResult {
     pub atomic_route_match_count: usize,
     pub atomic_route_amounts_unresolved_count: usize,
     pub atomic_route_outcome_resolved_count: usize,
+    pub window_not_mature_candidate_count: usize,
+    pub maturity_reached: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1040,12 +1167,14 @@ fn venue_program_id(venue: &str) -> Result<&'static str, String> {
 
 pub fn write_forensics_artifact(
     plan: &ForensicsPlan,
-    intersections: &IntersectionPlan,
-    analyses: &BTreeMap<String, RouteAnalysis>,
+    maturity: &EvidenceMaturity,
+    intersections: Option<&IntersectionPlan>,
+    analyses: Option<&BTreeMap<String, RouteAnalysis>>,
 ) -> Result<R13RunResult, String> {
     write_forensics_artifact_in_directory(
         Path::new(OUTPUT_DIRECTORY),
         plan,
+        maturity,
         intersections,
         analyses,
     )
@@ -1054,9 +1183,28 @@ pub fn write_forensics_artifact(
 fn write_forensics_artifact_in_directory(
     output_directory: &Path,
     plan: &ForensicsPlan,
-    intersections: &IntersectionPlan,
-    analyses: &BTreeMap<String, RouteAnalysis>,
+    maturity: &EvidenceMaturity,
+    intersections: Option<&IntersectionPlan>,
+    analyses: Option<&BTreeMap<String, RouteAnalysis>>,
 ) -> Result<R13RunResult, String> {
+    maturity.validate_for_plan(plan)?;
+
+    match (maturity.maturity_reached, intersections, analyses) {
+        (true, Some(_), Some(_)) | (false, None, None) => {}
+        (true, _, _) => {
+            return Err(
+                "R13 mature evidence requires route intersections and transaction analyses"
+                    .to_owned(),
+            )
+        }
+        (false, _, _) => {
+            return Err(
+                "R13 immature evidence must not contain route-search intersections or analyses"
+                    .to_owned(),
+            )
+        }
+    }
+
     create_dir_all(output_directory)
         .map_err(|error| format!("could not create R13 output directory: {error}"))?;
 
@@ -1095,9 +1243,69 @@ fn write_forensics_artifact_in_directory(
                 "start_slot_policy": "max(recorded_leg_source_slots)",
                 "forward_slots": MAX_FORWARD_SLOTS,
                 "atomic_scope": "exact two-pool intersection followed by exact supported venue instruction proof",
+                "maturity_policy_id": MATURITY_POLICY_ID,
             },
         }),
     )?;
+
+    writer.write_event(
+        "maturity_result",
+        unix_time_ms_now()?,
+        maturity.as_json(),
+    )?;
+
+    if !maturity.maturity_reached {
+        for candidate in &plan.candidates {
+            write_candidate_annotation(
+                &mut writer,
+                candidate,
+                "window_not_mature",
+                &[],
+            )?;
+        }
+
+        writer.write_event(
+            "forensics_run_end",
+            unix_time_ms_now()?,
+            json!({
+                "route_count": plan.routes.len(),
+                "route_search_result_count": 0,
+                "candidate_annotation_count": plan.candidates.len(),
+                "transaction_match_count": 0,
+                "search_incomplete_count": 0,
+                "no_atomic_match_complete_count": 0,
+                "atomic_route_match_count": 0,
+                "atomic_route_amounts_unresolved_count": 0,
+                "atomic_route_outcome_resolved_count": 0,
+                "window_not_mature_candidate_count": plan.candidates.len(),
+                "maturity_reached": false,
+            }),
+        )?;
+
+        writer.finish()?;
+        validate_r13_jsonl(&output_path, plan.candidates.len(), plan.routes.len())?;
+
+        return Ok(R13RunResult {
+            output_path,
+            route_count: plan.routes.len(),
+            candidate_count: plan.candidates.len(),
+            transaction_match_count: 0,
+            search_incomplete_count: 0,
+            no_atomic_match_complete_count: 0,
+            atomic_route_match_count: 0,
+            atomic_route_amounts_unresolved_count: 0,
+            atomic_route_outcome_resolved_count: 0,
+            window_not_mature_candidate_count: plan.candidates.len(),
+            maturity_reached: false,
+        });
+    }
+
+    let intersections = intersections.ok_or_else(|| {
+        "R13 mature evidence missing route intersections after contract validation".to_owned()
+    })?;
+    let analyses = analyses.ok_or_else(|| {
+        "R13 mature evidence missing route analyses after contract validation".to_owned()
+    })?;
 
     let mut transaction_match_count = 0usize;
     let mut search_incomplete_count = 0usize;
@@ -1132,6 +1340,12 @@ fn write_forensics_artifact_in_directory(
             other => return Err(format!("R13 unsupported analysis status {other}")),
         }
 
+        let intersecting_signatures = intersection
+            .signatures
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
         writer.write_event(
             "route_search_result",
             unix_time_ms_now()?,
@@ -1142,7 +1356,8 @@ fn write_forensics_artifact_in_directory(
                     "end_slot": route.end_slot()?,
                 },
                 "history_complete": intersection.complete,
-                "intersecting_signature_count": intersection.signatures.len(),
+                "intersecting_signature_count": intersecting_signatures.len(),
+                "intersecting_signatures": intersecting_signatures,
                 "status": analysis.status,
                 "reason": analysis.reason,
             }),
@@ -1175,33 +1390,17 @@ fn write_forensics_artifact_in_directory(
             )
         })?;
 
-        writer.write_event(
-            "candidate_annotation",
-            unix_time_ms_now()?,
-            json!({
-                "source_r12": {
-                    "run_id": candidate.source_run_id,
-                    "record_sequence": candidate.source_record_sequence,
-                    "candidate_id": candidate.candidate_id,
-                    "status": candidate.source_status,
-                    "usd_size": candidate.usd_size,
-                },
-                "route_id": candidate.route.route_id,
-                "captureability_status": analysis.status,
-                "matched_signatures": analysis
-                    .matches
-                    .iter()
-                    .map(|item| item.signature.clone())
-                    .collect::<Vec<_>>(),
-                "timing": {
-                    "candidate_found_at_unix_ms": candidate.candidate_found_at_unix_ms,
-                    "quote_complete_at_unix_ms": candidate.quote_complete_at_unix_ms,
-                    "economics_complete_at_unix_ms": candidate.economics_complete_at_unix_ms,
-                    "hypothetical_ready_at_unix_ms": candidate.hypothetical_ready_at_unix_ms,
-                    "timing_comparison_policy": "slot_delta_primary; R12 local milliseconds and Solana blockTime are not treated as synchronized millisecond clocks",
-                },
-                "profitability_claim": "none",
-            }),
+        let matched_signatures = analysis
+            .matches
+            .iter()
+            .map(|item| item.signature.clone())
+            .collect::<Vec<_>>();
+
+        write_candidate_annotation(
+            &mut writer,
+            candidate,
+            &analysis.status,
+            &matched_signatures,
         )?;
     }
 
@@ -1210,6 +1409,7 @@ fn write_forensics_artifact_in_directory(
         unix_time_ms_now()?,
         json!({
             "route_count": plan.routes.len(),
+            "route_search_result_count": plan.routes.len(),
             "candidate_annotation_count": plan.candidates.len(),
             "transaction_match_count": transaction_match_count,
             "search_incomplete_count": search_incomplete_count,
@@ -1217,6 +1417,8 @@ fn write_forensics_artifact_in_directory(
             "atomic_route_match_count": atomic_route_match_count,
             "atomic_route_amounts_unresolved_count": atomic_route_amounts_unresolved_count,
             "atomic_route_outcome_resolved_count": atomic_route_outcome_resolved_count,
+            "window_not_mature_candidate_count": 0,
+            "maturity_reached": true,
         }),
     )?;
 
@@ -1233,7 +1435,43 @@ fn write_forensics_artifact_in_directory(
         atomic_route_match_count,
         atomic_route_amounts_unresolved_count,
         atomic_route_outcome_resolved_count,
+        window_not_mature_candidate_count: 0,
+        maturity_reached: true,
     })
+}
+
+fn write_candidate_annotation(
+    writer: &mut R13Writer,
+    candidate: &CandidateEvidence,
+    captureability_status: &str,
+    matched_signatures: &[String],
+) -> Result<(), String> {
+    validate_candidate_status(captureability_status)?;
+
+    writer.write_event(
+        "candidate_annotation",
+        unix_time_ms_now()?,
+        json!({
+            "source_r12": {
+                "run_id": candidate.source_run_id,
+                "record_sequence": candidate.source_record_sequence,
+                "candidate_id": candidate.candidate_id,
+                "status": candidate.source_status,
+                "usd_size": candidate.usd_size,
+            },
+            "route_id": candidate.route.route_id,
+            "captureability_status": captureability_status,
+            "matched_signatures": matched_signatures,
+            "timing": {
+                "candidate_found_at_unix_ms": candidate.candidate_found_at_unix_ms,
+                "quote_complete_at_unix_ms": candidate.quote_complete_at_unix_ms,
+                "economics_complete_at_unix_ms": candidate.economics_complete_at_unix_ms,
+                "hypothetical_ready_at_unix_ms": candidate.hypothetical_ready_at_unix_ms,
+                "timing_comparison_policy": "slot_delta_primary; R12 local milliseconds and Solana blockTime are not treated as synchronized millisecond clocks",
+            },
+            "profitability_claim": "none",
+        }),
+    )
 }
 
 struct R13Writer {
@@ -1327,10 +1565,18 @@ pub fn validate_r13_jsonl(
     let mut run_id: Option<String> = None;
     let mut github: Option<Value> = None;
     let mut saw_start = false;
+    let mut saw_maturity = false;
     let mut saw_end = false;
+    let mut maturity_reached: Option<bool> = None;
     let mut route_results = 0usize;
     let mut candidate_annotations = 0usize;
     let mut transaction_matches = 0usize;
+    let mut search_incomplete_count = 0usize;
+    let mut no_atomic_match_complete_count = 0usize;
+    let mut atomic_route_match_count = 0usize;
+    let mut atomic_route_amounts_unresolved_count = 0usize;
+    let mut atomic_route_outcome_resolved_count = 0usize;
+    let mut window_not_mature_candidate_count = 0usize;
     let mut annotated_candidates = BTreeSet::new();
 
     for line in bytes
@@ -1379,27 +1625,131 @@ pub fn validate_r13_jsonl(
 
         match event_type {
             "forensics_run_start" => {
-                if saw_start || saw_end || sequence != 1 {
+                if saw_start || saw_maturity || saw_end || sequence != 1 {
                     return Err("R13 replay invalid run_start lifecycle".to_owned());
                 }
 
                 saw_start = true;
             }
+            "maturity_result" => {
+                if !saw_start || saw_maturity || saw_end {
+                    return Err("R13 replay invalid maturity_result lifecycle".to_owned());
+                }
+
+                let payload = required_object(&record, "payload")?;
+
+                if required_str(payload, "policy_id")? != MATURITY_POLICY_ID {
+                    return Err("R13 replay maturity policy mismatch".to_owned());
+                }
+
+                required_u64(payload, "required_end_slot")?;
+                optional_u64(payload, "initial_confirmed_tip")?;
+                let final_tip = optional_u64(payload, "final_confirmed_tip")?;
+                let poll_attempts = required_u64(payload, "poll_attempts")?;
+                let rpc_error_count = required_u64(payload, "rpc_error_count")?;
+                required_u64(payload, "wait_elapsed_ms")?;
+
+                if poll_attempts == 0 || rpc_error_count > poll_attempts {
+                    return Err("R13 replay maturity poll counts invalid".to_owned());
+                }
+
+                let reached = required_bool(payload, "maturity_reached")?;
+                let status = required_str(payload, "status")?;
+
+                if reached && status != "mature" {
+                    return Err("R13 replay maturity status/reached mismatch".to_owned());
+                }
+
+                if !reached && status != "window_not_mature" {
+                    return Err("R13 replay immature status/reached mismatch".to_owned());
+                }
+
+                let required_end_slot = required_u64(payload, "required_end_slot")?;
+
+                if reached {
+                    let final_tip = final_tip.ok_or_else(|| {
+                        "R13 replay mature evidence missing final confirmed tip".to_owned()
+                    })?;
+
+                    if final_tip < required_end_slot {
+                        return Err(
+                            "R13 replay mature evidence ends below required slot".to_owned()
+                        );
+                    }
+                } else if final_tip.is_some_and(|slot| slot >= required_end_slot) {
+                    return Err(
+                        "R13 replay window_not_mature despite final tip reaching required slot"
+                            .to_owned(),
+                    );
+                }
+
+                saw_maturity = true;
+                maturity_reached = Some(reached);
+            }
             "route_search_result" => {
-                if !saw_start || saw_end {
+                if !saw_start || !saw_maturity || saw_end {
                     return Err("R13 replay route_search_result outside lifecycle".to_owned());
+                }
+
+                if maturity_reached != Some(true) {
+                    return Err(
+                        "R13 replay route search exists before evidence window matured".to_owned()
+                    );
                 }
 
                 route_results += 1;
 
-                validate_status(required_str(
-                    required_object(&record, "payload")?,
-                    "status",
-                )?)?;
+                let payload = required_object(&record, "payload")?;
+                let status = required_str(payload, "status")?;
+                validate_route_status(status)?;
+
+                match status {
+                    "search_incomplete" => search_incomplete_count += 1,
+                    "no_atomic_match_complete" => no_atomic_match_complete_count += 1,
+                    "atomic_route_match" => atomic_route_match_count += 1,
+                    "atomic_route_amounts_unresolved" => {
+                        atomic_route_amounts_unresolved_count += 1
+                    }
+                    "atomic_route_outcome_resolved" => {
+                        atomic_route_outcome_resolved_count += 1
+                    }
+                    _ => {}
+                }
+
+                let count = required_u64(payload, "intersecting_signature_count")? as usize;
+                let signatures = required_array(payload, "intersecting_signatures")?;
+
+                if signatures.len() != count {
+                    return Err(
+                        "R13 replay intersecting signature count does not match retained signatures"
+                            .to_owned(),
+                    );
+                }
+
+                let mut unique_signatures = BTreeSet::new();
+
+                for signature in signatures {
+                    let signature = signature.as_str().ok_or_else(|| {
+                        "R13 replay intersecting signature was not a string".to_owned()
+                    })?;
+
+                    if !unique_signatures.insert(signature.to_owned()) {
+                        return Err(
+                            "R13 replay duplicate retained intersecting signature".to_owned()
+                        );
+                    }
+                }
             }
             "transaction_match" => {
-                if !saw_start || saw_end {
+                if !saw_start || !saw_maturity || saw_end {
                     return Err("R13 replay transaction_match outside lifecycle".to_owned());
+                }
+
+                if maturity_reached != Some(true) {
+                    return Err(
+                        "R13 replay transaction match exists before evidence window matured"
+                            .to_owned(),
+                    );
                 }
 
                 transaction_matches += 1;
@@ -1417,15 +1767,37 @@ pub fn validate_r13_jsonl(
                 required_object(payload, "transaction")?;
             }
             "candidate_annotation" => {
-                if !saw_start || saw_end {
+                if !saw_start || !saw_maturity || saw_end {
                     return Err("R13 replay candidate_annotation outside lifecycle".to_owned());
                 }
 
                 candidate_annotations += 1;
 
                 let payload = required_object(&record, "payload")?;
+                let status = required_str(payload, "captureability_status")?;
+                validate_candidate_status(status)?;
 
-                validate_status(required_str(payload, "captureability_status")?)?;
+                match maturity_reached {
+                    Some(true) if status == "window_not_mature" => {
+                        return Err(
+                            "R13 replay mature run contains window_not_mature candidate"
+                                .to_owned(),
+                        )
+                    }
+                    Some(false) if status != "window_not_mature" => {
+                        return Err(
+                            "R13 replay immature run contains post-search candidate status"
+                                .to_owned(),
+                        )
+                    }
+                    Some(false) => window_not_mature_candidate_count += 1,
+                    Some(true) => {}
+                    None => {
+                        return Err(
+                            "R13 replay candidate annotation preceded maturity result".to_owned()
+                        )
+                    }
+                }
 
                 let source = required_object(payload, "source_r12")?;
 
@@ -1441,19 +1813,38 @@ pub fn validate_r13_jsonl(
                 }
             }
             "forensics_run_end" => {
-                if !saw_start || saw_end {
+                if !saw_start || !saw_maturity || saw_end {
                     return Err("R13 replay invalid run_end lifecycle".to_owned());
                 }
 
                 saw_end = true;
 
                 let payload = required_object(&record, "payload")?;
+                let final_maturity_reached = required_bool(payload, "maturity_reached")?;
+
+                if Some(final_maturity_reached) != maturity_reached {
+                    return Err("R13 replay final maturity state mismatch".to_owned());
+                }
 
                 if required_u64(payload, "route_count")? as usize != expected_route_count
+                    || required_u64(payload, "route_search_result_count")? as usize
+                        != route_results
                     || required_u64(payload, "candidate_annotation_count")? as usize
                         != expected_candidate_count
                     || required_u64(payload, "transaction_match_count")? as usize
                         != transaction_matches
+                    || required_u64(payload, "search_incomplete_count")? as usize
+                        != search_incomplete_count
+                    || required_u64(payload, "no_atomic_match_complete_count")? as usize
+                        != no_atomic_match_complete_count
+                    || required_u64(payload, "atomic_route_match_count")? as usize
+                        != atomic_route_match_count
+                    || required_u64(payload, "atomic_route_amounts_unresolved_count")? as usize
+                        != atomic_route_amounts_unresolved_count
+                    || required_u64(payload, "atomic_route_outcome_resolved_count")? as usize
+                        != atomic_route_outcome_resolved_count
+                    || required_u64(payload, "window_not_mature_candidate_count")? as usize
+                        != window_not_mature_candidate_count
                 {
                     return Err("R13 replay final counts mismatch".to_owned());
                 }
@@ -1462,14 +1853,30 @@ pub fn validate_r13_jsonl(
         }
     }
 
-    if !saw_start || !saw_end {
+    if !saw_start || !saw_maturity || !saw_end {
         return Err("R13 replay incomplete lifecycle".to_owned());
     }
 
-    if route_results != expected_route_count {
-        return Err(format!(
-            "R13 replay route result count mismatch: expected={expected_route_count} actual={route_results}"
-        ));
+    match maturity_reached {
+        Some(true) if route_results != expected_route_count => {
+            return Err(format!(
+                "R13 replay mature route result count mismatch: expected={expected_route_count} actual={route_results}"
+            ))
+        }
+        Some(false) if route_results != 0 => {
+            return Err(
+                "R13 replay immature evidence must contain zero route_search_result records"
+                    .to_owned(),
+            )
+        }
+        Some(false) if transaction_matches != 0 => {
+            return Err(
+                "R13 replay immature evidence must contain zero transaction_match records"
+                    .to_owned(),
+            )
+        }
+        Some(_) => {}
+        None => return Err("R13 replay maturity result unavailable".to_owned()),
     }
 
     if candidate_annotations != expected_candidate_count
@@ -1480,10 +1887,18 @@ pub fn validate_r13_jsonl(
         ));
     }
 
+    if maturity_reached == Some(false)
+        && window_not_mature_candidate_count != expected_candidate_count
+    {
+        return Err(format!(
+            "R13 replay immature candidate coverage mismatch: expected={expected_candidate_count} actual={window_not_mature_candidate_count}"
+        ));
+    }
+
     Ok(())
 }
 
-fn validate_status(status: &str) -> Result<(), String> {
+fn validate_route_status(status: &str) -> Result<(), String> {
     match status {
         "search_incomplete"
         | "no_atomic_match_complete"
@@ -1491,6 +1906,14 @@ fn validate_status(status: &str) -> Result<(), String> {
         | "atomic_route_amounts_unresolved"
         | "atomic_route_outcome_resolved" => Ok(()),
         other => Err(format!("R13 unsupported captureability status {other}")),
+    }
+}
+
+fn validate_candidate_status(status: &str) -> Result<(), String> {
+    if status == "window_not_mature" {
+        Ok(())
+    } else {
+        validate_route_status(status)
     }
 }
 
@@ -1541,6 +1964,13 @@ fn required_object<'a>(value: &'a Value, field: &str) -> Result<&'a Value, Strin
         .ok_or_else(|| format!("R13 missing or invalid object field {field}"))
 }
 
+fn required_array<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>, String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("R13 missing or invalid array field {field}"))
+}
+
 fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
     value
         .get(field)
@@ -1553,6 +1983,13 @@ fn required_u64(value: &Value, field: &str) -> Result<u64, String> {
         .get(field)
         .and_then(Value::as_u64)
         .ok_or_else(|| format!("R13 missing or invalid u64 field {field}"))
+}
+
+fn required_bool(value: &Value, field: &str) -> Result<bool, String> {
+    value
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("R13 missing or invalid bool field {field}"))
 }
 
 fn optional_u64(value: &Value, field: &str) -> Result<Option<u64>, String> {
@@ -1600,12 +2037,122 @@ mod tests {
         }
     }
 
+    fn candidate(route: RouteEvidence) -> CandidateEvidence {
+        CandidateEvidence {
+            source_run_id: "source-run".to_owned(),
+            source_record_sequence: 2,
+            candidate_id: "candidate".to_owned(),
+            source_status: "economics_unresolved".to_owned(),
+            usd_size: 10,
+            candidate_found_at_unix_ms: 1000,
+            quote_complete_at_unix_ms: Some(1001),
+            economics_complete_at_unix_ms: Some(1002),
+            hypothetical_ready_at_unix_ms: None,
+            route,
+        }
+    }
+
+    fn plan_with_candidate() -> Result<ForensicsPlan, String> {
+        let route = route();
+        let left_request = route.history_request(&route.leg_1)?;
+        let right_request = route.history_request(&route.leg_2)?;
+
+        Ok(ForensicsPlan {
+            source_path: PathBuf::from("source"),
+            source_run_id: "source-run".to_owned(),
+            source_github_actions: json!({}),
+            candidates: vec![candidate(route.clone())],
+            routes: BTreeMap::from([("route".to_owned(), route)]),
+            history_requests: vec![left_request, right_request],
+        })
+    }
+
     #[test]
     fn search_window_uses_maximum_leg_slot() -> Result<(), String> {
         let route = route();
 
         assert_eq!(route.start_slot(), 101);
         assert_eq!(route.end_slot()?, 133);
+
+        Ok(())
+    }
+
+    #[test]
+    fn plan_required_end_slot_is_maximum_route_end() -> Result<(), String> {
+        let mut second = route();
+        second.route_id = "route-two".to_owned();
+        second.leg_1.source_slot = 150;
+        second.leg_2.source_slot = 149;
+
+        let first = route();
+
+        let plan = ForensicsPlan {
+            source_path: PathBuf::from("source"),
+            source_run_id: "run".to_owned(),
+            source_github_actions: json!({}),
+            candidates: Vec::new(),
+            routes: BTreeMap::from([
+                ("route".to_owned(), first),
+                ("route-two".to_owned(), second),
+            ]),
+            history_requests: Vec::new(),
+        };
+
+        assert_eq!(plan.required_end_slot()?, 182);
+
+        Ok(())
+    }
+
+    #[test]
+    fn maturity_contract_distinguishes_window_not_mature() -> Result<(), String> {
+        let plan = plan_with_candidate()?;
+
+        let immature = EvidenceMaturity {
+            required_end_slot: 133,
+            initial_confirmed_tip: Some(102),
+            final_confirmed_tip: Some(120),
+            poll_attempts: 5,
+            rpc_error_count: 0,
+            wait_elapsed_ms: 2000,
+            maturity_reached: false,
+        };
+
+        immature.validate_for_plan(&plan)?;
+        assert_eq!(immature.status(), "window_not_mature");
+        assert!(immature.reason().is_some());
+
+        let mature = EvidenceMaturity {
+            required_end_slot: 133,
+            initial_confirmed_tip: Some(102),
+            final_confirmed_tip: Some(133),
+            poll_attempts: 8,
+            rpc_error_count: 1,
+            wait_elapsed_ms: 3500,
+            maturity_reached: true,
+        };
+
+        mature.validate_for_plan(&plan)?;
+        assert_eq!(mature.status(), "mature");
+        assert!(mature.reason().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn maturity_contract_rejects_false_immaturity() -> Result<(), String> {
+        let plan = plan_with_candidate()?;
+
+        let maturity = EvidenceMaturity {
+            required_end_slot: 133,
+            initial_confirmed_tip: Some(102),
+            final_confirmed_tip: Some(134),
+            poll_attempts: 8,
+            rpc_error_count: 0,
+            wait_elapsed_ms: 3500,
+            maturity_reached: false,
+        };
+
+        assert!(maturity.validate_for_plan(&plan).is_err());
 
         Ok(())
     }
@@ -1769,12 +2316,183 @@ mod tests {
     }
 
     #[test]
-    fn status_vocabulary_is_closed() {
-        assert!(validate_status("search_incomplete").is_ok());
-        assert!(validate_status("no_atomic_match_complete").is_ok());
-        assert!(validate_status("atomic_route_match").is_ok());
-        assert!(validate_status("atomic_route_amounts_unresolved").is_ok());
-        assert!(validate_status("atomic_route_outcome_resolved").is_ok());
-        assert!(validate_status("profitable_winner").is_err());
+    fn immature_artifact_contains_no_route_search_results() -> Result<(), String> {
+        let plan = plan_with_candidate()?;
+        let maturity = EvidenceMaturity {
+            required_end_slot: 133,
+            initial_confirmed_tip: Some(102),
+            final_confirmed_tip: Some(120),
+            poll_attempts: 5,
+            rpc_error_count: 0,
+            wait_elapsed_ms: 2000,
+            maturity_reached: false,
+        };
+
+        let directory = env::temp_dir().join(format!(
+            "r13-forensics-immature-test-{}-{}",
+            process::id(),
+            unix_time_ms_now()?
+        ));
+
+        if directory.exists() {
+            fs::remove_dir_all(&directory)
+                .map_err(|error| format!("could not clear R13 test directory: {error}"))?;
+        }
+
+        let result =
+            write_forensics_artifact_in_directory(&directory, &plan, &maturity, None, None)?;
+
+        assert!(!result.maturity_reached);
+        assert_eq!(result.window_not_mature_candidate_count, 1);
+
+        let text = fs::read_to_string(&result.output_path)
+            .map_err(|error| format!("could not read R13 immature test artifact: {error}"))?;
+
+        let mut maturity_results = 0usize;
+        let mut route_results = 0usize;
+        let mut immature_annotations = 0usize;
+
+        for line in text.lines() {
+            let record: Value = serde_json::from_str(line)
+                .map_err(|error| format!("could not parse R13 immature test artifact: {error}"))?;
+
+            match required_str(&record, "event_type")? {
+                "maturity_result" => maturity_results += 1,
+                "route_search_result" => route_results += 1,
+                "candidate_annotation" => {
+                    let payload = required_object(&record, "payload")?;
+                    if required_str(payload, "captureability_status")? == "window_not_mature" {
+                        immature_annotations += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(maturity_results, 1);
+        assert_eq!(route_results, 0);
+        assert_eq!(immature_annotations, 1);
+
+        fs::remove_dir_all(&directory)
+            .map_err(|error| format!("could not remove R13 test directory: {error}"))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn mature_artifact_retains_exact_intersecting_signatures() -> Result<(), String> {
+        let plan = plan_with_candidate()?;
+
+        let maturity = EvidenceMaturity {
+            required_end_slot: 133,
+            initial_confirmed_tip: Some(102),
+            final_confirmed_tip: Some(133),
+            poll_attempts: 8,
+            rpc_error_count: 0,
+            wait_elapsed_ms: 3500,
+            maturity_reached: true,
+        };
+
+        let intersections = IntersectionPlan {
+            routes: BTreeMap::from([(
+                "route".to_owned(),
+                RouteIntersection {
+                    route_id: "route".to_owned(),
+                    signatures: BTreeSet::from([
+                        "signature-a".to_owned(),
+                        "signature-b".to_owned(),
+                    ]),
+                    complete: true,
+                    incomplete_reason: None,
+                },
+            )]),
+            required_signatures: BTreeSet::from([
+                "signature-a".to_owned(),
+                "signature-b".to_owned(),
+            ]),
+        };
+
+        let analyses = BTreeMap::from([(
+            "route".to_owned(),
+            RouteAnalysis {
+                route_id: "route".to_owned(),
+                status: "no_atomic_match_complete".to_owned(),
+                reason: Some(
+                    "intersecting signatures existed but none proved both exact supported route legs"
+                        .to_owned(),
+                ),
+                matches: Vec::new(),
+            },
+        )]);
+
+        let directory = env::temp_dir().join(format!(
+            "r13-forensics-mature-test-{}-{}",
+            process::id(),
+            unix_time_ms_now()?
+        ));
+
+        if directory.exists() {
+            fs::remove_dir_all(&directory)
+                .map_err(|error| format!("could not clear R13 test directory: {error}"))?;
+        }
+
+        let result = write_forensics_artifact_in_directory(
+            &directory,
+            &plan,
+            &maturity,
+            Some(&intersections),
+            Some(&analyses),
+        )?;
+
+        assert!(result.maturity_reached);
+
+        let text = fs::read_to_string(&result.output_path)
+            .map_err(|error| format!("could not read R13 mature test artifact: {error}"))?;
+
+        let mut retained = BTreeSet::new();
+
+        for line in text.lines() {
+            let record: Value = serde_json::from_str(line)
+                .map_err(|error| format!("could not parse R13 mature test artifact: {error}"))?;
+
+            if required_str(&record, "event_type")? != "route_search_result" {
+                continue;
+            }
+
+            let payload = required_object(&record, "payload")?;
+            for signature in required_array(payload, "intersecting_signatures")? {
+                retained.insert(
+                    signature
+                        .as_str()
+                        .ok_or_else(|| {
+                            "R13 mature test retained non-string signature".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+        }
+
+        assert_eq!(
+            retained,
+            BTreeSet::from(["signature-a".to_owned(), "signature-b".to_owned()])
+        );
+
+        fs::remove_dir_all(&directory)
+            .map_err(|error| format!("could not remove R13 test directory: {error}"))?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn status_vocabularies_keep_maturity_separate_from_route_search() {
+        assert!(validate_route_status("search_incomplete").is_ok());
+        assert!(validate_route_status("no_atomic_match_complete").is_ok());
+        assert!(validate_route_status("atomic_route_match").is_ok());
+        assert!(validate_route_status("atomic_route_amounts_unresolved").is_ok());
+        assert!(validate_route_status("atomic_route_outcome_resolved").is_ok());
+
+        assert!(validate_route_status("window_not_mature").is_err());
+        assert!(validate_candidate_status("window_not_mature").is_ok());
+        assert!(validate_candidate_status("profitable_winner").is_err());
     }
 }
