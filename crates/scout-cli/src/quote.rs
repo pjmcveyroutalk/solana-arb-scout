@@ -717,9 +717,9 @@ mod tests {
         };
 
         let ray_capabilities =
-            with_quote_adapter(&ray_context, ExactInputQuoteAdapter::capabilities);
+            with_quote_adapter(&ray_context, |adapter| adapter.capabilities());
         let pump_capabilities =
-            with_quote_adapter(&pump_context, ExactInputQuoteAdapter::capabilities);
+            with_quote_adapter(&pump_context, |adapter| adapter.capabilities());
 
         assert_eq!(
             ray_capabilities,
