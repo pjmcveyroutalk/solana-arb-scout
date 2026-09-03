@@ -418,7 +418,9 @@ pub fn intersect_route_histories(
                     route_id: route.route_id.clone(),
                     signatures: BTreeSet::new(),
                     complete: false,
-                    incomplete_reason: Some("one or both exact pool histories are unavailable".to_owned()),
+                    incomplete_reason: Some(
+                        "one or both exact pool histories are unavailable".to_owned(),
+                    ),
                 },
             );
             continue;
@@ -442,8 +444,8 @@ pub fn intersect_route_histories(
             continue;
         }
 
-        let left_signatures = successful_signatures(left);
-        let right_signatures = successful_signatures(right);
+        let left_signatures = observed_signatures(left);
+        let right_signatures = observed_signatures(right);
         let signatures = left_signatures
             .intersection(&right_signatures)
             .cloned()
@@ -467,11 +469,10 @@ pub fn intersect_route_histories(
     })
 }
 
-fn successful_signatures(history: &AddressHistory) -> BTreeSet<String> {
+fn observed_signatures(history: &AddressHistory) -> BTreeSet<String> {
     history
         .observations
         .iter()
-        .filter(|observation| observation.succeeded)
         .map(|observation| observation.signature.clone())
         .collect()
 }
@@ -633,13 +634,8 @@ fn match_transaction(
     let fee_lamports = required_u64(meta, "fee")?;
     let compute_units_consumed = optional_u64(meta, "computeUnitsConsumed")?;
 
-    let amount_evidence = reconstruct_amount_evidence(
-        route,
-        &first,
-        &second,
-        meta,
-        &account_keys,
-    )?;
+    let amount_evidence =
+        reconstruct_amount_evidence(route, &first, &second, meta, &account_keys)?;
 
     Ok(Some(TransactionMatch {
         signature: evidence.signature.clone(),
@@ -692,6 +688,11 @@ fn match_leg(
             }))
         }
         "pumpswap" => {
+            // Current official PumpSwap IDL keeps the route-critical prefix stable:
+            // pool[0], user[1], global_config[2], base_mint[3], quote_mint[4],
+            // user_base_token_account[5], user_quote_token_account[6],
+            // pool_base_token_account[7], pool_quote_token_account[8].
+            // Later fee/cashback accounts are intentionally not count-pinned here.
             if instruction.account_keys.len() < 9 || instruction.account_keys[0] != leg.pool_id {
                 return Ok(None);
             }
@@ -1107,9 +1108,12 @@ fn write_forensics_artifact_in_directory(
     }
 
     for candidate in &plan.candidates {
-        let analysis = analyses
-            .get(&candidate.route.route_id)
-            .ok_or_else(|| format!("R13 missing candidate route analysis {}", candidate.route.route_id))?;
+        let analysis = analyses.get(&candidate.route.route_id).ok_or_else(|| {
+            format!(
+                "R13 missing candidate route analysis {}",
+                candidate.route.route_id
+            )
+        })?;
         writer.write_event(
             "candidate_annotation",
             unix_time_ms_now()?,
@@ -1184,7 +1188,9 @@ impl R13Writer {
         if self.records_written >= MAX_RECORDS_PER_RUN {
             return Err("R13 recorder capacity exhausted".to_owned());
         }
-        if event_type != "forensics_run_end" && self.records_written >= MAX_RECORDS_PER_RUN - 1 {
+        if event_type != "forensics_run_end"
+            && self.records_written >= MAX_RECORDS_PER_RUN - 1
+        {
             return Err("R13 recorder capacity reserved for forensics_run_end".to_owned());
         }
         let record = json!({
@@ -1251,7 +1257,10 @@ pub fn validate_r13_jsonl(
     let mut transaction_matches = 0usize;
     let mut annotated_candidates = BTreeSet::new();
 
-    for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
         let record: Value = serde_json::from_slice(line)
             .map_err(|error| format!("R13 replay malformed JSON: {error}"))?;
         if required_str(&record, "schema_version")? != R13_SCHEMA_VERSION {
@@ -1403,10 +1412,7 @@ fn leg_json(leg: &LegEvidence) -> Value {
 fn build_run_id(now_ms: u64) -> String {
     let gha_run = env_nonempty("GITHUB_RUN_ID").unwrap_or_else(|| "local".to_owned());
     let gha_attempt = env_nonempty("GITHUB_RUN_ATTEMPT").unwrap_or_else(|| "0".to_owned());
-    format!(
-        "r13-{gha_run}-{gha_attempt}-{now_ms}-{}",
-        process::id()
-    )
+    format!("r13-{gha_run}-{gha_attempt}-{now_ms}-{}", process::id())
 }
 
 fn unix_time_ms_now() -> Result<u64, String> {
@@ -1418,7 +1424,9 @@ fn unix_time_ms_now() -> Result<u64, String> {
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.trim().is_empty())
+    env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn required_object<'a>(value: &'a Value, field: &str) -> Result<&'a Value, String> {
@@ -1506,8 +1514,10 @@ mod tests {
                 .map(|signature| SignatureObservation {
                     signature: (*signature).to_owned(),
                     slot: 110,
-                    succeeded: true,
+                    err: Value::Null,
+                    memo: None,
                     block_time: None,
+                    confirmation_status: Some("confirmed".to_owned()),
                 })
                 .collect(),
             complete_through_start_slot: true,
@@ -1525,8 +1535,14 @@ mod tests {
         let acquisition = HistoryAcquisition {
             confirmed_tip_slot: Some(200),
             histories: BTreeMap::from([
-                (left_request.clone(), history(left_request, &["shared", "left"])),
-                (right_request.clone(), history(right_request, &["shared", "right"])),
+                (
+                    left_request.clone(),
+                    history(left_request, &["shared", "left"]),
+                ),
+                (
+                    right_request.clone(),
+                    history(right_request, &["shared", "right"]),
+                ),
             ]),
             incomplete_reasons: Vec::new(),
         };
