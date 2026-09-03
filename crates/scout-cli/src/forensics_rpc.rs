@@ -497,7 +497,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signature_parser_preserves_raw_rpc_evidence() {
+    fn signature_parser_preserves_raw_rpc_evidence() -> Result<(), String> {
         let error = json!({"InstructionError": [1, {"Custom": 6001}]});
         let value = json!({
             "signature": "sig",
@@ -508,7 +508,7 @@ mod tests {
             "confirmationStatus": "confirmed"
         });
 
-        let observation = parse_signature_observation(&value).expect("signature must parse");
+        let observation = parse_signature_observation(&value)?;
         assert_eq!(observation.signature, "sig");
         assert_eq!(observation.slot, 123);
         assert_eq!(observation.err, error);
@@ -518,10 +518,12 @@ mod tests {
             observation.confirmation_status.as_deref(),
             Some("confirmed")
         );
+
+        Ok(())
     }
 
     #[test]
-    fn signature_parser_preserves_null_error() {
+    fn signature_parser_preserves_null_error() -> Result<(), String> {
         let value = json!({
             "signature": "sig",
             "slot": 123,
@@ -531,11 +533,13 @@ mod tests {
             "confirmationStatus": null
         });
 
-        let observation = parse_signature_observation(&value).expect("signature must parse");
+        let observation = parse_signature_observation(&value)?;
         assert!(observation.err.is_null());
         assert_eq!(observation.memo, None);
         assert_eq!(observation.block_time, Some(1_700_000_000));
         assert_eq!(observation.confirmation_status, None);
+
+        Ok(())
     }
 
     #[test]
