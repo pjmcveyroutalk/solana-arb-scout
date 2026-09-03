@@ -335,7 +335,11 @@ async fn fetch_address_history(
             .ok_or_else(|| "signature page unexpectedly empty".to_owned())?;
         let oldest_slot = required_u64(oldest, "slot")?;
 
-        if oldest_slot <= request.start_slot {
+        // The requested lower bound is inclusive. If a full page ends exactly
+        // on start_slot, additional signatures from that same slot may still
+        // exist on the next page. Only a slot strictly below start_slot proves
+        // that the inclusive lower boundary has been fully crossed.
+        if oldest_slot < request.start_slot {
             complete = true;
             break;
         }
