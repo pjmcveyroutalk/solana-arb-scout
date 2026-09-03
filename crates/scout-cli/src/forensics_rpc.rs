@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const SIGNATURE_PAGE_LIMIT: usize = 100;
 pub const MAX_SIGNATURE_PAGES_PER_ADDRESS: usize = 2;
 pub const MAX_TRANSACTION_FETCHES: usize = 32;
+pub const MAX_BLOCK_TRANSACTIONS: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HistoryRequest {
@@ -63,6 +64,37 @@ pub struct TransactionAcquisition {
 impl TransactionAcquisition {
     pub fn is_complete(&self) -> bool {
         self.incomplete_reasons.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockTransactionEvidence {
+    pub block_index: usize,
+    pub signature: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockEvidence {
+    pub slot: u64,
+    pub blockhash: String,
+    pub previous_blockhash: String,
+    pub parent_slot: u64,
+    pub block_time: Option<i64>,
+    pub target_signature: String,
+    pub target_block_index: usize,
+    pub transactions: Vec<BlockTransactionEvidence>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockAcquisition {
+    pub block: Option<BlockEvidence>,
+    pub incomplete_reasons: Vec<String>,
+}
+
+impl BlockAcquisition {
+    pub fn is_complete(&self) -> bool {
+        self.block.is_some() && self.incomplete_reasons.is_empty()
     }
 }
 
@@ -275,6 +307,42 @@ pub async fn acquire_transactions(
     acquisition
 }
 
+pub async fn acquire_block_for_signature(
+    client: &Client,
+    rpc_url: &str,
+    slot: u64,
+    target_signature: &str,
+) -> BlockAcquisition {
+    let mut acquisition = BlockAcquisition {
+        block: None,
+        incomplete_reasons: Vec::new(),
+    };
+
+    if target_signature.trim().is_empty() {
+        acquisition
+            .incomplete_reasons
+            .push("R14 block target signature must not be empty".to_owned());
+        return acquisition;
+    }
+
+    match fetch_block(client, rpc_url, slot).await {
+        Ok(Some(value)) => match parse_block_evidence(slot, target_signature, &value) {
+            Ok(block) => acquisition.block = Some(block),
+            Err(error) => acquisition
+                .incomplete_reasons
+                .push(format!("R14 block evidence invalid: {error}")),
+        },
+        Ok(None) => acquisition.incomplete_reasons.push(format!(
+            "getBlock returned null for requested slot {slot}"
+        )),
+        Err(error) => acquisition.incomplete_reasons.push(format!(
+            "getBlock failed for requested slot {slot}: {error}"
+        )),
+    }
+
+    acquisition
+}
+
 pub async fn fetch_confirmed_slot(client: &Client, rpc_url: &str) -> Result<u64, String> {
     let result = rpc_request(
         client,
@@ -420,6 +488,123 @@ async fn fetch_transaction(
     }
 }
 
+async fn fetch_block(
+    client: &Client,
+    rpc_url: &str,
+    slot: u64,
+) -> Result<Option<Value>, String> {
+    let result = rpc_request(
+        client,
+        rpc_url,
+        "getBlock",
+        json!([
+            slot,
+            {
+                "commitment": "confirmed",
+                "encoding": "json",
+                "transactionDetails": "full",
+                "rewards": false,
+                "maxSupportedTransactionVersion": 0
+            }
+        ]),
+    )
+    .await?;
+
+    if result.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(result))
+    }
+}
+
+fn parse_block_evidence(
+    slot: u64,
+    target_signature: &str,
+    value: &Value,
+) -> Result<BlockEvidence, String> {
+    if target_signature.trim().is_empty() {
+        return Err("target signature must not be empty".to_owned());
+    }
+
+    let blockhash = required_str(value, "blockhash")?.to_owned();
+    let previous_blockhash = required_str(value, "previousBlockhash")?.to_owned();
+    let parent_slot = required_u64(value, "parentSlot")?;
+    let block_time = optional_i64(value, "blockTime")?;
+
+    let transactions = value
+        .get("transactions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "getBlock result missing transactions array".to_owned())?;
+
+    if transactions.len() > MAX_BLOCK_TRANSACTIONS {
+        return Err(format!(
+            "block transaction cap exceeded: count={} cap={MAX_BLOCK_TRANSACTIONS}",
+            transactions.len()
+        ));
+    }
+
+    let mut transaction_evidence = Vec::with_capacity(transactions.len());
+    let mut target_block_index: Option<usize> = None;
+
+    for (block_index, transaction_value) in transactions.iter().enumerate() {
+        let transaction = transaction_value
+            .get("transaction")
+            .ok_or_else(|| format!("block transaction {block_index} missing transaction"))?;
+
+        let signatures = transaction
+            .get("signatures")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!("block transaction {block_index} missing signatures array")
+            })?;
+
+        let signature = signatures
+            .first()
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("block transaction {block_index} missing primary signature")
+            })?;
+
+        if signature.trim().is_empty() {
+            return Err(format!(
+                "block transaction {block_index} primary signature was empty"
+            ));
+        }
+
+        if signature == target_signature {
+            if target_block_index.is_some() {
+                return Err(format!(
+                    "target signature appeared more than once in requested block: {target_signature}"
+                ));
+            }
+            target_block_index = Some(block_index);
+        }
+
+        transaction_evidence.push(BlockTransactionEvidence {
+            block_index,
+            signature: signature.to_owned(),
+            value: transaction_value.clone(),
+        });
+    }
+
+    let target_block_index = target_block_index.ok_or_else(|| {
+        format!(
+            "target signature was not present in requested block: slot={slot} signature={target_signature}"
+        )
+    })?;
+
+    Ok(BlockEvidence {
+        slot,
+        blockhash,
+        previous_blockhash,
+        parent_slot,
+        block_time,
+        target_signature: target_signature.to_owned(),
+        target_block_index,
+        transactions: transaction_evidence,
+    })
+}
+
 async fn rpc_request(
     client: &Client,
     rpc_url: &str,
@@ -495,6 +680,39 @@ fn optional_string(value: &Value, field: &str) -> Result<Option<String>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_block(transactions: Vec<Value>) -> Value {
+        json!({
+            "blockhash": "blockhash",
+            "previousBlockhash": "previous-blockhash",
+            "parentSlot": 122,
+            "blockTime": 1_700_000_000,
+            "transactions": transactions
+        })
+    }
+
+    fn test_block_transaction(signature: &str) -> Value {
+        json!({
+            "meta": {
+                "err": null,
+                "fee": 5_000
+            },
+            "transaction": {
+                "message": {
+                    "accountKeys": [],
+                    "header": {
+                        "numRequiredSignatures": 1,
+                        "numReadonlySignedAccounts": 0,
+                        "numReadonlyUnsignedAccounts": 0
+                    },
+                    "instructions": [],
+                    "recentBlockhash": "recent-blockhash"
+                },
+                "signatures": [signature]
+            },
+            "version": "legacy"
+        })
+    }
 
     #[test]
     fn signature_parser_preserves_raw_rpc_evidence() -> Result<(), String> {
@@ -620,5 +838,123 @@ mod tests {
             incomplete_reasons: Vec::new(),
         };
         assert!(acquisition.is_complete());
+    }
+
+    #[test]
+    fn block_acquisition_requires_evidence_and_no_incomplete_reason() {
+        let incomplete = BlockAcquisition {
+            block: None,
+            incomplete_reasons: Vec::new(),
+        };
+        assert!(!incomplete.is_complete());
+
+        let block = parse_block_evidence(
+            123,
+            "target",
+            &test_block(vec![test_block_transaction("target")]),
+        )
+        .expect("fixture must parse");
+
+        let complete = BlockAcquisition {
+            block: Some(block),
+            incomplete_reasons: Vec::new(),
+        };
+        assert!(complete.is_complete());
+
+        let unresolved = BlockAcquisition {
+            block: complete.block,
+            incomplete_reasons: vec!["unresolved".to_owned()],
+        };
+        assert!(!unresolved.is_complete());
+    }
+
+    #[test]
+    fn block_parser_preserves_order_and_locates_target() -> Result<(), String> {
+        let block = test_block(vec![
+            test_block_transaction("first"),
+            test_block_transaction("target"),
+            test_block_transaction("third"),
+        ]);
+
+        let evidence = parse_block_evidence(123, "target", &block)?;
+
+        assert_eq!(evidence.slot, 123);
+        assert_eq!(evidence.blockhash, "blockhash");
+        assert_eq!(evidence.previous_blockhash, "previous-blockhash");
+        assert_eq!(evidence.parent_slot, 122);
+        assert_eq!(evidence.block_time, Some(1_700_000_000));
+        assert_eq!(evidence.target_signature, "target");
+        assert_eq!(evidence.target_block_index, 1);
+        assert_eq!(evidence.transactions.len(), 3);
+        assert_eq!(evidence.transactions[0].block_index, 0);
+        assert_eq!(evidence.transactions[0].signature, "first");
+        assert_eq!(evidence.transactions[1].block_index, 1);
+        assert_eq!(evidence.transactions[1].signature, "target");
+        assert_eq!(evidence.transactions[2].block_index, 2);
+        assert_eq!(evidence.transactions[2].signature, "third");
+
+        Ok(())
+    }
+
+    #[test]
+    fn block_parser_rejects_missing_target() {
+        let block = test_block(vec![
+            test_block_transaction("first"),
+            test_block_transaction("second"),
+        ]);
+
+        assert!(parse_block_evidence(123, "target", &block).is_err());
+    }
+
+    #[test]
+    fn block_parser_rejects_duplicate_target() {
+        let block = test_block(vec![
+            test_block_transaction("target"),
+            test_block_transaction("target"),
+        ]);
+
+        assert!(parse_block_evidence(123, "target", &block).is_err());
+    }
+
+    #[test]
+    fn block_parser_rejects_missing_transaction_array() {
+        let block = json!({
+            "blockhash": "blockhash",
+            "previousBlockhash": "previous-blockhash",
+            "parentSlot": 122,
+            "blockTime": null
+        });
+
+        assert!(parse_block_evidence(123, "target", &block).is_err());
+    }
+
+    #[test]
+    fn block_parser_rejects_malformed_primary_signature() {
+        let block = test_block(vec![json!({
+            "meta": {"err": null},
+            "transaction": {
+                "message": {},
+                "signatures": []
+            },
+            "version": "legacy"
+        })]);
+
+        assert!(parse_block_evidence(123, "target", &block).is_err());
+    }
+
+    #[test]
+    fn block_parser_rejects_empty_target_signature() {
+        let block = test_block(vec![test_block_transaction("target")]);
+
+        assert!(parse_block_evidence(123, "", &block).is_err());
+    }
+
+    #[test]
+    fn block_parser_fails_closed_above_transaction_cap() {
+        let transactions =
+            vec![test_block_transaction("other"); MAX_BLOCK_TRANSACTIONS + 1];
+        let block = test_block(transactions);
+
+        assert!(parse_block_evidence(123, "target", &block).is_err());
     }
 }
