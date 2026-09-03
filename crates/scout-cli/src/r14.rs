@@ -389,6 +389,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[allow(clippy::too_many_arguments)]
     fn block_transaction(
         block_index: usize,
         signature: &str,
