@@ -927,8 +927,7 @@ mod tests {
 
     #[test]
     fn transaction_metadata_is_preserved() -> Result<(), String> {
-        let evidence =
-            block_transaction(4, "sig", vec!["payer"], 1, 0, 0, Vec::new(), Vec::new());
+        let evidence = block_transaction(4, "sig", vec!["payer"], 1, 0, 0, Vec::new(), Vec::new());
 
         let parsed = parse_requested_lock_transaction(&evidence)?;
 
@@ -1037,10 +1036,7 @@ mod cohort_tests {
             &analysis("no_atomic_match_complete"),
         )?;
 
-        assert_eq!(
-            cohort.economics_status,
-            EconomicsCompleteness::Incomplete
-        );
+        assert_eq!(cohort.economics_status, EconomicsCompleteness::Incomplete);
         assert_eq!(
             cohort.capture_status,
             CaptureCompleteness::CompleteNoAtomicMatch
@@ -1048,8 +1044,8 @@ mod cohort_tests {
         assert_eq!(cohort.candidate_to_quote_ms, Some(10));
         assert_eq!(cohort.candidate_to_economics_ms, Some(20));
         assert_eq!(cohort.quote_to_economics_ms, Some(10));
-        assert_eq!(cohort.market_correction_at_unix_ms, None);
-        assert_eq!(cohort.decision_margin_ms, None);
+        assert!(cohort.market_correction_at_unix_ms.is_none());
+        assert!(cohort.decision_margin_ms.is_none());
         assert!(!cohort.decision_eligible);
 
         Ok(())
