@@ -1,20 +1,20 @@
+use crate::forensics_rpc::{
+    AddressHistory, HistoryAcquisition, HistoryRequest, TransactionAcquisition, TransactionEvidence,
+};
 use crate::{pumpswap, raydium};
-use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::env;
+use std::fs::{self, create_dir_all, File, OpenOptions};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const R13_SCHEMA_VERSION: &str = "r13-forensics-v1";
+pub const OUTPUT_DIRECTORY: &str = "artifacts/r13-forensics";
 pub const MAX_FORWARD_SLOTS: u64 = 32;
-
-const SIGNATURE_PAGE_LIMIT: usize = 100;
-const MAX_SIGNATURE_PAGES_PER_POOL: usize = 2;
-const MAX_TRANSACTION_CANDIDATES_PER_ROUTE: usize = 16;
-const MAX_RECORDS_PER_RUN: u64 = 512;
-const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
+pub const MAX_RECORDS_PER_RUN: u64 = 512;
 
 const RAYDIUM_SWAP_BASE_INPUT: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
 const RAYDIUM_SWAP_BASE_OUTPUT: [u8; 8] = [55, 217, 98, 86, 163, 74, 180, 173];
@@ -22,23 +22,30 @@ const PUMPSWAP_BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const PUMPSWAP_SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct R12RouteObservation {
-    pub run_id: String,
-    pub route_id: String,
-    pub anchor_mint: String,
-    pub intermediate_mint: String,
-    pub leg_1: R12LegObservation,
-    pub leg_2: R12LegObservation,
-    pub candidate_ids: Vec<String>,
-    pub statuses: BTreeSet<String>,
-    pub earliest_candidate_found_at_unix_ms: u64,
-    pub earliest_quote_complete_at_unix_ms: Option<u64>,
-    pub earliest_economics_complete_at_unix_ms: Option<u64>,
-    pub earliest_hypothetical_ready_at_unix_ms: Option<u64>,
+pub struct CandidateEvidence {
+    pub source_run_id: String,
+    pub source_record_sequence: u64,
+    pub candidate_id: String,
+    pub source_status: String,
+    pub usd_size: u64,
+    pub candidate_found_at_unix_ms: u64,
+    pub quote_complete_at_unix_ms: Option<u64>,
+    pub economics_complete_at_unix_ms: Option<u64>,
+    pub hypothetical_ready_at_unix_ms: Option<u64>,
+    pub route: RouteEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct R12LegObservation {
+pub struct RouteEvidence {
+    pub route_id: String,
+    pub anchor_mint: String,
+    pub intermediate_mint: String,
+    pub leg_1: LegEvidence,
+    pub leg_2: LegEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegEvidence {
     pub venue: String,
     pub pool_id: String,
     pub input_mint: String,
@@ -46,7 +53,7 @@ pub struct R12LegObservation {
     pub source_slot: u64,
 }
 
-impl R12RouteObservation {
+impl RouteEvidence {
     pub fn start_slot(&self) -> u64 {
         self.leg_1.source_slot.max(self.leg_2.source_slot)
     }
@@ -54,32 +61,79 @@ impl R12RouteObservation {
     pub fn end_slot(&self) -> Result<u64, String> {
         self.start_slot()
             .checked_add(MAX_FORWARD_SLOTS)
-            .ok_or_else(|| "R13 forward-slot window overflow".to_owned())
+            .ok_or_else(|| "R13 route end-slot overflow".to_owned())
+    }
+
+    fn history_request(&self, leg: &LegEvidence) -> Result<HistoryRequest, String> {
+        Ok(HistoryRequest {
+            address: leg.pool_id.clone(),
+            start_slot: self.start_slot(),
+            end_slot: self.end_slot()?,
+        })
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteSearchStatus {
-    Matched(TransactionMatch),
-    NoMatchComplete,
-    SearchIncomplete(String),
+#[derive(Debug, Clone)]
+pub struct ForensicsPlan {
+    pub source_path: PathBuf,
+    pub source_run_id: String,
+    pub source_github_actions: Value,
+    pub candidates: Vec<CandidateEvidence>,
+    pub routes: BTreeMap<String, RouteEvidence>,
+    pub history_requests: Vec<HistoryRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteIntersection {
+    pub route_id: String,
+    pub signatures: BTreeSet<String>,
+    pub complete: bool,
+    pub incomplete_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntersectionPlan {
+    pub routes: BTreeMap<String, RouteIntersection>,
+    pub required_signatures: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstructionCoordinate {
+    outer_index: usize,
+    inner_index: Option<usize>,
+    stack_height: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedInstruction {
+    coordinate: InstructionCoordinate,
+    program_id: String,
+    account_keys: Vec<String>,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct MatchedLeg {
+    coordinate: InstructionCoordinate,
+    venue: String,
+    pool_id: String,
+    input_mint: String,
+    output_mint: String,
+    user_input_token_account: String,
+    user_output_token_account: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct TransactionMatch {
     pub signature: String,
     pub slot: u64,
     pub block_time: Option<i64>,
     pub fee_lamports: u64,
     pub compute_units_consumed: Option<u64>,
-    pub requested_compute_unit_limit: Option<u64>,
-    pub requested_compute_unit_price_micro_lamports: Option<u64>,
-    pub jito_tip_lamports: Option<u64>,
-    pub instruction_order: Vec<String>,
-    pub pre_balances: Vec<u64>,
-    pub post_balances: Vec<u64>,
-    pub pre_token_balances: Value,
-    pub post_token_balances: Value,
+    pub leg_1: Value,
+    pub leg_2: Value,
+    pub amount_evidence: Value,
+    pub outcome_resolved: bool,
 }
 
 impl TransactionMatch {
@@ -90,210 +144,1253 @@ impl TransactionMatch {
             "block_time": self.block_time,
             "fee_lamports": self.fee_lamports,
             "compute_units_consumed": self.compute_units_consumed,
-            "compute_budget": {
-                "requested_compute_unit_limit": self.requested_compute_unit_limit,
-                "requested_compute_unit_price_micro_lamports": self.requested_compute_unit_price_micro_lamports,
+            "jito_tip": {
+                "status": "unknown",
+                "lamports": Value::Null,
+                "reason": "R13 does not infer Jito tips from meta.fee",
             },
-            "jito_tip_lamports": self.jito_tip_lamports,
-            "jito_tip_status": if self.jito_tip_lamports.is_some() { "known" } else { "unknown" },
-            "instruction_order": self.instruction_order,
-            "pre_balances": self.pre_balances,
-            "post_balances": self.post_balances,
-            "pre_token_balances": self.pre_token_balances,
-            "post_token_balances": self.post_token_balances,
+            "leg_1": self.leg_1,
+            "leg_2": self.leg_2,
+            "amount_evidence": self.amount_evidence,
+            "outcome_resolved": self.outcome_resolved,
         })
     }
 }
 
 #[derive(Debug, Clone)]
-struct SignatureObservation {
-    signature: String,
-    slot: u64,
-    succeeded: bool,
-}
-
-#[derive(Debug, Clone)]
-struct SignatureScan {
-    observations: Vec<SignatureObservation>,
-    complete_through_start_slot: bool,
-    reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedInstruction {
-    order: usize,
-    program_id: String,
-    account_keys: Vec<String>,
-    data: Vec<u8>,
+pub struct RouteAnalysis {
+    pub route_id: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub matches: Vec<TransactionMatch>,
 }
 
 #[derive(Debug)]
 pub struct R13RunResult {
     pub output_path: PathBuf,
     pub route_count: usize,
-    pub matched_count: usize,
-    pub no_match_complete_count: usize,
+    pub candidate_count: usize,
+    pub transaction_match_count: usize,
     pub search_incomplete_count: usize,
+    pub no_atomic_match_complete_count: usize,
+    pub atomic_route_match_count: usize,
+    pub atomic_route_amounts_unresolved_count: usize,
+    pub atomic_route_outcome_resolved_count: usize,
 }
 
-pub async fn analyze_r12_shadow(
-    rpc_client: &Client,
-    r12_path: &Path,
-) -> Result<R13RunResult, String> {
-    let routes = load_completed_r12_routes(r12_path)?;
-    if routes.is_empty() {
-        return Err("R13 received completed R12 evidence with no candidate routes".to_owned());
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubActionsProvenance {
+    run_id: Option<String>,
+    run_attempt: Option<String>,
+    sha: Option<String>,
+    workflow: Option<String>,
+    job: Option<String>,
+    git_ref: Option<String>,
+}
+
+impl GithubActionsProvenance {
+    fn from_environment() -> Self {
+        Self {
+            run_id: env_nonempty("GITHUB_RUN_ID"),
+            run_attempt: env_nonempty("GITHUB_RUN_ATTEMPT"),
+            sha: env_nonempty("GITHUB_SHA"),
+            workflow: env_nonempty("GITHUB_WORKFLOW"),
+            job: env_nonempty("GITHUB_JOB"),
+            git_ref: env_nonempty("GITHUB_REF"),
+        }
     }
 
-    fs::create_dir_all("artifacts/r13-forensics")
-        .map_err(|error| format!("could not create R13 artifact directory: {error}"))?;
+    fn as_json(&self) -> Value {
+        json!({
+            "github_run_id": self.run_id,
+            "github_run_attempt": self.run_attempt,
+            "github_sha": self.sha,
+            "github_workflow": self.workflow,
+            "github_job": self.job,
+            "github_ref": self.git_ref,
+        })
+    }
+}
 
-    let now_ms = unix_time_ms_now()?;
-    let run_id = r13_run_id(now_ms)?;
-    let output_path = PathBuf::from(format!("artifacts/r13-forensics/{run_id}.jsonl"));
+pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("could not read completed R12 evidence {}: {error}", path.display()))?;
+    if bytes.is_empty() {
+        return Err("R13 source R12 evidence is empty".to_owned());
+    }
+    if !bytes.ends_with(b"\n") {
+        return Err("R13 source R12 evidence is not newline terminated".to_owned());
+    }
+
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("R13 source R12 evidence is not UTF-8: {error}"))?;
+
+    let mut expected_sequence = 1u64;
+    let mut source_run_id: Option<String> = None;
+    let mut source_github_actions: Option<Value> = None;
+    let mut candidates = Vec::new();
+    let mut routes = BTreeMap::new();
+    let mut saw_start = false;
+    let mut saw_end = false;
+
+    for line in text.lines() {
+        let record: Value = serde_json::from_str(line)
+            .map_err(|error| format!("R13 could not parse R12 JSONL record: {error}"))?;
+        if required_str(&record, "schema_version")? != "r12-shadow-v1" {
+            return Err("R13 source schema is not r12-shadow-v1".to_owned());
+        }
+        let sequence = required_u64(&record, "record_sequence")?;
+        if sequence != expected_sequence {
+            return Err(format!(
+                "R13 source R12 sequence mismatch: expected={expected_sequence} actual={sequence}"
+            ));
+        }
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or_else(|| "R13 source sequence overflow".to_owned())?;
+
+        let run_id = required_str(&record, "run_id")?.to_owned();
+        match source_run_id.as_deref() {
+            None => source_run_id = Some(run_id.clone()),
+            Some(expected) if expected == run_id => {}
+            Some(_) => return Err("R13 source R12 run_id changed within file".to_owned()),
+        }
+
+        let github = record
+            .get("github_actions")
+            .cloned()
+            .ok_or_else(|| "R13 source R12 record missing github_actions".to_owned())?;
+        match source_github_actions.as_ref() {
+            None => source_github_actions = Some(github.clone()),
+            Some(expected) if expected == &github => {}
+            Some(_) => return Err("R13 source R12 GitHub provenance changed within file".to_owned()),
+        }
+
+        let event_type = required_str(&record, "event_type")?;
+        match event_type {
+            "run_start" => {
+                if saw_start || sequence != 1 {
+                    return Err("R13 source R12 run_start lifecycle invalid".to_owned());
+                }
+                saw_start = true;
+            }
+            "candidate_evaluation" => {
+                if !saw_start || saw_end {
+                    return Err("R13 source candidate outside completed lifecycle".to_owned());
+                }
+                let candidate = parse_candidate(&record)?;
+                if routes
+                    .insert(candidate.route.route_id.clone(), candidate.route.clone())
+                    .is_some_and(|previous| previous != candidate.route)
+                {
+                    return Err(format!(
+                        "R13 source route_id maps to conflicting route evidence: {}",
+                        candidate.route.route_id
+                    ));
+                }
+                candidates.push(candidate);
+            }
+            "route_rejection" => {
+                if !saw_start || saw_end {
+                    return Err("R13 source route rejection outside completed lifecycle".to_owned());
+                }
+            }
+            "run_end" => {
+                if !saw_start || saw_end {
+                    return Err("R13 source R12 run_end lifecycle invalid".to_owned());
+                }
+                saw_end = true;
+            }
+            other => return Err(format!("R13 source contains unsupported R12 event type {other}")),
+        }
+    }
+
+    if !saw_start || !saw_end {
+        return Err("R13 requires a completed R12 run with run_start and run_end".to_owned());
+    }
+    if candidates.is_empty() {
+        return Err("R13 completed R12 source contains no candidate_evaluation records".to_owned());
+    }
+
+    let mut candidate_keys = BTreeSet::new();
+    for candidate in &candidates {
+        let key = (
+            candidate.source_run_id.clone(),
+            candidate.source_record_sequence,
+            candidate.candidate_id.clone(),
+        );
+        if !candidate_keys.insert(key) {
+            return Err("R13 source contains duplicate candidate provenance".to_owned());
+        }
+    }
+
+    let mut history_requests = BTreeSet::new();
+    for route in routes.values() {
+        history_requests.insert(route.history_request(&route.leg_1)?);
+        history_requests.insert(route.history_request(&route.leg_2)?);
+    }
+
+    Ok(ForensicsPlan {
+        source_path: path.to_path_buf(),
+        source_run_id: source_run_id.ok_or_else(|| "R13 source run_id unavailable".to_owned())?,
+        source_github_actions: source_github_actions
+            .ok_or_else(|| "R13 source GitHub provenance unavailable".to_owned())?,
+        candidates,
+        routes,
+        history_requests: history_requests.into_iter().collect(),
+    })
+}
+
+fn parse_candidate(record: &Value) -> Result<CandidateEvidence, String> {
+    let payload = required_object(record, "payload")?;
+    let route = parse_route(required_object(payload, "route")?)?;
+    let timing = required_object(payload, "timing")?;
+
+    Ok(CandidateEvidence {
+        source_run_id: required_str(record, "run_id")?.to_owned(),
+        source_record_sequence: required_u64(record, "record_sequence")?,
+        candidate_id: required_str(payload, "candidate_id")?.to_owned(),
+        source_status: required_str(payload, "status")?.to_owned(),
+        usd_size: required_u64(payload, "usd_size")?,
+        candidate_found_at_unix_ms: required_u64(timing, "candidate_found_at_unix_ms")?,
+        quote_complete_at_unix_ms: optional_u64(timing, "quote_complete_at_unix_ms")?,
+        economics_complete_at_unix_ms: optional_u64(timing, "economics_complete_at_unix_ms")?,
+        hypothetical_ready_at_unix_ms: optional_u64(timing, "hypothetical_ready_at_unix_ms")?,
+        route,
+    })
+}
+
+fn parse_route(value: &Value) -> Result<RouteEvidence, String> {
+    let route = RouteEvidence {
+        route_id: required_str(value, "route_id")?.to_owned(),
+        anchor_mint: required_str(value, "anchor_mint")?.to_owned(),
+        intermediate_mint: required_str(value, "intermediate_mint")?.to_owned(),
+        leg_1: parse_leg(required_object(value, "leg_1")?)?,
+        leg_2: parse_leg(required_object(value, "leg_2")?)?,
+    };
+    if route.leg_1.input_mint != route.anchor_mint
+        || route.leg_1.output_mint != route.intermediate_mint
+        || route.leg_2.input_mint != route.intermediate_mint
+        || route.leg_2.output_mint != route.anchor_mint
+    {
+        return Err(format!(
+            "R13 source route mint continuity invalid for {}",
+            route.route_id
+        ));
+    }
+    if route.leg_1.pool_id == route.leg_2.pool_id {
+        return Err(format!(
+            "R13 source route unexpectedly reuses one pool for both legs: {}",
+            route.route_id
+        ));
+    }
+    Ok(route)
+}
+
+fn parse_leg(value: &Value) -> Result<LegEvidence, String> {
+    Ok(LegEvidence {
+        venue: required_str(value, "venue")?.to_owned(),
+        pool_id: required_str(value, "pool_id")?.to_owned(),
+        input_mint: required_str(value, "input_mint")?.to_owned(),
+        output_mint: required_str(value, "output_mint")?.to_owned(),
+        source_slot: required_u64(value, "source_slot")?,
+    })
+}
+
+pub fn intersect_route_histories(
+    plan: &ForensicsPlan,
+    acquisition: &HistoryAcquisition,
+) -> Result<IntersectionPlan, String> {
+    let mut routes = BTreeMap::new();
+    let mut required_signatures = BTreeSet::new();
+
+    for route in plan.routes.values() {
+        let left_request = route.history_request(&route.leg_1)?;
+        let right_request = route.history_request(&route.leg_2)?;
+
+        let left = acquisition.histories.get(&left_request);
+        let right = acquisition.histories.get(&right_request);
+
+        let (Some(left), Some(right)) = (left, right) else {
+            routes.insert(
+                route.route_id.clone(),
+                RouteIntersection {
+                    route_id: route.route_id.clone(),
+                    signatures: BTreeSet::new(),
+                    complete: false,
+                    incomplete_reason: Some("one or both exact pool histories are unavailable".to_owned()),
+                },
+            );
+            continue;
+        };
+
+        if !left.complete_through_start_slot || !right.complete_through_start_slot {
+            let reason = format!(
+                "exact route history incomplete: leg1={} leg2={}",
+                left.reason.as_deref().unwrap_or("complete=false"),
+                right.reason.as_deref().unwrap_or("complete=false")
+            );
+            routes.insert(
+                route.route_id.clone(),
+                RouteIntersection {
+                    route_id: route.route_id.clone(),
+                    signatures: BTreeSet::new(),
+                    complete: false,
+                    incomplete_reason: Some(reason),
+                },
+            );
+            continue;
+        }
+
+        let left_signatures = successful_signatures(left);
+        let right_signatures = successful_signatures(right);
+        let signatures = left_signatures
+            .intersection(&right_signatures)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        required_signatures.extend(signatures.iter().cloned());
+
+        routes.insert(
+            route.route_id.clone(),
+            RouteIntersection {
+                route_id: route.route_id.clone(),
+                signatures,
+                complete: true,
+                incomplete_reason: None,
+            },
+        );
+    }
+
+    Ok(IntersectionPlan {
+        routes,
+        required_signatures,
+    })
+}
+
+fn successful_signatures(history: &AddressHistory) -> BTreeSet<String> {
+    history
+        .observations
+        .iter()
+        .filter(|observation| observation.succeeded)
+        .map(|observation| observation.signature.clone())
+        .collect()
+}
+
+pub fn analyze_transactions(
+    plan: &ForensicsPlan,
+    intersections: &IntersectionPlan,
+    transactions: &TransactionAcquisition,
+) -> Result<BTreeMap<String, RouteAnalysis>, String> {
+    let mut analyses = BTreeMap::new();
+
+    for route in plan.routes.values() {
+        let intersection = intersections
+            .routes
+            .get(&route.route_id)
+            .ok_or_else(|| format!("R13 missing route intersection for {}", route.route_id))?;
+
+        if !intersection.complete {
+            analyses.insert(
+                route.route_id.clone(),
+                RouteAnalysis {
+                    route_id: route.route_id.clone(),
+                    status: "search_incomplete".to_owned(),
+                    reason: intersection.incomplete_reason.clone(),
+                    matches: Vec::new(),
+                },
+            );
+            continue;
+        }
+
+        if intersection.signatures.is_empty() {
+            analyses.insert(
+                route.route_id.clone(),
+                RouteAnalysis {
+                    route_id: route.route_id.clone(),
+                    status: "no_atomic_match_complete".to_owned(),
+                    reason: None,
+                    matches: Vec::new(),
+                },
+            );
+            continue;
+        }
+
+        let mut missing = Vec::new();
+        let mut matches = Vec::new();
+        for signature in &intersection.signatures {
+            let Some(evidence) = transactions.transactions.get(signature) else {
+                missing.push(signature.clone());
+                continue;
+            };
+            match match_transaction(route, evidence) {
+                Ok(Some(matched)) => matches.push(matched),
+                Ok(None) => {}
+                Err(error) => {
+                    missing.push(format!("{signature} (malformed/unresolved: {error})"));
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            analyses.insert(
+                route.route_id.clone(),
+                RouteAnalysis {
+                    route_id: route.route_id.clone(),
+                    status: "search_incomplete".to_owned(),
+                    reason: Some(format!(
+                        "required intersecting transactions unavailable: {}",
+                        missing.join(",")
+                    )),
+                    matches: Vec::new(),
+                },
+            );
+            continue;
+        }
+
+        if matches.is_empty() {
+            analyses.insert(
+                route.route_id.clone(),
+                RouteAnalysis {
+                    route_id: route.route_id.clone(),
+                    status: "no_atomic_match_complete".to_owned(),
+                    reason: Some(
+                        "intersecting signatures existed but none proved both exact supported route legs"
+                            .to_owned(),
+                    ),
+                    matches,
+                },
+            );
+            continue;
+        }
+
+        let outcome_resolved = matches.iter().any(|matched| matched.outcome_resolved);
+        analyses.insert(
+            route.route_id.clone(),
+            RouteAnalysis {
+                route_id: route.route_id.clone(),
+                status: if outcome_resolved {
+                    "atomic_route_outcome_resolved".to_owned()
+                } else {
+                    "atomic_route_amounts_unresolved".to_owned()
+                },
+                reason: if outcome_resolved {
+                    None
+                } else {
+                    Some(
+                        "atomic route structure proven; realized cost basis remains fail-closed"
+                            .to_owned(),
+                    )
+                },
+                matches,
+            },
+        );
+    }
+
+    Ok(analyses)
+}
+
+fn match_transaction(
+    route: &RouteEvidence,
+    evidence: &TransactionEvidence,
+) -> Result<Option<TransactionMatch>, String> {
+    let transaction = &evidence.value;
+    let meta = required_object(transaction, "meta")?;
+    if !meta.get("err").is_some_and(Value::is_null) {
+        return Ok(None);
+    }
+
+    let account_keys = resolved_account_keys(transaction, meta)?;
+    let instructions = resolved_instructions(transaction, meta, &account_keys)?;
+
+    let leg_1 = instructions
+        .iter()
+        .filter_map(|instruction| match_leg(&route.leg_1, instruction).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    let leg_2 = instructions
+        .iter()
+        .filter_map(|instruction| match_leg(&route.leg_2, instruction).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut ordered_pair: Option<(MatchedLeg, MatchedLeg)> = None;
+    for first in &leg_1 {
+        for second in &leg_2 {
+            if coordinate_precedes(&first.coordinate, &second.coordinate) {
+                ordered_pair = Some((first.clone(), second.clone()));
+                break;
+            }
+        }
+        if ordered_pair.is_some() {
+            break;
+        }
+    }
+
+    let Some((first, second)) = ordered_pair else {
+        return Ok(None);
+    };
+
+    let slot = required_u64(transaction, "slot")?;
+    let block_time = optional_i64(transaction, "blockTime")?;
+    let fee_lamports = required_u64(meta, "fee")?;
+    let compute_units_consumed = optional_u64(meta, "computeUnitsConsumed")?;
+
+    let amount_evidence = reconstruct_amount_evidence(
+        route,
+        &first,
+        &second,
+        meta,
+        &account_keys,
+    )?;
+
+    Ok(Some(TransactionMatch {
+        signature: evidence.signature.clone(),
+        slot,
+        block_time,
+        fee_lamports,
+        compute_units_consumed,
+        leg_1: matched_leg_json(&first),
+        leg_2: matched_leg_json(&second),
+        amount_evidence,
+        outcome_resolved: false,
+    }))
+}
+
+fn match_leg(
+    leg: &LegEvidence,
+    instruction: &ResolvedInstruction,
+) -> Result<Option<MatchedLeg>, String> {
+    if instruction.program_id != venue_program_id(&leg.venue)? {
+        return Ok(None);
+    }
+    let Some(discriminator) = instruction.data.get(..8) else {
+        return Ok(None);
+    };
+
+    match leg.venue.as_str() {
+        "raydium_cpmm" => {
+            if discriminator != RAYDIUM_SWAP_BASE_INPUT
+                && discriminator != RAYDIUM_SWAP_BASE_OUTPUT
+            {
+                return Ok(None);
+            }
+            if instruction.account_keys.len() < 13 {
+                return Ok(None);
+            }
+            if instruction.account_keys[3] != leg.pool_id
+                || instruction.account_keys[10] != leg.input_mint
+                || instruction.account_keys[11] != leg.output_mint
+            {
+                return Ok(None);
+            }
+            Ok(Some(MatchedLeg {
+                coordinate: instruction.coordinate.clone(),
+                venue: leg.venue.clone(),
+                pool_id: leg.pool_id.clone(),
+                input_mint: leg.input_mint.clone(),
+                output_mint: leg.output_mint.clone(),
+                user_input_token_account: instruction.account_keys[4].clone(),
+                user_output_token_account: instruction.account_keys[5].clone(),
+            }))
+        }
+        "pumpswap" => {
+            if instruction.account_keys.len() < 9 || instruction.account_keys[0] != leg.pool_id {
+                return Ok(None);
+            }
+            let base_mint = &instruction.account_keys[3];
+            let quote_mint = &instruction.account_keys[4];
+
+            if discriminator == PUMPSWAP_BUY {
+                if &leg.input_mint != quote_mint || &leg.output_mint != base_mint {
+                    return Ok(None);
+                }
+                Ok(Some(MatchedLeg {
+                    coordinate: instruction.coordinate.clone(),
+                    venue: leg.venue.clone(),
+                    pool_id: leg.pool_id.clone(),
+                    input_mint: leg.input_mint.clone(),
+                    output_mint: leg.output_mint.clone(),
+                    user_input_token_account: instruction.account_keys[6].clone(),
+                    user_output_token_account: instruction.account_keys[5].clone(),
+                }))
+            } else if discriminator == PUMPSWAP_SELL {
+                if &leg.input_mint != base_mint || &leg.output_mint != quote_mint {
+                    return Ok(None);
+                }
+                Ok(Some(MatchedLeg {
+                    coordinate: instruction.coordinate.clone(),
+                    venue: leg.venue.clone(),
+                    pool_id: leg.pool_id.clone(),
+                    input_mint: leg.input_mint.clone(),
+                    output_mint: leg.output_mint.clone(),
+                    user_input_token_account: instruction.account_keys[5].clone(),
+                    user_output_token_account: instruction.account_keys[6].clone(),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        other => Err(format!("R13 unsupported venue {other}")),
+    }
+}
+
+fn coordinate_precedes(left: &InstructionCoordinate, right: &InstructionCoordinate) -> bool {
+    match left.outer_index.cmp(&right.outer_index) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => match (left.inner_index, right.inner_index) {
+            (None, Some(_)) => true,
+            (Some(left_inner), Some(right_inner)) => left_inner < right_inner,
+            _ => false,
+        },
+    }
+}
+
+fn matched_leg_json(leg: &MatchedLeg) -> Value {
+    json!({
+        "venue": leg.venue,
+        "pool_id": leg.pool_id,
+        "input_mint": leg.input_mint,
+        "output_mint": leg.output_mint,
+        "user_input_token_account": leg.user_input_token_account,
+        "user_output_token_account": leg.user_output_token_account,
+        "instruction_coordinate": {
+            "outer_index": leg.coordinate.outer_index,
+            "inner_index": leg.coordinate.inner_index,
+            "stack_height": leg.coordinate.stack_height,
+        },
+    })
+}
+
+fn reconstruct_amount_evidence(
+    route: &RouteEvidence,
+    first: &MatchedLeg,
+    second: &MatchedLeg,
+    meta: &Value,
+    account_keys: &[String],
+) -> Result<Value, String> {
+    let watched = BTreeSet::from([
+        first.user_input_token_account.clone(),
+        first.user_output_token_account.clone(),
+        second.user_input_token_account.clone(),
+        second.user_output_token_account.clone(),
+    ]);
+    let pre = token_balances_by_account(meta, "preTokenBalances", account_keys)?;
+    let post = token_balances_by_account(meta, "postTokenBalances", account_keys)?;
+
+    let mut accounts = Vec::new();
+    let mut complete = true;
+    for account in watched {
+        let before = pre.get(&account);
+        let after = post.get(&account);
+        if before.is_none() || after.is_none() {
+            complete = false;
+        }
+        accounts.push(json!({
+            "account": account,
+            "pre": before,
+            "post": after,
+        }));
+    }
+
+    Ok(json!({
+        "anchor_mint": route.anchor_mint,
+        "intermediate_mint": route.intermediate_mint,
+        "watched_user_token_accounts": accounts,
+        "token_balance_snapshots_complete": complete,
+        "realized_transaction_cost_basis_complete": false,
+        "reason": if complete {
+            "token balance snapshots available, but R13 does not fabricate a complete realized cost basis from token deltas plus meta.fee"
+        } else {
+            "one or more route user token accounts lack pre/post token balance evidence"
+        },
+    }))
+}
+
+fn token_balances_by_account(
+    meta: &Value,
+    field: &str,
+    account_keys: &[String],
+) -> Result<BTreeMap<String, Value>, String> {
+    let mut result = BTreeMap::new();
+    let values = match meta.get(field) {
+        None | Some(Value::Null) => return Ok(result),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| format!("R13 {field} was not an array"))?,
+    };
+
+    for value in values {
+        let index = required_u64(value, "accountIndex")? as usize;
+        let account = account_keys
+            .get(index)
+            .ok_or_else(|| format!("R13 {field} accountIndex out of range"))?
+            .clone();
+        let mint = required_str(value, "mint")?;
+        let token_amount = required_object(value, "uiTokenAmount")?;
+        let amount = required_str(token_amount, "amount")?;
+        let decimals = required_u64(token_amount, "decimals")?;
+        result.insert(
+            account,
+            json!({
+                "mint": mint,
+                "amount_raw": amount,
+                "decimals": decimals,
+            }),
+        );
+    }
+    Ok(result)
+}
+
+fn resolved_account_keys(transaction: &Value, meta: &Value) -> Result<Vec<String>, String> {
+    let message = transaction
+        .pointer("/transaction/message")
+        .ok_or_else(|| "R13 transaction missing transaction.message".to_owned())?;
+    let static_keys = message
+        .get("accountKeys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "R13 raw transaction missing message.accountKeys".to_owned())?;
+
+    let mut keys = Vec::new();
+    for key in static_keys {
+        keys.push(
+            key.as_str()
+                .ok_or_else(|| "R13 raw account key was not a string".to_owned())?
+                .to_owned(),
+        );
+    }
+
+    if let Some(loaded) = meta.get("loadedAddresses") {
+        if !loaded.is_null() {
+            append_string_array(&mut keys, loaded, "writable")?;
+            append_string_array(&mut keys, loaded, "readonly")?;
+        }
+    }
+    Ok(keys)
+}
+
+fn append_string_array(
+    destination: &mut Vec<String>,
+    object: &Value,
+    field: &str,
+) -> Result<(), String> {
+    let values = object
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("R13 loadedAddresses.{field} missing or invalid"))?;
+    for value in values {
+        destination.push(
+            value
+                .as_str()
+                .ok_or_else(|| format!("R13 loadedAddresses.{field} contained non-string"))?
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn resolved_instructions(
+    transaction: &Value,
+    meta: &Value,
+    account_keys: &[String],
+) -> Result<Vec<ResolvedInstruction>, String> {
+    let outer = transaction
+        .pointer("/transaction/message/instructions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "R13 raw transaction missing compiled instructions".to_owned())?;
+
+    let mut inner_by_outer: BTreeMap<usize, Vec<&Value>> = BTreeMap::new();
+    if let Some(groups) = meta.get("innerInstructions") {
+        if !groups.is_null() {
+            let groups = groups
+                .as_array()
+                .ok_or_else(|| "R13 innerInstructions was not an array".to_owned())?;
+            for group in groups {
+                let outer_index = required_u64(group, "index")? as usize;
+                let instructions = group
+                    .get("instructions")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "R13 inner instruction group missing instructions".to_owned())?;
+                inner_by_outer.insert(outer_index, instructions.iter().collect());
+            }
+        }
+    }
+
+    let mut resolved = Vec::new();
+    for (outer_index, instruction) in outer.iter().enumerate() {
+        resolved.push(resolve_instruction(
+            instruction,
+            account_keys,
+            InstructionCoordinate {
+                outer_index,
+                inner_index: None,
+                stack_height: optional_u64(instruction, "stackHeight")?,
+            },
+        )?);
+
+        if let Some(inner) = inner_by_outer.get(&outer_index) {
+            for (inner_index, instruction) in inner.iter().enumerate() {
+                resolved.push(resolve_instruction(
+                    instruction,
+                    account_keys,
+                    InstructionCoordinate {
+                        outer_index,
+                        inner_index: Some(inner_index),
+                        stack_height: optional_u64(instruction, "stackHeight")?,
+                    },
+                )?);
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn resolve_instruction(
+    instruction: &Value,
+    account_keys: &[String],
+    coordinate: InstructionCoordinate,
+) -> Result<ResolvedInstruction, String> {
+    let program_index = required_u64(instruction, "programIdIndex")? as usize;
+    let program_id = account_keys
+        .get(program_index)
+        .ok_or_else(|| "R13 programIdIndex out of range".to_owned())?
+        .clone();
+    let indexes = instruction
+        .get("accounts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "R13 compiled instruction missing accounts".to_owned())?;
+    let mut instruction_accounts = Vec::new();
+    for index in indexes {
+        let index = index
+            .as_u64()
+            .ok_or_else(|| "R13 instruction account index was not u64".to_owned())?
+            as usize;
+        instruction_accounts.push(
+            account_keys
+                .get(index)
+                .ok_or_else(|| "R13 instruction account index out of range".to_owned())?
+                .clone(),
+        );
+    }
+    let data = bs58::decode(required_str(instruction, "data")?)
+        .into_vec()
+        .map_err(|error| format!("R13 could not decode instruction data: {error}"))?;
+
+    Ok(ResolvedInstruction {
+        coordinate,
+        program_id,
+        account_keys: instruction_accounts,
+        data,
+    })
+}
+
+fn venue_program_id(venue: &str) -> Result<&'static str, String> {
+    match venue {
+        "raydium_cpmm" => Ok(raydium::RAYDIUM_CPMM_PROGRAM_ID),
+        "pumpswap" => Ok(pumpswap::PUMPSWAP_PROGRAM_ID),
+        other => Err(format!("R13 unsupported route venue {other}")),
+    }
+}
+
+pub fn write_forensics_artifact(
+    plan: &ForensicsPlan,
+    intersections: &IntersectionPlan,
+    analyses: &BTreeMap<String, RouteAnalysis>,
+) -> Result<R13RunResult, String> {
+    write_forensics_artifact_in_directory(
+        Path::new(OUTPUT_DIRECTORY),
+        plan,
+        intersections,
+        analyses,
+    )
+}
+
+fn write_forensics_artifact_in_directory(
+    output_directory: &Path,
+    plan: &ForensicsPlan,
+    intersections: &IntersectionPlan,
+    analyses: &BTreeMap<String, RouteAnalysis>,
+) -> Result<R13RunResult, String> {
+    create_dir_all(output_directory)
+        .map_err(|error| format!("could not create R13 output directory: {error}"))?;
+    let now = unix_time_ms_now()?;
+    let run_id = build_run_id(now);
+    let output_path = output_directory.join(format!("{run_id}.jsonl"));
     let file = OpenOptions::new()
-        .create_new(true)
         .write(true)
+        .create_new(true)
         .open(&output_path)
-        .map_err(|error| format!("could not create R13 JSONL file: {error}"))?;
-    let mut writer = R13Writer::new(BufWriter::new(file), run_id, output_path.clone());
+        .map_err(|error| format!("could not create immutable R13 artifact: {error}"))?;
+    let github = GithubActionsProvenance::from_environment();
+    let mut writer = R13Writer {
+        run_id,
+        writer: BufWriter::new(file),
+        next_sequence: 1,
+        records_written: 0,
+        github,
+    };
 
     writer.write_event(
         "forensics_run_start",
+        now,
         json!({
-            "source_r12_path": r12_path.display().to_string(),
-            "route_count": routes.len(),
-            "max_forward_slots": MAX_FORWARD_SLOTS,
-            "signature_page_limit": SIGNATURE_PAGE_LIMIT,
-            "max_signature_pages_per_pool": MAX_SIGNATURE_PAGES_PER_POOL,
-            "max_transaction_candidates_per_route": MAX_TRANSACTION_CANDIDATES_PER_ROUTE,
-            "matching_policy": "exact-two-pool + exact-two-venue-program + recognized-swap-instruction + leg-order",
-            "timing_policy": "slot-primary; block_time coarse nullable seconds; no invented millisecond chain ordering",
-            "jito_tip_policy": "unknown unless independently provable from transaction evidence",
+            "source_r12": {
+                "path": plan.source_path.display().to_string(),
+                "run_id": plan.source_run_id,
+                "github_actions": plan.source_github_actions,
+                "candidate_count": plan.candidates.len(),
+                "route_count": plan.routes.len(),
+            },
+            "search_contract": {
+                "start_slot_policy": "max(recorded_leg_source_slots)",
+                "forward_slots": MAX_FORWARD_SLOTS,
+                "atomic_scope": "exact two-pool intersection followed by exact supported venue instruction proof",
+            },
         }),
     )?;
 
-    let mut matched_count = 0usize;
-    let mut no_match_complete_count = 0usize;
+    let mut transaction_match_count = 0usize;
     let mut search_incomplete_count = 0usize;
+    let mut no_atomic_match_complete_count = 0usize;
+    let mut atomic_route_match_count = 0usize;
+    let mut atomic_route_amounts_unresolved_count = 0usize;
+    let mut atomic_route_outcome_resolved_count = 0usize;
 
-    for route in &routes {
-        let status = search_route(rpc_client, route).await?;
-        match &status {
-            RouteSearchStatus::Matched(_) => matched_count += 1,
-            RouteSearchStatus::NoMatchComplete => no_match_complete_count += 1,
-            RouteSearchStatus::SearchIncomplete(_) => search_incomplete_count += 1,
+    for route in plan.routes.values() {
+        let intersection = intersections
+            .routes
+            .get(&route.route_id)
+            .ok_or_else(|| format!("R13 missing intersection for {}", route.route_id))?;
+        let analysis = analyses
+            .get(&route.route_id)
+            .ok_or_else(|| format!("R13 missing analysis for {}", route.route_id))?;
+
+        match analysis.status.as_str() {
+            "search_incomplete" => search_incomplete_count += 1,
+            "no_atomic_match_complete" => no_atomic_match_complete_count += 1,
+            "atomic_route_match" => atomic_route_match_count += 1,
+            "atomic_route_amounts_unresolved" => atomic_route_amounts_unresolved_count += 1,
+            "atomic_route_outcome_resolved" => atomic_route_outcome_resolved_count += 1,
+            other => return Err(format!("R13 unsupported analysis status {other}")),
         }
 
         writer.write_event(
             "route_search_result",
-            route_forensics_payload(route, &status)?,
+            unix_time_ms_now()?,
+            json!({
+                "route": route_json(route),
+                "window": {
+                    "start_slot": route.start_slot(),
+                    "end_slot": route.end_slot()?,
+                },
+                "history_complete": intersection.complete,
+                "intersecting_signature_count": intersection.signatures.len(),
+                "status": analysis.status,
+                "reason": analysis.reason,
+            }),
+        )?;
+
+        for matched in &analysis.matches {
+            transaction_match_count += 1;
+            writer.write_event(
+                "transaction_match",
+                unix_time_ms_now()?,
+                json!({
+                    "route_id": route.route_id,
+                    "status": if matched.outcome_resolved {
+                        "atomic_route_outcome_resolved"
+                    } else {
+                        "atomic_route_amounts_unresolved"
+                    },
+                    "transaction": matched.as_json(),
+                }),
+            )?;
+        }
+    }
+
+    for candidate in &plan.candidates {
+        let analysis = analyses
+            .get(&candidate.route.route_id)
+            .ok_or_else(|| format!("R13 missing candidate route analysis {}", candidate.route.route_id))?;
+        writer.write_event(
+            "candidate_annotation",
+            unix_time_ms_now()?,
+            json!({
+                "source_r12": {
+                    "run_id": candidate.source_run_id,
+                    "record_sequence": candidate.source_record_sequence,
+                    "candidate_id": candidate.candidate_id,
+                    "status": candidate.source_status,
+                    "usd_size": candidate.usd_size,
+                },
+                "route_id": candidate.route.route_id,
+                "captureability_status": analysis.status,
+                "matched_signatures": analysis.matches.iter().map(|item| item.signature.clone()).collect::<Vec<_>>(),
+                "timing": {
+                    "candidate_found_at_unix_ms": candidate.candidate_found_at_unix_ms,
+                    "quote_complete_at_unix_ms": candidate.quote_complete_at_unix_ms,
+                    "economics_complete_at_unix_ms": candidate.economics_complete_at_unix_ms,
+                    "hypothetical_ready_at_unix_ms": candidate.hypothetical_ready_at_unix_ms,
+                    "timing_comparison_policy": "slot_delta_primary; R12 local milliseconds and Solana blockTime are not treated as synchronized millisecond clocks",
+                },
+                "profitability_claim": "none",
+            }),
         )?;
     }
 
     writer.write_event(
         "forensics_run_end",
+        unix_time_ms_now()?,
         json!({
-            "route_count": routes.len(),
-            "matched_count": matched_count,
-            "no_match_complete_count": no_match_complete_count,
+            "route_count": plan.routes.len(),
+            "candidate_annotation_count": plan.candidates.len(),
+            "transaction_match_count": transaction_match_count,
             "search_incomplete_count": search_incomplete_count,
+            "no_atomic_match_complete_count": no_atomic_match_complete_count,
+            "atomic_route_match_count": atomic_route_match_count,
+            "atomic_route_amounts_unresolved_count": atomic_route_amounts_unresolved_count,
+            "atomic_route_outcome_resolved_count": atomic_route_outcome_resolved_count,
         }),
     )?;
     writer.finish()?;
-    validate_r13_jsonl(&output_path)?;
+    validate_r13_jsonl(&output_path, plan.candidates.len(), plan.routes.len())?;
 
     Ok(R13RunResult {
         output_path,
-        route_count: routes.len(),
-        matched_count,
-        no_match_complete_count,
+        route_count: plan.routes.len(),
+        candidate_count: plan.candidates.len(),
+        transaction_match_count,
         search_incomplete_count,
+        no_atomic_match_complete_count,
+        atomic_route_match_count,
+        atomic_route_amounts_unresolved_count,
+        atomic_route_outcome_resolved_count,
     })
 }
 
-fn route_forensics_payload(
-    route: &R12RouteObservation,
-    status: &RouteSearchStatus,
-) -> Result<Value, String> {
-    let end_slot = route.end_slot()?;
-    let (status_label, reason, transaction) = match status {
-        RouteSearchStatus::Matched(transaction) => (
-            "atomic_route_match",
-            Value::Null,
-            transaction.as_json(),
-        ),
-        RouteSearchStatus::NoMatchComplete => (
-            "no_atomic_match_complete",
-            Value::Null,
-            Value::Null,
-        ),
-        RouteSearchStatus::SearchIncomplete(reason) => (
-            "search_incomplete",
-            Value::String(reason.clone()),
-            Value::Null,
-        ),
-    };
+struct R13Writer {
+    run_id: String,
+    writer: BufWriter<File>,
+    next_sequence: u64,
+    records_written: u64,
+    github: GithubActionsProvenance,
+}
 
-    Ok(json!({
-        "source_r12_run_id": route.run_id,
+impl R13Writer {
+    fn write_event(
+        &mut self,
+        event_type: &str,
+        observed_at_unix_ms: u64,
+        payload: Value,
+    ) -> Result<(), String> {
+        if self.records_written >= MAX_RECORDS_PER_RUN {
+            return Err("R13 recorder capacity exhausted".to_owned());
+        }
+        if event_type != "forensics_run_end" && self.records_written >= MAX_RECORDS_PER_RUN - 1 {
+            return Err("R13 recorder capacity reserved for forensics_run_end".to_owned());
+        }
+        let record = json!({
+            "schema_version": R13_SCHEMA_VERSION,
+            "event_type": event_type,
+            "run_id": self.run_id,
+            "record_sequence": self.next_sequence,
+            "observed_at_unix_ms": observed_at_unix_ms,
+            "github_actions": self.github.as_json(),
+            "payload": payload,
+        });
+        let mut bytes = serde_json::to_vec(&record)
+            .map_err(|error| format!("could not serialize R13 record: {error}"))?;
+        bytes.push(b'\n');
+        self.writer
+            .write_all(&bytes)
+            .map_err(|error| format!("could not append R13 record: {error}"))?;
+        self.writer
+            .flush()
+            .map_err(|error| format!("could not flush R13 record: {error}"))?;
+        self.records_written = self
+            .records_written
+            .checked_add(1)
+            .ok_or_else(|| "R13 record count overflow".to_owned())?;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| "R13 record sequence overflow".to_owned())?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.writer
+            .flush()
+            .map_err(|error| format!("could not flush R13 artifact: {error}"))?;
+        self.writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("could not sync R13 artifact: {error}"))
+    }
+}
+
+pub fn validate_r13_jsonl(
+    path: &Path,
+    expected_candidate_count: usize,
+    expected_route_count: usize,
+) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(|error| format!("could not open R13 artifact for replay: {error}"))?
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read R13 artifact for replay: {error}"))?;
+    if bytes.is_empty() || !bytes.ends_with(b"\n") {
+        return Err("R13 replay requires non-empty newline-terminated JSONL".to_owned());
+    }
+
+    let mut expected_sequence = 1u64;
+    let mut run_id: Option<String> = None;
+    let mut github: Option<Value> = None;
+    let mut saw_start = false;
+    let mut saw_end = false;
+    let mut route_results = 0usize;
+    let mut candidate_annotations = 0usize;
+    let mut transaction_matches = 0usize;
+    let mut annotated_candidates = BTreeSet::new();
+
+    for line in bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+        let record: Value = serde_json::from_slice(line)
+            .map_err(|error| format!("R13 replay malformed JSON: {error}"))?;
+        if required_str(&record, "schema_version")? != R13_SCHEMA_VERSION {
+            return Err("R13 replay schema mismatch".to_owned());
+        }
+        let sequence = required_u64(&record, "record_sequence")?;
+        if sequence != expected_sequence {
+            return Err(format!(
+                "R13 replay sequence mismatch: expected={expected_sequence} actual={sequence}"
+            ));
+        }
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or_else(|| "R13 replay sequence overflow".to_owned())?;
+
+        let current_run_id = required_str(&record, "run_id")?.to_owned();
+        match run_id.as_deref() {
+            None => run_id = Some(current_run_id.clone()),
+            Some(expected) if expected == current_run_id => {}
+            Some(_) => return Err("R13 replay run_id changed".to_owned()),
+        }
+
+        let current_github = record
+            .get("github_actions")
+            .cloned()
+            .ok_or_else(|| "R13 replay missing github_actions".to_owned())?;
+        match github.as_ref() {
+            None => github = Some(current_github.clone()),
+            Some(expected) if expected == &current_github => {}
+            Some(_) => return Err("R13 replay GitHub provenance changed".to_owned()),
+        }
+
+        let event_type = required_str(&record, "event_type")?;
+        match event_type {
+            "forensics_run_start" => {
+                if saw_start || saw_end || sequence != 1 {
+                    return Err("R13 replay invalid run_start lifecycle".to_owned());
+                }
+                saw_start = true;
+            }
+            "route_search_result" => {
+                if !saw_start || saw_end {
+                    return Err("R13 replay route_search_result outside lifecycle".to_owned());
+                }
+                route_results += 1;
+                validate_status(required_str(required_object(&record, "payload")?, "status")?)?;
+            }
+            "transaction_match" => {
+                if !saw_start || saw_end {
+                    return Err("R13 replay transaction_match outside lifecycle".to_owned());
+                }
+                transaction_matches += 1;
+                let payload = required_object(&record, "payload")?;
+                let status = required_str(payload, "status")?;
+                if status != "atomic_route_amounts_unresolved"
+                    && status != "atomic_route_outcome_resolved"
+                {
+                    return Err("R13 replay transaction_match status invalid".to_owned());
+                }
+                required_str(payload, "route_id")?;
+                required_object(payload, "transaction")?;
+            }
+            "candidate_annotation" => {
+                if !saw_start || saw_end {
+                    return Err("R13 replay candidate_annotation outside lifecycle".to_owned());
+                }
+                candidate_annotations += 1;
+                let payload = required_object(&record, "payload")?;
+                validate_status(required_str(payload, "captureability_status")?)?;
+                let source = required_object(payload, "source_r12")?;
+                let key = format!(
+                    "{}:{}:{}",
+                    required_str(source, "run_id")?,
+                    required_u64(source, "record_sequence")?,
+                    required_str(source, "candidate_id")?
+                );
+                if !annotated_candidates.insert(key) {
+                    return Err("R13 replay duplicate candidate annotation".to_owned());
+                }
+            }
+            "forensics_run_end" => {
+                if !saw_start || saw_end {
+                    return Err("R13 replay invalid run_end lifecycle".to_owned());
+                }
+                saw_end = true;
+                let payload = required_object(&record, "payload")?;
+                if required_u64(payload, "route_count")? as usize != expected_route_count
+                    || required_u64(payload, "candidate_annotation_count")? as usize
+                        != expected_candidate_count
+                    || required_u64(payload, "transaction_match_count")? as usize
+                        != transaction_matches
+                {
+                    return Err("R13 replay final counts mismatch".to_owned());
+                }
+            }
+            other => return Err(format!("R13 replay unsupported event type {other}")),
+        }
+    }
+
+    if !saw_start || !saw_end {
+        return Err("R13 replay incomplete lifecycle".to_owned());
+    }
+    if route_results != expected_route_count {
+        return Err(format!(
+            "R13 replay route result count mismatch: expected={expected_route_count} actual={route_results}"
+        ));
+    }
+    if candidate_annotations != expected_candidate_count
+        || annotated_candidates.len() != expected_candidate_count
+    {
+        return Err(format!(
+            "R13 replay candidate annotation coverage mismatch: expected={expected_candidate_count} actual={candidate_annotations}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_status(status: &str) -> Result<(), String> {
+    match status {
+        "search_incomplete"
+        | "no_atomic_match_complete"
+        | "atomic_route_match"
+        | "atomic_route_amounts_unresolved"
+        | "atomic_route_outcome_resolved" => Ok(()),
+        other => Err(format!("R13 unsupported captureability status {other}")),
+    }
+}
+
+fn route_json(route: &RouteEvidence) -> Value {
+    json!({
         "route_id": route.route_id,
-        "candidate_ids": route.candidate_ids,
-        "r12_statuses": route.statuses,
         "anchor_mint": route.anchor_mint,
         "intermediate_mint": route.intermediate_mint,
         "leg_1": leg_json(&route.leg_1),
         "leg_2": leg_json(&route.leg_2),
-        "r12_timing": {
-            "earliest_candidate_found_at_unix_ms": route.earliest_candidate_found_at_unix_ms,
-            "earliest_quote_complete_at_unix_ms": route.earliest_quote_complete_at_unix_ms,
-            "earliest_economics_complete_at_unix_ms": route.earliest_economics_complete_at_unix_ms,
-            "earliest_hypothetical_ready_at_unix_ms": route.earliest_hypothetical_ready_at_unix_ms,
-        },
-        "chain_search": {
-            "start_slot": route.start_slot(),
-            "end_slot": end_slot,
-            "forward_slot_span": MAX_FORWARD_SLOTS,
-            "status": status_label,
-            "reason": reason,
-        },
-        "transaction": transaction,
-        "captureability": captureability_json(route, status),
-    }))
+    })
 }
 
-fn captureability_json(route: &R12RouteObservation, status: &RouteSearchStatus) -> Value {
-    match status {
-        RouteSearchStatus::Matched(transaction) => {
-            let slot_delta = transaction.slot.checked_sub(route.start_slot());
-            json!({
-                "matched_chain_transaction": true,
-                "slot_delta_from_latest_route_source": slot_delta,
-                "scout_candidate_existed_before_or_at_matched_slot": slot_delta.is_some(),
-                "scout_quote_completed_locally": route.earliest_quote_complete_at_unix_ms.is_some(),
-                "scout_economics_completed_locally": route.earliest_economics_complete_at_unix_ms.is_some(),
-                "scout_hypothetical_ready_locally": route.earliest_hypothetical_ready_at_unix_ms.is_some(),
-                "profitably_executable_claim": false,
-                "profitably_executable_reason": "R13 is read-only forensics; unresolved economics or structural matching cannot prove profitable execution",
-            })
-        }
-        RouteSearchStatus::NoMatchComplete => json!({
-            "matched_chain_transaction": false,
-            "bounded_atomic_search_complete": true,
-            "profitably_executable_claim": false,
-            "interpretation": "no qualifying atomic two-leg transaction matched the exact two-pool route inside the bounded slot window; this does not prove no arbitrage occurred",
-        }),
-        RouteSearchStatus::SearchIncomplete(reason) => json!({
-            "matched_chain_transaction": false,
-            "bounded_atomic_search_complete": false,
-            "profitably_executable_claim": false,
-            "interpretation": "history search was incomplete and cannot support a no-match claim",
-            "reason": reason,
-        }),
-    }
-}
-
-fn leg_json(leg: &R12LegObservation) -> Value {
+fn leg_json(leg: &LegEvidence) -> Value {
     json!({
         "venue": leg.venue,
         "pool_id": leg.pool_id,
@@ -303,969 +1400,46 @@ fn leg_json(leg: &R12LegObservation) -> Value {
     })
 }
 
-async fn search_route(
-    rpc_client: &Client,
-    route: &R12RouteObservation,
-) -> Result<RouteSearchStatus, String> {
-    let start_slot = route.start_slot();
-    let end_slot = route.end_slot()?;
-
-    let confirmed_slot = fetch_confirmed_slot(rpc_client).await?;
-    if confirmed_slot < end_slot {
-        return Ok(RouteSearchStatus::SearchIncomplete(format!(
-            "confirmed chain has not reached forensic end_slot: confirmed_slot={confirmed_slot} end_slot={end_slot}"
-        )));
-    }
-
-    let left = fetch_pool_signatures(
-        rpc_client,
-        &route.leg_1.pool_id,
-        start_slot,
-        end_slot,
+fn build_run_id(now_ms: u64) -> String {
+    let gha_run = env_nonempty("GITHUB_RUN_ID").unwrap_or_else(|| "local".to_owned());
+    let gha_attempt = env_nonempty("GITHUB_RUN_ATTEMPT").unwrap_or_else(|| "0".to_owned());
+    format!(
+        "r13-{gha_run}-{gha_attempt}-{now_ms}-{}",
+        process::id()
     )
-    .await?;
-    let right = fetch_pool_signatures(
-        rpc_client,
-        &route.leg_2.pool_id,
-        start_slot,
-        end_slot,
-    )
-    .await?;
-
-    if !left.complete_through_start_slot || !right.complete_through_start_slot {
-        let reason = format!(
-            "signature history incomplete: leg1={} leg2={}",
-            left.reason.as_deref().unwrap_or("complete"),
-            right.reason.as_deref().unwrap_or("complete")
-        );
-        return Ok(RouteSearchStatus::SearchIncomplete(reason));
-    }
-
-    let left_signatures = left
-        .observations
-        .iter()
-        .filter(|observation| {
-            observation.succeeded
-                && observation.slot >= start_slot
-                && observation.slot <= end_slot
-        })
-        .map(|observation| observation.signature.as_str())
-        .collect::<BTreeSet<_>>();
-
-    let mut intersection = right
-        .observations
-        .iter()
-        .filter(|observation| {
-            observation.succeeded
-                && observation.slot >= start_slot
-                && observation.slot <= end_slot
-                && left_signatures.contains(observation.signature.as_str())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    intersection.sort_by_key(|observation| observation.slot);
-
-    if intersection.len() > MAX_TRANSACTION_CANDIDATES_PER_ROUTE {
-        return Ok(RouteSearchStatus::SearchIncomplete(format!(
-            "atomic candidate intersection exceeded bounded transaction cap: count={} cap={}",
-            intersection.len(),
-            MAX_TRANSACTION_CANDIDATES_PER_ROUTE
-        )));
-    }
-
-    for observation in intersection {
-        if let Some(transaction) =
-            fetch_and_match_transaction(rpc_client, route, &observation.signature).await?
-        {
-            return Ok(RouteSearchStatus::Matched(transaction));
-        }
-    }
-
-    Ok(RouteSearchStatus::NoMatchComplete)
-}
-
-async fn fetch_confirmed_slot(rpc_client: &Client) -> Result<u64, String> {
-    let result = rpc_request(
-        rpc_client,
-        "getSlot",
-        json!([{"commitment": "confirmed"}]),
-    )
-    .await?;
-    result
-        .as_u64()
-        .ok_or_else(|| "R13 getSlot result was not u64".to_owned())
-}
-
-async fn fetch_pool_signatures(
-    rpc_client: &Client,
-    pool_id: &str,
-    start_slot: u64,
-    end_slot: u64,
-) -> Result<SignatureScan, String> {
-    let mut observations = Vec::new();
-    let mut before: Option<String> = None;
-    let mut complete = false;
-    let mut reason = None;
-
-    for page_index in 0..MAX_SIGNATURE_PAGES_PER_POOL {
-        let mut config = json!({
-            "commitment": "confirmed",
-            "limit": SIGNATURE_PAGE_LIMIT
-        });
-
-        if let Some(before_signature) = before.as_deref() {
-            config["before"] = Value::String(before_signature.to_owned());
-        }
-
-        let result = rpc_request(
-            rpc_client,
-            "getSignaturesForAddress",
-            json!([pool_id, config]),
-        )
-        .await?;
-
-        let entries = result.as_array().ok_or_else(|| {
-            format!("R13 getSignaturesForAddress result for {pool_id} was not an array")
-        })?;
-
-        if entries.is_empty() {
-            complete = true;
-            break;
-        }
-
-        for entry in entries {
-            let signature = required_str(entry, "signature")?.to_owned();
-            let slot = required_u64(entry, "slot")?;
-            let succeeded = entry.get("err").map_or(false, Value::is_null);
-            observations.push(SignatureObservation {
-                signature,
-                slot,
-                succeeded,
-            });
-        }
-
-        let oldest_slot = entries
-            .last()
-            .and_then(|entry| entry.get("slot"))
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                format!("R13 signature page for {pool_id} missing oldest slot")
-            })?;
-
-        if oldest_slot <= start_slot {
-            complete = true;
-            break;
-        }
-
-        if entries.len() < SIGNATURE_PAGE_LIMIT {
-            complete = true;
-            break;
-        }
-
-        before = entries
-            .last()
-            .and_then(|entry| entry.get("signature"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-
-        if before.is_none() {
-            reason = Some(format!(
-                "signature pagination for {pool_id} could not obtain before cursor"
-            ));
-            break;
-        }
-
-        if page_index + 1 == MAX_SIGNATURE_PAGES_PER_POOL {
-            reason = Some(format!(
-                "signature pagination for {pool_id} saturated before start_slot={start_slot}; end_slot={end_slot}"
-            ));
-        }
-    }
-
-    observations.sort_by_key(|observation| observation.slot);
-    observations.dedup_by(|left, right| left.signature == right.signature);
-
-    Ok(SignatureScan {
-        observations,
-        complete_through_start_slot: complete,
-        reason,
-    })
-}
-
-async fn fetch_and_match_transaction(
-    rpc_client: &Client,
-    route: &R12RouteObservation,
-    signature: &str,
-) -> Result<Option<TransactionMatch>, String> {
-    let transaction = rpc_request(
-        rpc_client,
-        "getTransaction",
-        json!([
-            signature,
-            {
-                "commitment": "confirmed",
-                "encoding": "json",
-                "maxSupportedTransactionVersion": 0
-            }
-        ]),
-    )
-    .await?;
-
-    if transaction.is_null() {
-        return Ok(None);
-    }
-
-    let meta = required_object(&transaction, "meta")?;
-    if meta.get("err").map_or(true, |value| !value.is_null()) {
-        return Ok(None);
-    }
-
-    let slot = required_u64(&transaction, "slot")?;
-    if slot < route.start_slot() || slot > route.end_slot()? {
-        return Ok(None);
-    }
-
-    let account_keys = resolved_account_keys(&transaction)?;
-    let instructions = resolved_instructions(&transaction, &account_keys)?;
-
-    let first = find_route_swap_instruction(
-        &instructions,
-        &route.leg_1,
-        route.leg_1.venue.as_str(),
-    );
-    let second = find_route_swap_instruction(
-        &instructions,
-        &route.leg_2,
-        route.leg_2.venue.as_str(),
-    );
-
-    let (first, second) = match (first, second) {
-        (Some(first), Some(second)) => (first, second),
-        _ => return Ok(None),
-    };
-
-    if first.order >= second.order {
-        return Ok(None);
-    }
-
-    let instruction_order = vec![
-        format!(
-            "{}:{}:{}",
-            route.leg_1.venue, route.leg_1.pool_id, first.order
-        ),
-        format!(
-            "{}:{}:{}",
-            route.leg_2.venue, route.leg_2.pool_id, second.order
-        ),
-    ];
-
-    let (requested_compute_unit_limit, requested_compute_unit_price_micro_lamports) =
-        compute_budget_requests(&instructions)?;
-
-    Ok(Some(TransactionMatch {
-        signature: signature.to_owned(),
-        slot,
-        block_time: optional_i64(&transaction, "blockTime")?,
-        fee_lamports: required_u64(meta, "fee")?,
-        compute_units_consumed: optional_u64(meta, "computeUnitsConsumed")?,
-        requested_compute_unit_limit,
-        requested_compute_unit_price_micro_lamports,
-        jito_tip_lamports: None,
-        instruction_order,
-        pre_balances: u64_array(meta, "preBalances")?,
-        post_balances: u64_array(meta, "postBalances")?,
-        pre_token_balances: meta
-            .get("preTokenBalances")
-            .cloned()
-            .unwrap_or(Value::Null),
-        post_token_balances: meta
-            .get("postTokenBalances")
-            .cloned()
-            .unwrap_or(Value::Null),
-    }))
-}
-
-fn find_route_swap_instruction<'a>(
-    instructions: &'a [ResolvedInstruction],
-    leg: &R12LegObservation,
-    venue: &str,
-) -> Option<&'a ResolvedInstruction> {
-    let expected_program = match venue {
-        "raydium_cpmm" => raydium::PROGRAM_ID,
-        "pumpswap" => pumpswap::PROGRAM_ID,
-        _ => return None,
-    };
-
-    instructions.iter().find(|instruction| {
-        instruction.program_id == expected_program
-            && instruction
-                .account_keys
-                .iter()
-                .any(|account| account == &leg.pool_id)
-            && recognized_swap(venue, &instruction.data)
-    })
-}
-
-fn recognized_swap(venue: &str, data: &[u8]) -> bool {
-    if data.len() < 8 {
-        return false;
-    }
-
-    let discriminator = &data[..8];
-
-    match venue {
-        "raydium_cpmm" => {
-            discriminator == RAYDIUM_SWAP_BASE_INPUT
-                || discriminator == RAYDIUM_SWAP_BASE_OUTPUT
-        }
-        "pumpswap" => discriminator == PUMPSWAP_BUY || discriminator == PUMPSWAP_SELL,
-        _ => false,
-    }
-}
-
-fn resolved_account_keys(transaction: &Value) -> Result<Vec<String>, String> {
-    let message = transaction
-        .pointer("/transaction/message")
-        .ok_or_else(|| "R13 transaction missing message".to_owned())?;
-
-    let static_keys = message
-        .get("accountKeys")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "R13 transaction message missing accountKeys".to_owned())?;
-
-    let mut keys = Vec::with_capacity(static_keys.len());
-
-    for key in static_keys {
-        if let Some(text) = key.as_str() {
-            keys.push(text.to_owned());
-        } else if let Some(pubkey) = key.get("pubkey").and_then(Value::as_str) {
-            keys.push(pubkey.to_owned());
-        } else {
-            return Err("R13 transaction account key had unsupported shape".to_owned());
-        }
-    }
-
-    let meta = required_object(transaction, "meta")?;
-    if let Some(loaded) = meta.get("loadedAddresses") {
-        if !loaded.is_null() {
-            for field in ["writable", "readonly"] {
-                if let Some(array) = loaded.get(field).and_then(Value::as_array) {
-                    for key in array {
-                        keys.push(
-                            key.as_str()
-                                .ok_or_else(|| {
-                                    format!(
-                                        "R13 loadedAddresses.{field} contained non-string key"
-                                    )
-                                })?
-                                .to_owned(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(keys)
-}
-
-fn resolved_instructions(
-    transaction: &Value,
-    account_keys: &[String],
-) -> Result<Vec<ResolvedInstruction>, String> {
-    let message = transaction
-        .pointer("/transaction/message")
-        .ok_or_else(|| "R13 transaction missing message".to_owned())?;
-    let outer = message
-        .get("instructions")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "R13 transaction message missing instructions".to_owned())?;
-
-    let meta = required_object(transaction, "meta")?;
-    let mut inner_by_outer = BTreeMap::<usize, Vec<Value>>::new();
-
-    if let Some(inner_groups) = meta.get("innerInstructions") {
-        if !inner_groups.is_null() {
-            let groups = inner_groups
-                .as_array()
-                .ok_or_else(|| "R13 innerInstructions was not an array".to_owned())?;
-            for group in groups {
-                let outer_index = required_u64(group, "index")?;
-                let outer_index = usize::try_from(outer_index)
-                    .map_err(|_| "R13 inner instruction index overflow".to_owned())?;
-                let entries = group
-                    .get("instructions")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        "R13 inner instruction group missing instructions".to_owned()
-                    })?;
-                inner_by_outer
-                    .entry(outer_index)
-                    .or_default()
-                    .extend(entries.iter().cloned());
-            }
-        }
-    }
-
-    let mut resolved = Vec::new();
-    let mut order = 0usize;
-
-    for (outer_index, instruction) in outer.iter().enumerate() {
-        resolved.push(resolve_instruction(instruction, account_keys, order)?);
-        order = order
-            .checked_add(1)
-            .ok_or_else(|| "R13 instruction order overflow".to_owned())?;
-
-        if let Some(inner) = inner_by_outer.get(&outer_index) {
-            for instruction in inner {
-                resolved.push(resolve_instruction(instruction, account_keys, order)?);
-                order = order
-                    .checked_add(1)
-                    .ok_or_else(|| "R13 instruction order overflow".to_owned())?;
-            }
-        }
-    }
-
-    Ok(resolved)
-}
-
-fn resolve_instruction(
-    instruction: &Value,
-    account_keys: &[String],
-    order: usize,
-) -> Result<ResolvedInstruction, String> {
-    let program_id_index = required_u64(instruction, "programIdIndex")?;
-    let program_id_index = usize::try_from(program_id_index)
-        .map_err(|_| "R13 programIdIndex overflow".to_owned())?;
-    let program_id = account_keys
-        .get(program_id_index)
-        .ok_or_else(|| "R13 programIdIndex outside resolved account keys".to_owned())?
-        .clone();
-
-    let account_indices = instruction
-        .get("accounts")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "R13 instruction missing accounts".to_owned())?;
-
-    let mut resolved_accounts = Vec::with_capacity(account_indices.len());
-    for index in account_indices {
-        let index = index
-            .as_u64()
-            .ok_or_else(|| "R13 instruction account index was not u64".to_owned())?;
-        let index = usize::try_from(index)
-            .map_err(|_| "R13 instruction account index overflow".to_owned())?;
-        resolved_accounts.push(
-            account_keys
-                .get(index)
-                .ok_or_else(|| {
-                    "R13 instruction account index outside resolved account keys".to_owned()
-                })?
-                .clone(),
-        );
-    }
-
-    let encoded_data = required_str(instruction, "data")?;
-    let data = bs58::decode(encoded_data)
-        .into_vec()
-        .map_err(|error| format!("R13 instruction data was invalid base58: {error}"))?;
-
-    Ok(ResolvedInstruction {
-        order,
-        program_id,
-        account_keys: resolved_accounts,
-        data,
-    })
-}
-
-fn compute_budget_requests(
-    instructions: &[ResolvedInstruction],
-) -> Result<(Option<u64>, Option<u64>), String> {
-    let mut limit = None;
-    let mut price = None;
-
-    for instruction in instructions {
-        if instruction.program_id != COMPUTE_BUDGET_PROGRAM_ID || instruction.data.is_empty() {
-            continue;
-        }
-
-        match instruction.data[0] {
-            2 if instruction.data.len() >= 5 => {
-                let mut bytes = [0u8; 4];
-                bytes.copy_from_slice(&instruction.data[1..5]);
-                limit = Some(u64::from(u32::from_le_bytes(bytes)));
-            }
-            3 if instruction.data.len() >= 9 => {
-                let mut bytes = [0u8; 8];
-                bytes.copy_from_slice(&instruction.data[1..9]);
-                price = Some(u64::from_le_bytes(bytes));
-            }
-            _ => {}
-        }
-    }
-
-    Ok((limit, price))
-}
-
-async fn rpc_request(
-    rpc_client: &Client,
-    method: &str,
-    params: Value,
-) -> Result<Value, String> {
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 13,
-        "method": method,
-        "params": params,
-    });
-
-    let response = rpc_client
-        .post("https://api.mainnet-beta.solana.com")
-        .json(&request)
-        .send()
-        .await
-        .map_err(|error| format!("R13 {method} RPC transport failed: {error}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("R13 {method} RPC HTTP status {status}"));
-    }
-
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("R13 {method} RPC returned invalid JSON: {error}"))?;
-
-    if let Some(error) = payload.get("error") {
-        return Err(format!("R13 {method} RPC error: {error}"));
-    }
-
-    payload
-        .get("result")
-        .cloned()
-        .ok_or_else(|| format!("R13 {method} RPC response missing result"))
-}
-
-pub fn load_completed_r12_routes(path: &Path) -> Result<Vec<R12RouteObservation>, String> {
-    let file =
-        File::open(path).map_err(|error| format!("could not open R12 evidence: {error}"))?;
-    let reader = BufReader::new(file);
-
-    let mut expected_sequence = 1u64;
-    let mut run_id: Option<String> = None;
-    let mut saw_start = false;
-    let mut saw_run_end = false;
-    let mut routes = BTreeMap::<String, R12RouteObservation>::new();
-
-    for line_result in reader.lines() {
-        let line =
-            line_result.map_err(|error| format!("could not read R12 evidence: {error}"))?;
-        if line.trim().is_empty() {
-            return Err("R13 rejected blank line in R12 JSONL".to_owned());
-        }
-
-        let record: Value = serde_json::from_str(&line)
-            .map_err(|error| format!("R13 rejected malformed R12 JSONL: {error}"))?;
-
-        if required_str(&record, "schema_version")? != "r12-shadow-v1" {
-            return Err("R13 rejected unsupported R12 schema".to_owned());
-        }
-
-        let record_run_id = required_str(&record, "run_id")?;
-        if let Some(expected) = run_id.as_deref() {
-            if record_run_id != expected {
-                return Err("R13 rejected R12 run_id change".to_owned());
-            }
-        } else {
-            run_id = Some(record_run_id.to_owned());
-        }
-
-        let sequence = required_u64(&record, "record_sequence")?;
-        if sequence != expected_sequence {
-            return Err(format!(
-                "R13 rejected non-contiguous R12 sequence: expected={expected_sequence} actual={sequence}"
-            ));
-        }
-        expected_sequence = expected_sequence
-            .checked_add(1)
-            .ok_or_else(|| "R13 R12 sequence overflow".to_owned())?;
-
-        let event_type = required_str(&record, "event_type")?;
-        match event_type {
-            "run_start" => {
-                if saw_start || sequence != 1 {
-                    return Err("R13 rejected invalid R12 run_start".to_owned());
-                }
-                saw_start = true;
-            }
-            "candidate_evaluation" => {
-                if !saw_start || saw_run_end {
-                    return Err("R13 rejected R12 candidate outside run lifecycle".to_owned());
-                }
-                let payload = required_object(&record, "payload")?;
-                aggregate_candidate(
-                    routes.entry(required_str(
-                        required_object(payload, "route")?,
-                        "route_id",
-                    )?
-                    .to_owned()),
-                    record_run_id,
-                    payload,
-                )?;
-            }
-            "route_rejection" => {
-                if !saw_start || saw_run_end {
-                    return Err("R13 rejected R12 route rejection outside run lifecycle".to_owned());
-                }
-            }
-            "run_end" => {
-                if saw_run_end {
-                    return Err("R13 rejected R12 JSONL with multiple run_end records".to_owned());
-                }
-                saw_run_end = true;
-            }
-            other => {
-                return Err(format!("R13 rejected unknown R12 event_type {other}"));
-            }
-        }
-    }
-
-    if !saw_start || !saw_run_end {
-        return Err("R13 requires a completed R12 run with run_start and run_end".to_owned());
-    }
-
-    Ok(routes.into_values().collect())
-}
-
-fn aggregate_candidate(
-    entry: std::collections::btree_map::Entry<'_, String, R12RouteObservation>,
-    run_id: &str,
-    payload: &Value,
-) -> Result<(), String> {
-    let candidate_id = required_str(payload, "candidate_id")?.to_owned();
-    let status = required_str(payload, "status")?.to_owned();
-    let route = required_object(payload, "route")?;
-    let timing = required_object(payload, "timing")?;
-
-    let candidate_found = required_u64(timing, "candidate_found_at_unix_ms")?;
-    let quote_complete = optional_u64(timing, "quote_complete_at_unix_ms")?;
-    let economics_complete = optional_u64(timing, "economics_complete_at_unix_ms")?;
-    let hypothetical_ready = optional_u64(timing, "hypothetical_ready_at_unix_ms")?;
-
-    match entry {
-        std::collections::btree_map::Entry::Vacant(vacant) => {
-            let mut statuses = BTreeSet::new();
-            statuses.insert(status);
-            vacant.insert(R12RouteObservation {
-                run_id: run_id.to_owned(),
-                route_id: required_str(route, "route_id")?.to_owned(),
-                anchor_mint: required_str(route, "anchor_mint")?.to_owned(),
-                intermediate_mint: required_str(route, "intermediate_mint")?.to_owned(),
-                leg_1: parse_leg(required_object(route, "leg_1")?)?,
-                leg_2: parse_leg(required_object(route, "leg_2")?)?,
-                candidate_ids: vec![candidate_id],
-                statuses,
-                earliest_candidate_found_at_unix_ms: candidate_found,
-                earliest_quote_complete_at_unix_ms: quote_complete,
-                earliest_economics_complete_at_unix_ms: economics_complete,
-                earliest_hypothetical_ready_at_unix_ms: hypothetical_ready,
-            });
-        }
-        std::collections::btree_map::Entry::Occupied(mut occupied) => {
-            let existing = occupied.get_mut();
-
-            if existing.anchor_mint != required_str(route, "anchor_mint")?
-                || existing.intermediate_mint != required_str(route, "intermediate_mint")?
-                || existing.leg_1 != parse_leg(required_object(route, "leg_1")?)?
-                || existing.leg_2 != parse_leg(required_object(route, "leg_2")?)?
-            {
-                return Err(format!(
-                    "R13 route identity collision with inconsistent route payload: {}",
-                    existing.route_id
-                ));
-            }
-
-            existing.candidate_ids.push(candidate_id);
-            existing.statuses.insert(status);
-            existing.earliest_candidate_found_at_unix_ms = existing
-                .earliest_candidate_found_at_unix_ms
-                .min(candidate_found);
-            existing.earliest_quote_complete_at_unix_ms =
-                min_option(existing.earliest_quote_complete_at_unix_ms, quote_complete);
-            existing.earliest_economics_complete_at_unix_ms = min_option(
-                existing.earliest_economics_complete_at_unix_ms,
-                economics_complete,
-            );
-            existing.earliest_hypothetical_ready_at_unix_ms = min_option(
-                existing.earliest_hypothetical_ready_at_unix_ms,
-                hypothetical_ready,
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn min_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
-}
-
-fn parse_leg(value: &Value) -> Result<R12LegObservation, String> {
-    Ok(R12LegObservation {
-        venue: required_str(value, "venue")?.to_owned(),
-        pool_id: required_str(value, "pool_id")?.to_owned(),
-        input_mint: required_str(value, "input_mint")?.to_owned(),
-        output_mint: required_str(value, "output_mint")?.to_owned(),
-        source_slot: required_u64(value, "source_slot")?,
-    })
-}
-
-struct R13Writer {
-    writer: BufWriter<File>,
-    run_id: String,
-    output_path: PathBuf,
-    next_sequence: u64,
-    records_written: u64,
-    finished: bool,
-}
-
-impl R13Writer {
-    fn new(writer: BufWriter<File>, run_id: String, output_path: PathBuf) -> Self {
-        Self {
-            writer,
-            run_id,
-            output_path,
-            next_sequence: 1,
-            records_written: 0,
-            finished: false,
-        }
-    }
-
-    fn write_event(&mut self, event_type: &str, payload: Value) -> Result<(), String> {
-        if self.finished {
-            return Err("R13 writer is already finished".to_owned());
-        }
-        if self.records_written >= MAX_RECORDS_PER_RUN {
-            return Err("R13 recorder capacity exhausted".to_owned());
-        }
-
-        let record = json!({
-            "schema_version": R13_SCHEMA_VERSION,
-            "event_type": event_type,
-            "run_id": self.run_id,
-            "record_sequence": self.next_sequence,
-            "observed_at_unix_ms": unix_time_ms_now()?,
-            "github_actions": {
-                "github_run_id": std::env::var("GITHUB_RUN_ID").ok(),
-                "github_run_attempt": std::env::var("GITHUB_RUN_ATTEMPT").ok(),
-                "github_sha": std::env::var("GITHUB_SHA").ok(),
-                "github_workflow": std::env::var("GITHUB_WORKFLOW").ok(),
-                "github_job": std::env::var("GITHUB_JOB").ok(),
-                "github_ref": std::env::var("GITHUB_REF").ok(),
-            },
-            "payload": payload,
-        });
-
-        serde_json::to_writer(&mut self.writer, &record)
-            .map_err(|error| format!("could not serialize R13 record: {error}"))?;
-        self.writer
-            .write_all(b"\n")
-            .map_err(|error| format!("could not terminate R13 record: {error}"))?;
-        self.writer
-            .flush()
-            .map_err(|error| format!("could not flush R13 record: {error}"))?;
-
-        self.records_written = self
-            .records_written
-            .checked_add(1)
-            .ok_or_else(|| "R13 record count overflow".to_owned())?;
-        self.next_sequence = self
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| "R13 sequence overflow".to_owned())?;
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<(), String> {
-        if self.finished {
-            return Err("R13 writer already finished".to_owned());
-        }
-        self.writer
-            .flush()
-            .map_err(|error| format!("could not flush completed R13 JSONL: {error}"))?;
-        self.writer
-            .get_ref()
-            .sync_all()
-            .map_err(|error| format!("could not sync completed R13 JSONL: {error}"))?;
-        self.finished = true;
-        Ok(())
-    }
-}
-
-pub fn validate_r13_jsonl(path: &Path) -> Result<(), String> {
-    let file =
-        File::open(path).map_err(|error| format!("could not open R13 JSONL replay: {error}"))?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut expected_sequence = 1u64;
-    let mut expected_run_id: Option<String> = None;
-    let mut saw_start = false;
-    let mut saw_end = false;
-    let mut route_records = 0u64;
-
-    loop {
-        line.clear();
-        let bytes = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("could not read R13 JSONL replay: {error}"))?;
-        if bytes == 0 {
-            break;
-        }
-        if !line.ends_with('\n') {
-            return Err("R13 JSONL contains non-newline-terminated record".to_owned());
-        }
-
-        let record: Value = serde_json::from_str(&line)
-            .map_err(|error| format!("R13 JSONL malformed record: {error}"))?;
-
-        if required_str(&record, "schema_version")? != R13_SCHEMA_VERSION {
-            return Err("R13 JSONL schema mismatch".to_owned());
-        }
-
-        let run_id = required_str(&record, "run_id")?;
-        if let Some(expected) = expected_run_id.as_deref() {
-            if run_id != expected {
-                return Err("R13 JSONL run_id changed".to_owned());
-            }
-        } else {
-            expected_run_id = Some(run_id.to_owned());
-        }
-
-        let sequence = required_u64(&record, "record_sequence")?;
-        if sequence != expected_sequence {
-            return Err(format!(
-                "R13 JSONL sequence mismatch expected={expected_sequence} actual={sequence}"
-            ));
-        }
-        expected_sequence = expected_sequence
-            .checked_add(1)
-            .ok_or_else(|| "R13 replay sequence overflow".to_owned())?;
-
-        required_u64(&record, "observed_at_unix_ms")?;
-        let payload = required_object(&record, "payload")?;
-
-        match required_str(&record, "event_type")? {
-            "forensics_run_start" => {
-                if saw_start || saw_end || sequence != 1 {
-                    return Err("R13 invalid run_start lifecycle".to_owned());
-                }
-                saw_start = true;
-            }
-            "route_search_result" => {
-                if !saw_start || saw_end {
-                    return Err("R13 route_search_result outside run lifecycle".to_owned());
-                }
-                validate_route_forensics(payload)?;
-                route_records = route_records
-                    .checked_add(1)
-                    .ok_or_else(|| "R13 replay route count overflow".to_owned())?;
-            }
-            "forensics_run_end" => {
-                if !saw_start || saw_end {
-                    return Err("R13 invalid run_end lifecycle".to_owned());
-                }
-                saw_end = true;
-            }
-            other => return Err(format!("R13 JSONL unknown event_type {other}")),
-        }
-    }
-
-    if !saw_start || !saw_end || route_records == 0 {
-        return Err("R13 JSONL incomplete lifecycle".to_owned());
-    }
-    Ok(())
-}
-
-fn validate_route_forensics(payload: &Value) -> Result<(), String> {
-    required_str(payload, "source_r12_run_id")?;
-    required_str(payload, "route_id")?;
-    required_str(payload, "anchor_mint")?;
-    required_str(payload, "intermediate_mint")?;
-    required_object(payload, "leg_1")?;
-    required_object(payload, "leg_2")?;
-
-    let chain_search = required_object(payload, "chain_search")?;
-    let start_slot = required_u64(chain_search, "start_slot")?;
-    let end_slot = required_u64(chain_search, "end_slot")?;
-    if end_slot < start_slot {
-        return Err("R13 replay end_slot precedes start_slot".to_owned());
-    }
-
-    match required_str(chain_search, "status")? {
-        "atomic_route_match" => {
-            if payload.get("transaction").map_or(true, Value::is_null) {
-                return Err("R13 matched record missing transaction".to_owned());
-            }
-        }
-        "no_atomic_match_complete" | "search_incomplete" => {
-            if payload
-                .get("transaction")
-                .is_some_and(|value| !value.is_null())
-            {
-                return Err("R13 unmatched record unexpectedly contains transaction".to_owned());
-            }
-        }
-        other => return Err(format!("R13 replay unknown search status {other}")),
-    }
-
-    Ok(())
-}
-
-fn r13_run_id(now_ms: u64) -> Result<String, String> {
-    let github_run = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".to_owned());
-    let github_attempt =
-        std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_else(|_| "0".to_owned());
-    Ok(format!(
-        "r13-{github_run}-{github_attempt}-{now_ms}-{}",
-        std::process::id()
-    ))
 }
 
 fn unix_time_ms_now() -> Result<u64, String> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock is before Unix epoch: {error}"))?;
+        .map_err(|error| format!("R13 system clock precedes Unix epoch: {error}"))?;
     u64::try_from(duration.as_millis())
-        .map_err(|_| "Unix millisecond timestamp does not fit u64".to_owned())
+        .map_err(|_| "R13 Unix millisecond timestamp overflow".to_owned())
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn required_object<'a>(value: &'a Value, field: &str) -> Result<&'a Value, String> {
-    let object = value
+    value
         .get(field)
-        .ok_or_else(|| format!("missing required field {field}"))?;
-    if !object.is_object() {
-        return Err(format!("required field {field} was not an object"));
-    }
-    Ok(object)
+        .filter(|item| item.is_object())
+        .ok_or_else(|| format!("R13 missing or invalid object field {field}"))
 }
 
 fn required_str<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
     value
         .get(field)
         .and_then(Value::as_str)
-        .ok_or_else(|| format!("missing or invalid string field {field}"))
+        .ok_or_else(|| format!("R13 missing or invalid string field {field}"))
 }
 
 fn required_u64(value: &Value, field: &str) -> Result<u64, String> {
     value
         .get(field)
         .and_then(Value::as_u64)
-        .ok_or_else(|| format!("missing or invalid u64 field {field}"))
+        .ok_or_else(|| format!("R13 missing or invalid u64 field {field}"))
 }
 
 fn optional_u64(value: &Value, field: &str) -> Result<Option<u64>, String> {
@@ -1274,7 +1448,7 @@ fn optional_u64(value: &Value, field: &str) -> Result<Option<u64>, String> {
         Some(other) => other
             .as_u64()
             .map(Some)
-            .ok_or_else(|| format!("invalid optional u64 field {field}")),
+            .ok_or_else(|| format!("R13 invalid optional u64 field {field}")),
     }
 }
 
@@ -1284,198 +1458,172 @@ fn optional_i64(value: &Value, field: &str) -> Result<Option<i64>, String> {
         Some(other) => other
             .as_i64()
             .map(Some)
-            .ok_or_else(|| format!("invalid optional i64 field {field}")),
+            .ok_or_else(|| format!("R13 invalid optional i64 field {field}")),
     }
-}
-
-fn u64_array(value: &Value, field: &str) -> Result<Vec<u64>, String> {
-    let array = value
-        .get(field)
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("missing or invalid u64 array {field}"))?;
-    array
-        .iter()
-        .map(|entry| {
-            entry
-                .as_u64()
-                .ok_or_else(|| format!("invalid u64 entry in {field}"))
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::forensics_rpc::{AddressHistory, SignatureObservation};
 
-    fn temp_path(name: &str) -> Result<PathBuf, String> {
-        let now = unix_time_ms_now()?;
-        Ok(std::env::temp_dir().join(format!(
-            "scout-{name}-{}-{now}.jsonl",
-            std::process::id()
-        )))
-    }
-
-    fn sample_candidate(sequence: u64, usd: u64) -> Value {
-        json!({
-            "schema_version": "r12-shadow-v1",
-            "event_type": "candidate_evaluation",
-            "run_id": "r12-test",
-            "record_sequence": sequence,
-            "observed_at_unix_ms": 1100 + usd,
-            "payload": {
-                "candidate_id": format!("route|usd={usd}"),
-                "status": "economics_unresolved",
-                "route": {
-                    "route_id": "anchor=SOL|intermediate=T|leg1=raydium_cpmm:R|leg2=pumpswap:P",
-                    "anchor_mint": "SOL",
-                    "intermediate_mint": "T",
-                    "leg_1": {
-                        "venue": "raydium_cpmm",
-                        "pool_id": "R",
-                        "input_mint": "SOL",
-                        "output_mint": "T",
-                        "source_slot": 100
-                    },
-                    "leg_2": {
-                        "venue": "pumpswap",
-                        "pool_id": "P",
-                        "input_mint": "T",
-                        "output_mint": "SOL",
-                        "source_slot": 101
-                    }
-                },
-                "timing": {
-                    "candidate_found_at_unix_ms": 1000 + usd,
-                    "quote_complete_at_unix_ms": 1010 + usd,
-                    "economics_complete_at_unix_ms": 1020 + usd,
-                    "hypothetical_ready_at_unix_ms": null
-                }
-            }
-        })
-    }
-
-    #[test]
-    fn loads_and_aggregates_completed_r12_routes() -> Result<(), String> {
-        let path = temp_path("r13-r12-load")?;
-        let mut file = File::create(&path)
-            .map_err(|error| format!("test could not create fixture: {error}"))?;
-
-        let records = vec![
-            json!({
-                "schema_version": "r12-shadow-v1",
-                "event_type": "run_start",
-                "run_id": "r12-test",
-                "record_sequence": 1,
-                "observed_at_unix_ms": 1,
-                "payload": {}
-            }),
-            sample_candidate(2, 1),
-            sample_candidate(3, 5),
-            json!({
-                "schema_version": "r12-shadow-v1",
-                "event_type": "run_end",
-                "run_id": "r12-test",
-                "record_sequence": 4,
-                "observed_at_unix_ms": 4,
-                "payload": {}
-            }),
-        ];
-
-        for record in records {
-            writeln!(
-                file,
-                "{}",
-                serde_json::to_string(&record)
-                    .map_err(|error| format!("test serialization failed: {error}"))?
-            )
-            .map_err(|error| format!("test fixture write failed: {error}"))?;
+    fn leg(venue: &str, pool: &str, input: &str, output: &str, slot: u64) -> LegEvidence {
+        LegEvidence {
+            venue: venue.to_owned(),
+            pool_id: pool.to_owned(),
+            input_mint: input.to_owned(),
+            output_mint: output.to_owned(),
+            source_slot: slot,
         }
+    }
 
-        let routes = load_completed_r12_routes(&path)?;
-        fs::remove_file(&path)
-            .map_err(|error| format!("test fixture cleanup failed: {error}"))?;
-
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].candidate_ids.len(), 2);
-        assert_eq!(routes[0].start_slot(), 101);
-        assert_eq!(routes[0].end_slot()?, 133);
-        assert_eq!(routes[0].earliest_candidate_found_at_unix_ms, 1001);
-        Ok(())
+    fn route() -> RouteEvidence {
+        RouteEvidence {
+            route_id: "route".to_owned(),
+            anchor_mint: "anchor".to_owned(),
+            intermediate_mint: "middle".to_owned(),
+            leg_1: leg("raydium_cpmm", "ray", "anchor", "middle", 100),
+            leg_2: leg("pumpswap", "pump", "middle", "anchor", 101),
+        }
     }
 
     #[test]
-    fn rejects_incomplete_r12_run() -> Result<(), String> {
-        let path = temp_path("r13-r12-incomplete")?;
-        let mut file = File::create(&path)
-            .map_err(|error| format!("test could not create fixture: {error}"))?;
-
-        let start = json!({
-            "schema_version": "r12-shadow-v1",
-            "event_type": "run_start",
-            "run_id": "r12-test",
-            "record_sequence": 1,
-            "observed_at_unix_ms": 1,
-            "payload": {}
-        });
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(&start)
-                .map_err(|error| format!("test serialization failed: {error}"))?
-        )
-        .map_err(|error| format!("test fixture write failed: {error}"))?;
-
-        let result = load_completed_r12_routes(&path);
-        fs::remove_file(&path)
-            .map_err(|error| format!("test fixture cleanup failed: {error}"))?;
-        assert!(result.is_err());
-        Ok(())
+    fn search_window_uses_maximum_leg_slot() {
+        let route = route();
+        assert_eq!(route.start_slot(), 101);
+        assert_eq!(route.end_slot().expect("end slot"), 133);
     }
 
     #[test]
-    fn recognizes_locked_swap_discriminators() {
-        assert!(recognized_swap(
-            "raydium_cpmm",
-            &RAYDIUM_SWAP_BASE_INPUT
-        ));
-        assert!(recognized_swap(
-            "raydium_cpmm",
-            &RAYDIUM_SWAP_BASE_OUTPUT
-        ));
-        assert!(recognized_swap("pumpswap", &PUMPSWAP_BUY));
-        assert!(recognized_swap("pumpswap", &PUMPSWAP_SELL));
-        assert!(!recognized_swap(
-            "pumpswap",
-            &RAYDIUM_SWAP_BASE_INPUT
-        ));
+    fn exact_route_intersection_uses_only_two_requested_pool_histories() {
+        let route = route();
+        let left_request = route.history_request(&route.leg_1).expect("left request");
+        let right_request = route.history_request(&route.leg_2).expect("right request");
+        let history = |request: HistoryRequest, signatures: &[&str]| AddressHistory {
+            request,
+            observations: signatures
+                .iter()
+                .map(|signature| SignatureObservation {
+                    signature: (*signature).to_owned(),
+                    slot: 110,
+                    succeeded: true,
+                    block_time: None,
+                })
+                .collect(),
+            complete_through_start_slot: true,
+            reason: None,
+        };
+
+        let plan = ForensicsPlan {
+            source_path: PathBuf::from("source"),
+            source_run_id: "run".to_owned(),
+            source_github_actions: json!({}),
+            candidates: Vec::new(),
+            routes: BTreeMap::from([("route".to_owned(), route.clone())]),
+            history_requests: vec![left_request.clone(), right_request.clone()],
+        };
+        let acquisition = HistoryAcquisition {
+            confirmed_tip_slot: Some(200),
+            histories: BTreeMap::from([
+                (left_request.clone(), history(left_request, &["shared", "left"])),
+                (right_request.clone(), history(right_request, &["shared", "right"])),
+            ]),
+            incomplete_reasons: Vec::new(),
+        };
+
+        let intersections = intersect_route_histories(&plan, &acquisition).expect("intersection");
+        assert_eq!(
+            intersections.required_signatures,
+            BTreeSet::from(["shared".to_owned()])
+        );
     }
 
     #[test]
-    fn parses_compute_budget_requests() -> Result<(), String> {
-        let mut limit_data = vec![2];
-        limit_data.extend_from_slice(&400_000u32.to_le_bytes());
-        let mut price_data = vec![3];
-        price_data.extend_from_slice(&12_345u64.to_le_bytes());
+    fn incomplete_history_never_becomes_complete_no_match() {
+        let route = route();
+        let left_request = route.history_request(&route.leg_1).expect("left request");
+        let right_request = route.history_request(&route.leg_2).expect("right request");
+        let plan = ForensicsPlan {
+            source_path: PathBuf::from("source"),
+            source_run_id: "run".to_owned(),
+            source_github_actions: json!({}),
+            candidates: Vec::new(),
+            routes: BTreeMap::from([("route".to_owned(), route.clone())]),
+            history_requests: vec![left_request.clone(), right_request.clone()],
+        };
+        let acquisition = HistoryAcquisition {
+            confirmed_tip_slot: Some(200),
+            histories: BTreeMap::from([
+                (
+                    left_request.clone(),
+                    AddressHistory {
+                        request: left_request,
+                        observations: Vec::new(),
+                        complete_through_start_slot: false,
+                        reason: Some("saturated".to_owned()),
+                    },
+                ),
+                (
+                    right_request.clone(),
+                    AddressHistory {
+                        request: right_request,
+                        observations: Vec::new(),
+                        complete_through_start_slot: true,
+                        reason: None,
+                    },
+                ),
+            ]),
+            incomplete_reasons: vec!["saturated".to_owned()],
+        };
+        let intersections = intersect_route_histories(&plan, &acquisition).expect("intersection");
+        assert!(!intersections.routes["route"].complete);
+    }
 
-        let instructions = vec![
-            ResolvedInstruction {
-                order: 0,
-                program_id: COMPUTE_BUDGET_PROGRAM_ID.to_owned(),
-                account_keys: Vec::new(),
-                data: limit_data,
-            },
-            ResolvedInstruction {
-                order: 1,
-                program_id: COMPUTE_BUDGET_PROGRAM_ID.to_owned(),
-                account_keys: Vec::new(),
-                data: price_data,
-            },
-        ];
+    #[test]
+    fn instruction_coordinates_preserve_outer_inner_order() {
+        let outer = InstructionCoordinate {
+            outer_index: 2,
+            inner_index: None,
+            stack_height: Some(1),
+        };
+        let inner = InstructionCoordinate {
+            outer_index: 2,
+            inner_index: Some(0),
+            stack_height: Some(2),
+        };
+        let later = InstructionCoordinate {
+            outer_index: 3,
+            inner_index: None,
+            stack_height: Some(1),
+        };
+        assert!(coordinate_precedes(&outer, &inner));
+        assert!(coordinate_precedes(&inner, &later));
+        assert!(!coordinate_precedes(&later, &inner));
+    }
 
-        let (limit, price) = compute_budget_requests(&instructions)?;
-        assert_eq!(limit, Some(400_000));
-        assert_eq!(price, Some(12_345));
-        Ok(())
+    #[test]
+    fn failed_transaction_is_not_a_route_match() {
+        let evidence = TransactionEvidence {
+            signature: "sig".to_owned(),
+            value: json!({
+                "slot": 110,
+                "blockTime": null,
+                "transaction": {"message": {"accountKeys": [], "instructions": []}},
+                "meta": {"err": {"InstructionError": [0, "Custom"]}, "fee": 5000}
+            }),
+        };
+        assert!(match_transaction(&route(), &evidence)
+            .expect("failed tx should be handled")
+            .is_none());
+    }
+
+    #[test]
+    fn status_vocabulary_is_closed() {
+        assert!(validate_status("search_incomplete").is_ok());
+        assert!(validate_status("no_atomic_match_complete").is_ok());
+        assert!(validate_status("atomic_route_match").is_ok());
+        assert!(validate_status("atomic_route_amounts_unresolved").is_ok());
+        assert!(validate_status("atomic_route_outcome_resolved").is_ok());
+        assert!(validate_status("profitable_winner").is_err());
     }
 }
