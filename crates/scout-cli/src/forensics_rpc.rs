@@ -514,7 +514,10 @@ mod tests {
         assert_eq!(observation.err, error);
         assert_eq!(observation.memo.as_deref(), Some("memo"));
         assert_eq!(observation.block_time, None);
-        assert_eq!(observation.confirmation_status.as_deref(), Some("confirmed"));
+        assert_eq!(
+            observation.confirmation_status.as_deref(),
+            Some("confirmed")
+        );
     }
 
     #[test]
