@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use scout_core::{
-    NormalizedPoolState, NormalizedToken, PoolTradingState, QuoteReserveState, Venue,
+    ensure_supported_token_2022_mint_extensions, NormalizedPoolState, NormalizedToken,
+    PoolTradingState, QuoteReserveState, Venue,
 };
 use serde_json::{json, Value};
 
@@ -193,8 +194,8 @@ pub fn quote_exact_input(
         return Err("Raydium quote input must be greater than zero".to_owned());
     }
 
-    ensure_legacy_token_program(&snapshot.pool_state.token_0_program, "Raydium token_0")?;
-    ensure_legacy_token_program(&snapshot.pool_state.token_1_program, "Raydium token_1")?;
+    ensure_supported_token_program(&snapshot.pool_state.token_0_program, "Raydium token_0")?;
+    ensure_supported_token_program(&snapshot.pool_state.token_1_program, "Raydium token_1")?;
 
     let zero_for_one = if input_mint == snapshot.pool_state.token_0_mint {
         true
@@ -330,15 +331,9 @@ pub fn quote_exact_input(
     })
 }
 
-fn ensure_legacy_token_program(program: &str, label: &str) -> Result<(), String> {
-    if program == SPL_TOKEN_PROGRAM_ID {
+fn ensure_supported_token_program(program: &str, label: &str) -> Result<(), String> {
+    if program == SPL_TOKEN_PROGRAM_ID || program == TOKEN_2022_PROGRAM_ID {
         return Ok(());
-    }
-
-    if program == TOKEN_2022_PROGRAM_ID {
-        return Err(format!(
-            "{label} uses Token-2022; transfer-fee extension state is not hydrated, so quoting fails closed"
-        ));
     }
 
     Err(format!("{label} uses unsupported token program {program}"))
@@ -448,12 +443,14 @@ pub fn program_subscribe_request() -> Value {
     })
 }
 
-pub fn hydration_account_pubkeys(observation: &RaydiumCpmmAccountObservation) -> [String; 4] {
+pub fn hydration_account_pubkeys(observation: &RaydiumCpmmAccountObservation) -> [String; 6] {
     [
         observation.pubkey.clone(),
         observation.pool_state.amm_config.clone(),
         observation.pool_state.token_0_vault.clone(),
         observation.pool_state.token_1_vault.clone(),
+        observation.pool_state.token_0_mint.clone(),
+        observation.pool_state.token_1_mint.clone(),
     ]
 }
 
@@ -544,9 +541,9 @@ pub fn parse_hydration_response(
         .and_then(Value::as_array)
         .ok_or_else(|| "Solana getMultipleAccounts response missing account array".to_owned())?;
 
-    if accounts.len() != 4 {
+    if accounts.len() != 6 {
         return Err(format!(
-            "Raydium hydration expected exactly 4 accounts, got {}",
+            "Raydium hydration expected exactly 6 accounts, got {}",
             accounts.len()
         ));
     }
@@ -563,6 +560,9 @@ pub fn parse_hydration_response(
     let pool_state = decode_pool_state(&pool_data)?;
 
     verify_pool_identity(&observation.pool_state, &pool_state)?;
+
+    ensure_supported_token_program(&pool_state.token_0_program, "Raydium token_0")?;
+    ensure_supported_token_program(&pool_state.token_1_program, "Raydium token_1")?;
 
     let amm_config_data = decode_rpc_account_data(
         &accounts[1],
@@ -583,6 +583,17 @@ pub fn parse_hydration_response(
         &pool_state.token_1_program,
         &pool_state.token_1_mint,
         "token_1_vault",
+    )?;
+
+    validate_hydrated_mint_account(
+        &accounts[4],
+        &pool_state.token_0_program,
+        "Raydium token_0 mint",
+    )?;
+    validate_hydrated_mint_account(
+        &accounts[5],
+        &pool_state.token_1_program,
+        "Raydium token_1 mint",
     )?;
 
     let token_0_accrued_fees_raw = checked_accrued_fees(
@@ -790,6 +801,22 @@ fn decode_rpc_account_data(
     BASE64_STANDARD
         .decode(encoded_data)
         .map_err(|error| format!("{label} contained invalid base64 data: {error}"))
+}
+
+fn validate_hydrated_mint_account(
+    account: &Value,
+    expected_program: &str,
+    label: &str,
+) -> Result<(), String> {
+    ensure_supported_token_program(expected_program, label)?;
+
+    let data = decode_rpc_account_data(account, expected_program, label)?;
+
+    if expected_program == TOKEN_2022_PROGRAM_ID {
+        ensure_supported_token_2022_mint_extensions(&data, label)?;
+    }
+
+    Ok(())
 }
 
 fn parse_token_vault_account(
@@ -1071,6 +1098,14 @@ fn take<const N: usize>(data: &[u8], offset: &mut usize) -> Result<[u8; N], Stri
 mod tests {
     use super::*;
 
+    const TEST_MINT_BASE_LEN: usize = 82;
+    const TEST_MINT_INITIALIZED_OFFSET: usize = 45;
+    const TEST_TOKEN_2022_ACCOUNT_TYPE_OFFSET: usize = 165;
+    const TEST_TOKEN_2022_TLV_START: usize = 166;
+    const TEST_TOKEN_2022_METADATA_POINTER: u16 = 18;
+    const TEST_TOKEN_2022_TOKEN_METADATA: u16 = 19;
+    const TEST_TOKEN_2022_TRANSFER_FEE_CONFIG: u16 = 1;
+
     #[test]
     fn subscription_targets_raydium_cpmm_pool_state_size() {
         let request = program_subscribe_request();
@@ -1269,15 +1304,18 @@ mod tests {
     }
 
     #[test]
-    fn hydration_account_order_includes_amm_config() -> Result<(), String> {
+    fn hydration_account_order_includes_mints() -> Result<(), String> {
         let observation = fixture_observation(0, 1_234_567)?;
 
         let account_pubkeys = hydration_account_pubkeys(&observation);
 
+        assert_eq!(account_pubkeys.len(), 6);
         assert_eq!(account_pubkeys[0], observation.pubkey);
         assert_eq!(account_pubkeys[1], observation.pool_state.amm_config);
         assert_eq!(account_pubkeys[2], observation.pool_state.token_0_vault);
         assert_eq!(account_pubkeys[3], observation.pool_state.token_1_vault);
+        assert_eq!(account_pubkeys[4], observation.pool_state.token_0_mint);
+        assert_eq!(account_pubkeys[5], observation.pool_state.token_1_mint);
 
         Ok(())
     }
@@ -1287,13 +1325,13 @@ mod tests {
         let observation = fixture_observation(0, 1_234_567)?;
         let payload = fixture_hydration_payload(
             123_500,
-            &observation.pool_state.token_0_program,
+            SPL_TOKEN_PROGRAM_ID,
             6,
             10_000,
-            &observation.pool_state.token_1_program,
+            SPL_TOKEN_PROGRAM_ID,
             7,
             20_000,
-        );
+        )?;
 
         let snapshot = parse_hydration_response(&observation, &payload)?;
 
@@ -1325,17 +1363,199 @@ mod tests {
     }
 
     #[test]
+    fn token_2022_metadata_only_hydration_succeeds() -> Result<(), String> {
+        let observation = fixture_observation_with_programs(
+            0,
+            1_234_567,
+            TOKEN_2022_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+        )?;
+        let token_0_mint = fixture_token_2022_metadata_mint();
+
+        let payload = fixture_hydration_payload_with_programs(
+            123_500,
+            TOKEN_2022_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+            TOKEN_2022_PROGRAM_ID,
+            6,
+            10_000,
+            SPL_TOKEN_PROGRAM_ID,
+            7,
+            20_000,
+            &token_0_mint,
+            &fixture_legacy_mint(),
+        )?;
+
+        let snapshot = parse_hydration_response(&observation, &payload)?;
+        let quote = quote_exact_input(
+            &snapshot,
+            &snapshot.pool_state.token_0_mint,
+            100_000,
+        )?;
+
+        assert_eq!(snapshot.pool_state.token_0_program, TOKEN_2022_PROGRAM_ID);
+        assert!(quote.amount_out_raw > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn token_2022_transfer_fee_hydration_fails_closed() -> Result<(), String> {
+        let observation = fixture_observation_with_programs(
+            0,
+            1_234_567,
+            TOKEN_2022_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+        )?;
+        let token_0_mint =
+            fixture_token_2022_mint_with_extension(TEST_TOKEN_2022_TRANSFER_FEE_CONFIG, 8);
+
+        let payload = fixture_hydration_payload_with_programs(
+            123_500,
+            TOKEN_2022_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+            TOKEN_2022_PROGRAM_ID,
+            6,
+            10_000,
+            SPL_TOKEN_PROGRAM_ID,
+            7,
+            20_000,
+            &token_0_mint,
+            &fixture_legacy_mint(),
+        )?;
+
+        let result = parse_hydration_response(&observation, &payload);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("TransferFeeConfig")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn token_2022_unsupported_extension_hydration_fails_closed() -> Result<(), String> {
+        let observation = fixture_observation_with_programs(
+            0,
+            1_234_567,
+            TOKEN_2022_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+        )?;
+        let token_0_mint = fixture_token_2022_mint_with_extension(14, 4);
+
+        let payload = fixture_hydration_payload_with_programs(
+            123_500,
+            TOKEN_2022_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+            TOKEN_2022_PROGRAM_ID,
+            6,
+            10_000,
+            SPL_TOKEN_PROGRAM_ID,
+            7,
+            20_000,
+            &token_0_mint,
+            &fixture_legacy_mint(),
+        )?;
+
+        let result = parse_hydration_response(&observation, &payload);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("unsupported Token-2022 extension")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn token_2022_malformed_tlv_hydration_fails_closed() -> Result<(), String> {
+        let observation = fixture_observation_with_programs(
+            0,
+            1_234_567,
+            TOKEN_2022_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+        )?;
+        let mut token_0_mint = fixture_token_2022_mint_base();
+        token_0_mint.extend_from_slice(&TEST_TOKEN_2022_METADATA_POINTER.to_le_bytes());
+        token_0_mint.push(64);
+
+        let payload = fixture_hydration_payload_with_programs(
+            123_500,
+            TOKEN_2022_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+            TOKEN_2022_PROGRAM_ID,
+            6,
+            10_000,
+            SPL_TOKEN_PROGRAM_ID,
+            7,
+            20_000,
+            &token_0_mint,
+            &fixture_legacy_mint(),
+        )?;
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_wrong_mint_owner() -> Result<(), String> {
+        let observation = fixture_observation(0, 1_234_567)?;
+        let mut payload = fixture_hydration_payload(
+            123_500,
+            SPL_TOKEN_PROGRAM_ID,
+            6,
+            10_000,
+            SPL_TOKEN_PROGRAM_ID,
+            7,
+            20_000,
+        )?;
+
+        payload["result"]["value"][4]["owner"] =
+            Value::String(TOKEN_2022_PROGRAM_ID.to_owned());
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hydration_rejects_unsupported_pool_token_program() -> Result<(), String> {
+        let unsupported = bs58::encode([42u8; 32]).into_string();
+        let observation =
+            fixture_observation_with_programs(0, 1_234_567, &unsupported, SPL_TOKEN_PROGRAM_ID)?;
+        let payload = fixture_hydration_payload_with_programs(
+            123_500,
+            &unsupported,
+            SPL_TOKEN_PROGRAM_ID,
+            &unsupported,
+            6,
+            10_000,
+            SPL_TOKEN_PROGRAM_ID,
+            7,
+            20_000,
+            &fixture_legacy_mint(),
+            &fixture_legacy_mint(),
+        )?;
+
+        assert!(parse_hydration_response(&observation, &payload).is_err());
+
+        Ok(())
+    }
+
+    #[test]
     fn hydration_rejects_stale_context_slot() -> Result<(), String> {
         let observation = fixture_observation(0, 1_234_567)?;
         let payload = fixture_hydration_payload(
             123_455,
-            &observation.pool_state.token_0_program,
+            SPL_TOKEN_PROGRAM_ID,
             6,
             10_000,
-            &observation.pool_state.token_1_program,
+            SPL_TOKEN_PROGRAM_ID,
             7,
             20_000,
-        );
+        )?;
 
         assert!(parse_hydration_response(&observation, &payload).is_err());
 
@@ -1347,13 +1567,13 @@ mod tests {
         let observation = fixture_observation(0, 1_234_567)?;
         let mut payload = fixture_hydration_payload(
             123_500,
-            &observation.pool_state.token_0_program,
+            SPL_TOKEN_PROGRAM_ID,
             6,
             10_000,
-            &observation.pool_state.token_1_program,
+            SPL_TOKEN_PROGRAM_ID,
             7,
             20_000,
-        );
+        )?;
 
         payload["result"]["value"][1]["owner"] =
             Value::String("WrongProgram111111111111111111111111111111".to_owned());
@@ -1371,10 +1591,10 @@ mod tests {
             "WrongTokenProgram111111111111111111111111111",
             6,
             10_000,
-            &observation.pool_state.token_1_program,
+            SPL_TOKEN_PROGRAM_ID,
             7,
             20_000,
-        );
+        )?;
 
         assert!(parse_hydration_response(&observation, &payload).is_err());
 
@@ -1386,13 +1606,13 @@ mod tests {
         let observation = fixture_observation(0, 1_234_567)?;
         let payload = fixture_hydration_payload(
             123_500,
-            &observation.pool_state.token_0_program,
+            SPL_TOKEN_PROGRAM_ID,
             42,
             10_000,
-            &observation.pool_state.token_1_program,
+            SPL_TOKEN_PROGRAM_ID,
             7,
             20_000,
-        );
+        )?;
 
         assert!(parse_hydration_response(&observation, &payload).is_err());
 
@@ -1404,15 +1624,20 @@ mod tests {
         let observation = fixture_observation(0, 1_234_567)?;
         let mut payload = fixture_hydration_payload(
             123_500,
-            &observation.pool_state.token_0_program,
+            SPL_TOKEN_PROGRAM_ID,
             6,
             10_000,
-            &observation.pool_state.token_1_program,
+            SPL_TOKEN_PROGRAM_ID,
             7,
             20_000,
-        );
+        )?;
 
-        let mut changed_pool_data = fixture_pool_state(0, 1_234_567);
+        let mut changed_pool_data = fixture_pool_state_with_programs(
+            0,
+            1_234_567,
+            SPL_TOKEN_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+        )?;
         let observation_key_offset = POOL_STATE_DISCRIMINATOR.len() + (9 * 32);
         changed_pool_data[observation_key_offset..observation_key_offset + 32].fill(42);
         payload["result"]["value"][0] =
@@ -1429,13 +1654,13 @@ mod tests {
         let observation = fixture_observation(0, 1_234_567)?;
         let payload = fixture_hydration_payload(
             123_500,
-            &observation.pool_state.token_0_program,
+            SPL_TOKEN_PROGRAM_ID,
             6,
             35,
-            &observation.pool_state.token_1_program,
+            SPL_TOKEN_PROGRAM_ID,
             7,
             20_000,
-        );
+        )?;
 
         assert!(parse_hydration_response(&observation, &payload).is_err());
 
@@ -1447,15 +1672,15 @@ mod tests {
         let observation = fixture_observation(0, 1_234_567)?;
         let mut payload = fixture_hydration_payload(
             123_500,
-            &observation.pool_state.token_0_program,
+            SPL_TOKEN_PROGRAM_ID,
             6,
             10_000,
-            &observation.pool_state.token_1_program,
+            SPL_TOKEN_PROGRAM_ID,
             7,
             20_000,
-        );
+        )?;
 
-        payload["result"]["value"][3] = Value::Null;
+        payload["result"]["value"][5] = Value::Null;
 
         assert!(parse_hydration_response(&observation, &payload).is_err());
 
@@ -1466,7 +1691,23 @@ mod tests {
         status: u8,
         open_time: u64,
     ) -> Result<RaydiumCpmmAccountObservation, String> {
-        let pool_state = decode_pool_state(&fixture_pool_state(status, open_time))?;
+        fixture_observation_with_programs(
+            status,
+            open_time,
+            SPL_TOKEN_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+        )
+    }
+
+    fn fixture_observation_with_programs(
+        status: u8,
+        open_time: u64,
+        token_0_program: &str,
+        token_1_program: &str,
+    ) -> Result<RaydiumCpmmAccountObservation, String> {
+        let pool_data =
+            fixture_pool_state_with_programs(status, open_time, token_0_program, token_1_program)?;
+        let pool_state = decode_pool_state(&pool_data)?;
 
         Ok(RaydiumCpmmAccountObservation {
             pubkey: "ExamplePool111111111111111111111111111111111".to_owned(),
@@ -1480,19 +1721,53 @@ mod tests {
 
     fn fixture_hydration_payload(
         context_slot: u64,
-        token_0_owner: &str,
+        token_0_vault_owner: &str,
         token_0_mint_seed: u8,
         token_0_amount: u64,
-        token_1_owner: &str,
+        token_1_vault_owner: &str,
         token_1_mint_seed: u8,
         token_1_amount: u64,
-    ) -> Value {
-        let pool_data = fixture_pool_state(0, 1_234_567);
+    ) -> Result<Value, String> {
+        fixture_hydration_payload_with_programs(
+            context_slot,
+            SPL_TOKEN_PROGRAM_ID,
+            SPL_TOKEN_PROGRAM_ID,
+            token_0_vault_owner,
+            token_0_mint_seed,
+            token_0_amount,
+            token_1_vault_owner,
+            token_1_mint_seed,
+            token_1_amount,
+            &fixture_legacy_mint(),
+            &fixture_legacy_mint(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fixture_hydration_payload_with_programs(
+        context_slot: u64,
+        token_0_program: &str,
+        token_1_program: &str,
+        token_0_vault_owner: &str,
+        token_0_mint_seed: u8,
+        token_0_amount: u64,
+        token_1_vault_owner: &str,
+        token_1_mint_seed: u8,
+        token_1_amount: u64,
+        token_0_mint_data: &[u8],
+        token_1_mint_data: &[u8],
+    ) -> Result<Value, String> {
+        let pool_data = fixture_pool_state_with_programs(
+            0,
+            1_234_567,
+            token_0_program,
+            token_1_program,
+        )?;
         let amm_config_data = fixture_amm_config();
         let token_0_data = fixture_token_account(token_0_mint_seed, token_0_amount);
         let token_1_data = fixture_token_account(token_1_mint_seed, token_1_amount);
 
-        json!({
+        Ok(json!({
             "jsonrpc": "2.0",
             "id": 3,
             "result": {
@@ -1502,11 +1777,13 @@ mod tests {
                 "value": [
                     fixture_rpc_account(RAYDIUM_CPMM_PROGRAM_ID, &pool_data),
                     fixture_rpc_account(RAYDIUM_CPMM_PROGRAM_ID, &amm_config_data),
-                    fixture_rpc_account(token_0_owner, &token_0_data),
-                    fixture_rpc_account(token_1_owner, &token_1_data)
+                    fixture_rpc_account(token_0_vault_owner, &token_0_data),
+                    fixture_rpc_account(token_1_vault_owner, &token_1_data),
+                    fixture_rpc_account(token_0_program, token_0_mint_data),
+                    fixture_rpc_account(token_1_program, token_1_mint_data)
                 ]
             }
-        })
+        }))
     }
 
     fn fixture_rpc_account(owner: &str, data: &[u8]) -> Value {
@@ -1530,6 +1807,36 @@ mod tests {
         data[TOKEN_ACCOUNT_AMOUNT_OFFSET..TOKEN_ACCOUNT_AMOUNT_OFFSET + 8]
             .copy_from_slice(&amount.to_le_bytes());
 
+        data
+    }
+
+    fn fixture_legacy_mint() -> Vec<u8> {
+        let mut data = vec![0u8; TEST_MINT_BASE_LEN];
+        data[TEST_MINT_INITIALIZED_OFFSET] = 1;
+        data
+    }
+
+    fn fixture_token_2022_mint_base() -> Vec<u8> {
+        let mut data = vec![0u8; TEST_TOKEN_2022_TLV_START];
+        data[TEST_MINT_INITIALIZED_OFFSET] = 1;
+        data[TEST_TOKEN_2022_ACCOUNT_TYPE_OFFSET] = 1;
+        data
+    }
+
+    fn fixture_token_2022_mint_with_extension(extension_type: u16, length: u16) -> Vec<u8> {
+        let mut data = fixture_token_2022_mint_base();
+        data.extend_from_slice(&extension_type.to_le_bytes());
+        data.extend_from_slice(&length.to_le_bytes());
+        data.resize(data.len() + usize::from(length), 0);
+        data
+    }
+
+    fn fixture_token_2022_metadata_mint() -> Vec<u8> {
+        let mut data =
+            fixture_token_2022_mint_with_extension(TEST_TOKEN_2022_METADATA_POINTER, 64);
+        data.extend_from_slice(&TEST_TOKEN_2022_TOKEN_METADATA.to_le_bytes());
+        data.extend_from_slice(&8u16.to_le_bytes());
+        data.extend_from_slice(&[0u8; 8]);
         data
     }
 
@@ -1578,6 +1885,36 @@ mod tests {
         data.extend_from_slice(&[0u8; 28 * 8]);
 
         data
+    }
+
+    fn fixture_pool_state_with_programs(
+        status: u8,
+        open_time: u64,
+        token_0_program: &str,
+        token_1_program: &str,
+    ) -> Result<Vec<u8>, String> {
+        let mut data = fixture_pool_state(status, open_time);
+        let token_0_bytes = fixture_pubkey_bytes(token_0_program)?;
+        let token_1_bytes = fixture_pubkey_bytes(token_1_program)?;
+
+        let token_0_program_offset = POOL_STATE_DISCRIMINATOR.len() + (7 * 32);
+        let token_1_program_offset = token_0_program_offset + 32;
+
+        data[token_0_program_offset..token_0_program_offset + 32]
+            .copy_from_slice(&token_0_bytes);
+        data[token_1_program_offset..token_1_program_offset + 32]
+            .copy_from_slice(&token_1_bytes);
+
+        Ok(data)
+    }
+
+    fn fixture_pubkey_bytes(value: &str) -> Result<[u8; 32], String> {
+        let decoded = bs58::decode(value)
+            .into_vec()
+            .map_err(|error| format!("test pubkey decode failed: {error}"))?;
+
+        <[u8; 32]>::try_from(decoded.as_slice())
+            .map_err(|_| format!("test pubkey {value} did not decode to 32 bytes"))
     }
 
     fn quote_snapshot(creator_fee_on: u8) -> Result<RaydiumHydrationSnapshot, String> {
@@ -1642,13 +1979,18 @@ mod tests {
     }
 
     #[test]
-    fn exact_input_quote_fails_closed_for_token_2022() -> Result<(), String> {
+    fn exact_input_quote_accepts_supported_token_2022_program() -> Result<(), String> {
         let mut snapshot = quote_snapshot(0)?;
         snapshot.pool_state.token_1_program = TOKEN_2022_PROGRAM_ID.to_owned();
 
-        let result = quote_exact_input(&snapshot, &snapshot.pool_state.token_0_mint, 100_000);
+        let quote = quote_exact_input(
+            &snapshot,
+            &snapshot.pool_state.token_0_mint,
+            100_000,
+        )?;
 
-        assert!(matches!(result, Err(error) if error.contains("Token-2022")));
+        assert!(quote.amount_out_raw > 0);
+
         Ok(())
     }
 
