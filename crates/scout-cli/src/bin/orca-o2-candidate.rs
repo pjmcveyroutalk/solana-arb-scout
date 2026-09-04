@@ -11,7 +11,8 @@ use orca_whirlpools_core::{
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
-const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x07, 0x42, 0xbb];
+const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] =
+    [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0x07, 0x42, 0xbb];
 
 const TICK_SERIALIZED_LEN: usize = 113;
 const FIXED_TICK_ARRAY_LEN: usize = 8 + 4 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN) + 32;
