@@ -351,19 +351,15 @@ mod tests {
         let input_max_fee = u64::MAX;
         let output_max_fee = u64::MAX;
 
-        let net_input =
-            reference_apply_transfer_fee(gross_input, input_fee_bps, input_max_fee)?;
+        let net_input = reference_apply_transfer_fee(gross_input, input_fee_bps, input_max_fee)?;
 
         let input_fee_mint = transfer_fee_mint(input_fee_bps, input_max_fee)?;
         let output_fee_mint = transfer_fee_mint(output_fee_bps, output_max_fee)?;
 
         let baseline = baseline_quote(net_input, specified_token_a)?;
 
-        let expected_output = reference_apply_transfer_fee(
-            baseline.token_est_out,
-            output_fee_bps,
-            output_max_fee,
-        )?;
+        let expected_output =
+            reference_apply_transfer_fee(baseline.token_est_out, output_fee_bps, output_max_fee)?;
 
         let actual = if specified_token_a {
             quote_exact_input_with_mint_fees(
