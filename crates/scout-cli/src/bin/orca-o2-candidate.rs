@@ -52,6 +52,21 @@ const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0
 const TICK_SERIALIZED_LEN: usize = 113;
 const FIXED_TICK_ARRAY_LEN: usize = 8 + 4 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN) + 32;
 
+const DYNAMIC_TICK_ARRAY_DISCRIMINATOR: [u8; 8] =
+    [17, 216, 246, 142, 225, 199, 218, 56];
+const DYNAMIC_TICK_ARRAY_START_TICK_INDEX_OFFSET: usize = 8;
+const DYNAMIC_TICK_ARRAY_WHIRLPOOL_OFFSET: usize = 12;
+const DYNAMIC_TICK_ARRAY_BITMAP_OFFSET: usize = 44;
+const DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET: usize = 60;
+const DYNAMIC_TICK_UNINITIALIZED_LEN: usize = 1;
+const DYNAMIC_TICK_INITIALIZED_LEN: usize = 113;
+const DYNAMIC_TICK_DATA_LEN: usize =
+    DYNAMIC_TICK_INITIALIZED_LEN - DYNAMIC_TICK_UNINITIALIZED_LEN;
+const DYNAMIC_TICK_ARRAY_MIN_LEN: usize =
+    DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET + (TICK_ARRAY_SIZE * DYNAMIC_TICK_UNINITIALIZED_LEN);
+const DYNAMIC_TICK_ARRAY_MAX_LEN: usize =
+    DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET + (TICK_ARRAY_SIZE * DYNAMIC_TICK_INITIALIZED_LEN);
+
 fn main() -> Result<(), String> {
     println!("Orca O2 quote-readiness candidate");
     println!("Read-only. No routing admission, signing, submission, or execution.");
@@ -376,6 +391,35 @@ pub fn verify_whirlpool_facade_matches_pool(
     Ok(())
 }
 
+pub fn decode_tick_array_account(
+    data: &[u8],
+    account_owner: &str,
+    expected_whirlpool: &str,
+    expected_start_tick_index: i32,
+) -> Result<TickArrayFacade, String> {
+    if account_owner != orca::ORCA_WHIRLPOOL_PROGRAM_ID {
+        return Err(format!(
+            "Orca tick-array owner mismatch: expected {}, got {}",
+            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            account_owner
+        ));
+    }
+
+    let discriminator = read_array::<8>(data, 0, "tick-array discriminator")?;
+
+    if discriminator == FIXED_TICK_ARRAY_DISCRIMINATOR {
+        return decode_fixed_tick_array(data, expected_whirlpool, expected_start_tick_index);
+    }
+
+    if discriminator == DYNAMIC_TICK_ARRAY_DISCRIMINATOR {
+        return decode_dynamic_tick_array(data, expected_whirlpool, expected_start_tick_index);
+    }
+
+    Err(format!(
+        "unsupported Orca tick-array discriminator: {discriminator:?}"
+    ))
+}
+
 pub fn decode_fixed_tick_array(
     data: &[u8],
     expected_whirlpool: &str,
@@ -384,8 +428,8 @@ pub fn decode_fixed_tick_array(
     if data.len() != FIXED_TICK_ARRAY_LEN {
         return Err(format!(
             concat!(
-                "unsupported Orca tick-array representation: ",
-                "expected fixed array length {}, got {}"
+                "unsupported Orca fixed tick-array length: ",
+                "expected {}, got {}"
             ),
             FIXED_TICK_ARRAY_LEN,
             data.len()
@@ -480,6 +524,187 @@ pub fn decode_fixed_tick_array(
         return Err(format!(
             concat!(
                 "Orca fixed tick-array decoder did not consume account: ",
+                "consumed={} len={}"
+            ),
+            offset,
+            data.len()
+        ));
+    }
+
+    Ok(TickArrayFacade {
+        start_tick_index,
+        ticks,
+    })
+}
+
+pub fn decode_dynamic_tick_array(
+    data: &[u8],
+    expected_whirlpool: &str,
+    expected_start_tick_index: i32,
+) -> Result<TickArrayFacade, String> {
+    if !(DYNAMIC_TICK_ARRAY_MIN_LEN..=DYNAMIC_TICK_ARRAY_MAX_LEN).contains(&data.len()) {
+        return Err(format!(
+            concat!(
+                "Orca dynamic tick-array length outside supported bounds: ",
+                "min={} max={} got={}"
+            ),
+            DYNAMIC_TICK_ARRAY_MIN_LEN,
+            DYNAMIC_TICK_ARRAY_MAX_LEN,
+            data.len()
+        ));
+    }
+
+    let discriminator = read_array::<8>(data, 0, "dynamic tick-array discriminator")?;
+
+    if discriminator != DYNAMIC_TICK_ARRAY_DISCRIMINATOR {
+        return Err(format!(
+            "Orca dynamic tick-array discriminator mismatch: got {discriminator:?}"
+        ));
+    }
+
+    let start_tick_index = read_i32(
+        data,
+        DYNAMIC_TICK_ARRAY_START_TICK_INDEX_OFFSET,
+        "dynamic tick-array start index",
+    )?;
+
+    if start_tick_index != expected_start_tick_index {
+        return Err(format!(
+            concat!(
+                "Orca dynamic tick-array start-index mismatch: ",
+                "expected {}, got {}"
+            ),
+            expected_start_tick_index, start_tick_index
+        ));
+    }
+
+    let whirlpool_bytes = read_array::<32>(
+        data,
+        DYNAMIC_TICK_ARRAY_WHIRLPOOL_OFFSET,
+        "dynamic tick-array Whirlpool identity",
+    )?;
+    let decoded_whirlpool = Pubkey::new_from_array(whirlpool_bytes).to_string();
+
+    if decoded_whirlpool != expected_whirlpool {
+        return Err(format!(
+            concat!(
+                "Orca dynamic tick-array Whirlpool mismatch: ",
+                "expected {}, got {}"
+            ),
+            expected_whirlpool, decoded_whirlpool
+        ));
+    }
+
+    let tick_bitmap = read_u128(
+        data,
+        DYNAMIC_TICK_ARRAY_BITMAP_OFFSET,
+        "dynamic tick-array bitmap",
+    )?;
+
+    if (tick_bitmap >> TICK_ARRAY_SIZE) != 0 {
+        return Err("Orca dynamic tick-array bitmap has bits outside the 88-tick range".to_owned());
+    }
+
+    let initialized_tick_count = usize::try_from(tick_bitmap.count_ones())
+        .map_err(|_| "Orca dynamic tick count does not fit usize".to_owned())?;
+
+    let initialized_extra = initialized_tick_count
+        .checked_mul(DYNAMIC_TICK_DATA_LEN)
+        .ok_or_else(|| "Orca dynamic tick-array initialized-size overflow".to_owned())?;
+
+    let expected_len = DYNAMIC_TICK_ARRAY_MIN_LEN
+        .checked_add(initialized_extra)
+        .ok_or_else(|| "Orca dynamic tick-array expected-length overflow".to_owned())?;
+
+    if data.len() != expected_len {
+        return Err(format!(
+            concat!(
+                "Orca dynamic tick-array bitmap/length mismatch: ",
+                "expected {} bytes for {} initialized ticks, got {}"
+            ),
+            expected_len,
+            initialized_tick_count,
+            data.len()
+        ));
+    }
+
+    let mut ticks = [TickFacade::default(); TICK_ARRAY_SIZE];
+    let mut offset = DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET;
+
+    for (tick_index, tick) in ticks.iter_mut().enumerate() {
+        let tag = *data
+            .get(offset)
+            .ok_or_else(|| "Orca dynamic tick enum tag missing".to_owned())?;
+
+        let initialized = (tick_bitmap & (1u128 << tick_index)) != 0;
+
+        match (initialized, tag) {
+            (false, 0) => {
+                offset = checked_advance(offset, 1, "dynamic uninitialized tick")?;
+            }
+            (true, 1) => {
+                offset = checked_advance(offset, 1, "dynamic initialized tick tag")?;
+
+                let liquidity_net = read_i128(data, offset, "dynamic tick liquidity_net")?;
+                offset = checked_advance(offset, 16, "dynamic liquidity_net")?;
+
+                let liquidity_gross = read_u128(data, offset, "dynamic tick liquidity_gross")?;
+                offset = checked_advance(offset, 16, "dynamic liquidity_gross")?;
+
+                let fee_growth_outside_a =
+                    read_u128(data, offset, "dynamic tick fee_growth_outside_a")?;
+                offset = checked_advance(offset, 16, "dynamic fee_growth_outside_a")?;
+
+                let fee_growth_outside_b =
+                    read_u128(data, offset, "dynamic tick fee_growth_outside_b")?;
+                offset = checked_advance(offset, 16, "dynamic fee_growth_outside_b")?;
+
+                let reward_growth_0 =
+                    read_u128(data, offset, "dynamic tick reward_growth_outside_0")?;
+                offset = checked_advance(offset, 16, "dynamic reward_growth_outside_0")?;
+
+                let reward_growth_1 =
+                    read_u128(data, offset, "dynamic tick reward_growth_outside_1")?;
+                offset = checked_advance(offset, 16, "dynamic reward_growth_outside_1")?;
+
+                let reward_growth_2 =
+                    read_u128(data, offset, "dynamic tick reward_growth_outside_2")?;
+                offset = checked_advance(offset, 16, "dynamic reward_growth_outside_2")?;
+
+                *tick = TickFacade {
+                    initialized: true,
+                    liquidity_net,
+                    liquidity_gross,
+                    fee_growth_outside_a,
+                    fee_growth_outside_b,
+                    reward_growths_outside: [reward_growth_0, reward_growth_1, reward_growth_2],
+                };
+            }
+            (false, other) => {
+                return Err(format!(
+                    concat!(
+                        "Orca dynamic tick bitmap/tag mismatch at offset {}: ",
+                        "bitmap=uninitialized tag={}"
+                    ),
+                    tick_index, other
+                ));
+            }
+            (true, other) => {
+                return Err(format!(
+                    concat!(
+                        "Orca dynamic tick bitmap/tag mismatch at offset {}: ",
+                        "bitmap=initialized tag={}"
+                    ),
+                    tick_index, other
+                ));
+            }
+        }
+    }
+
+    if offset != data.len() {
+        return Err(format!(
+            concat!(
+                "Orca dynamic tick-array decoder did not consume account: ",
                 "consumed={} len={}"
             ),
             offset,
@@ -723,6 +948,96 @@ mod tests {
         Ok(data)
     }
 
+    fn sample_dynamic_tick_array(
+        whirlpool: &str,
+        start_tick_index: i32,
+        initialized_offsets: &[usize],
+    ) -> Result<Vec<u8>, String> {
+        let whirlpool_pubkey = Pubkey::from_str(whirlpool)
+            .map_err(|error| format!("invalid test Whirlpool pubkey: {error}"))?;
+
+        let mut tick_bitmap = 0u128;
+
+        for tick_offset in initialized_offsets {
+            if *tick_offset >= TICK_ARRAY_SIZE {
+                return Err(format!(
+                    "test dynamic tick offset outside array: {tick_offset}"
+                ));
+            }
+
+            tick_bitmap |= 1u128 << tick_offset;
+        }
+
+        let initialized_count = initialized_offsets.len();
+        let initialized_extra = initialized_count
+            .checked_mul(DYNAMIC_TICK_DATA_LEN)
+            .ok_or_else(|| "test dynamic tick-array size overflow".to_owned())?;
+        let account_len = DYNAMIC_TICK_ARRAY_MIN_LEN
+            .checked_add(initialized_extra)
+            .ok_or_else(|| "test dynamic tick-array length overflow".to_owned())?;
+
+        let mut data = vec![0u8; account_len];
+
+        data[0..8].copy_from_slice(&DYNAMIC_TICK_ARRAY_DISCRIMINATOR);
+        data[DYNAMIC_TICK_ARRAY_START_TICK_INDEX_OFFSET
+            ..DYNAMIC_TICK_ARRAY_START_TICK_INDEX_OFFSET + 4]
+            .copy_from_slice(&start_tick_index.to_le_bytes());
+        data[DYNAMIC_TICK_ARRAY_WHIRLPOOL_OFFSET..DYNAMIC_TICK_ARRAY_WHIRLPOOL_OFFSET + 32]
+            .copy_from_slice(whirlpool_pubkey.as_ref());
+        data[DYNAMIC_TICK_ARRAY_BITMAP_OFFSET..DYNAMIC_TICK_ARRAY_BITMAP_OFFSET + 16]
+            .copy_from_slice(&tick_bitmap.to_le_bytes());
+
+        let mut offset = DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET;
+
+        for tick_index in 0..TICK_ARRAY_SIZE {
+            let initialized = (tick_bitmap & (1u128 << tick_index)) != 0;
+
+            if !initialized {
+                data[offset] = 0;
+                offset += 1;
+                continue;
+            }
+
+            data[offset] = 1;
+            offset += 1;
+
+            let index_i128 = tick_index as i128;
+            let index_u128 = tick_index as u128;
+
+            let liquidity_net = 100i128 + index_i128;
+            let liquidity_gross = 200u128 + index_u128;
+            let fee_growth_a = 300u128 + index_u128;
+            let fee_growth_b = 400u128 + index_u128;
+            let reward_0 = 500u128 + index_u128;
+            let reward_1 = 600u128 + index_u128;
+            let reward_2 = 700u128 + index_u128;
+
+            data[offset..offset + 16].copy_from_slice(&liquidity_net.to_le_bytes());
+            offset += 16;
+            data[offset..offset + 16].copy_from_slice(&liquidity_gross.to_le_bytes());
+            offset += 16;
+            data[offset..offset + 16].copy_from_slice(&fee_growth_a.to_le_bytes());
+            offset += 16;
+            data[offset..offset + 16].copy_from_slice(&fee_growth_b.to_le_bytes());
+            offset += 16;
+            data[offset..offset + 16].copy_from_slice(&reward_0.to_le_bytes());
+            offset += 16;
+            data[offset..offset + 16].copy_from_slice(&reward_1.to_le_bytes());
+            offset += 16;
+            data[offset..offset + 16].copy_from_slice(&reward_2.to_le_bytes());
+            offset += 16;
+        }
+
+        if offset != data.len() {
+            return Err(format!(
+                "test dynamic tick-array encoder consumed {offset}, len={}",
+                data.len()
+            ));
+        }
+
+        Ok(data)
+    }
+
     #[test]
     fn official_tick_array_pda_vector_matches() -> Result<(), String> {
         let whirlpool = "2kJmUjxWBwL2NGPBV2PiA5hWtmLCqcKY6reQgkrPtaeS";
@@ -902,12 +1217,121 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_tick_array_representation_fails_closed() -> Result<(), String> {
-        let data = vec![0u8; 64];
+    fn dynamic_tick_array_decoder_preserves_sparse_initialized_ticks() -> Result<(), String> {
+        let whirlpool = Pubkey::new_unique().to_string();
+        let data = sample_dynamic_tick_array(&whirlpool, 0, &[1, 86])?;
 
-        match decode_fixed_tick_array(&data, &Pubkey::new_unique().to_string(), 0) {
-            Ok(_) => Err("unsupported tick-array representation was accepted".to_owned()),
-            Err(_) => Ok(()),
+        assert_eq!(data.len(), DYNAMIC_TICK_ARRAY_MIN_LEN + (2 * DYNAMIC_TICK_DATA_LEN));
+
+        let decoded = decode_tick_array_account(
+            &data,
+            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            &whirlpool,
+            0,
+        )?;
+
+        assert_eq!(decoded.start_tick_index, 0);
+        assert!(!decoded.ticks[0].initialized);
+        assert!(decoded.ticks[1].initialized);
+        assert_eq!(decoded.ticks[1].liquidity_net, 101);
+        assert_eq!(decoded.ticks[1].liquidity_gross, 201);
+        assert_eq!(decoded.ticks[1].fee_growth_outside_a, 301);
+        assert_eq!(decoded.ticks[1].fee_growth_outside_b, 401);
+        assert_eq!(decoded.ticks[1].reward_growths_outside, [501, 601, 701]);
+        assert!(!decoded.ticks[85].initialized);
+        assert!(decoded.ticks[86].initialized);
+        assert_eq!(decoded.ticks[86].liquidity_net, 186);
+        assert_eq!(decoded.ticks[86].liquidity_gross, 286);
+        assert_eq!(decoded.ticks[86].reward_growths_outside, [586, 686, 786]);
+        assert!(!decoded.ticks[87].initialized);
+
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_tick_array_decoder_rejects_bitmap_tag_mismatch() -> Result<(), String> {
+        let whirlpool = Pubkey::new_unique().to_string();
+        let mut data = sample_dynamic_tick_array(&whirlpool, 0, &[1])?;
+
+        let tick_one_tag_offset = DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET + 1;
+        data[tick_one_tag_offset] = 0;
+
+        match decode_dynamic_tick_array(&data, &whirlpool, 0) {
+            Ok(_) => Err("dynamic tick bitmap/tag mismatch was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("bitmap/tag mismatch"));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_tick_array_decoder_rejects_bitmap_length_mismatch() -> Result<(), String> {
+        let whirlpool = Pubkey::new_unique().to_string();
+        let mut data = sample_dynamic_tick_array(&whirlpool, 0, &[2])?;
+
+        let _ = data.pop();
+
+        match decode_dynamic_tick_array(&data, &whirlpool, 0) {
+            Ok(_) => Err("dynamic tick bitmap/length mismatch was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("bitmap/length mismatch"));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_tick_array_decoder_rejects_out_of_range_bitmap_bits() -> Result<(), String> {
+        let whirlpool = Pubkey::new_unique().to_string();
+        let mut data = sample_dynamic_tick_array(&whirlpool, 0, &[])?;
+
+        let invalid_bitmap = 1u128 << 100;
+        data[DYNAMIC_TICK_ARRAY_BITMAP_OFFSET..DYNAMIC_TICK_ARRAY_BITMAP_OFFSET + 16]
+            .copy_from_slice(&invalid_bitmap.to_le_bytes());
+
+        match decode_dynamic_tick_array(&data, &whirlpool, 0) {
+            Ok(_) => Err("dynamic tick bitmap with out-of-range bit was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("outside the 88-tick range"));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn tick_array_account_decoder_rejects_wrong_owner() -> Result<(), String> {
+        let whirlpool = Pubkey::new_unique().to_string();
+        let data = sample_dynamic_tick_array(&whirlpool, 0, &[])?;
+        let wrong_owner = Pubkey::new_unique().to_string();
+
+        match decode_tick_array_account(&data, &wrong_owner, &whirlpool, 0) {
+            Ok(_) => Err("tick array with wrong owner was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("owner mismatch"));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn tick_array_account_decoder_rejects_unknown_discriminator() -> Result<(), String> {
+        let whirlpool = Pubkey::new_unique().to_string();
+        let mut data = sample_dynamic_tick_array(&whirlpool, 0, &[])?;
+
+        data[0..8].copy_from_slice(&[9u8; 8]);
+
+        match decode_tick_array_account(
+            &data,
+            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            &whirlpool,
+            0,
+        ) {
+            Ok(_) => Err("unknown tick-array discriminator was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("unsupported Orca tick-array discriminator"));
+                Ok(())
+            }
         }
     }
 
