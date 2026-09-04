@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 #[path = "../src/orca.rs"]
 mod orca;
 
@@ -15,5 +17,9 @@ fn orca_o1_seam_is_compiled_by_the_canonical_test_suite() {
             .pointer("/params/0")
             .and_then(serde_json::Value::as_str),
         Some(orca::ORCA_WHIRLPOOL_PROGRAM_ID)
+    );
+    assert_eq!(
+        request.get("id").and_then(serde_json::Value::as_u64),
+        Some(18)
     );
 }
