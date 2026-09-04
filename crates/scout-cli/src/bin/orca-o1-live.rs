@@ -52,9 +52,7 @@ async fn run_orca_o1() -> Result<(), String> {
         .map_err(|error| format!("could not connect to Solana WebSocket: {error}"))?;
 
     websocket
-        .send(Message::Text(
-            orca::program_subscribe_request().to_string(),
-        ))
+        .send(Message::Text(orca::program_subscribe_request().to_string()))
         .await
         .map_err(|error| format!("could not subscribe to Orca Whirlpool: {error}"))?;
 
@@ -88,10 +86,7 @@ async fn run_orca_o1() -> Result<(), String> {
 
         let hydration_payload = fetch_hydration(&rpc_client, &observation).await?;
 
-        let snapshot = match orca::parse_hydration_response(
-            &observation,
-            &hydration_payload,
-        ) {
+        let snapshot = match orca::parse_hydration_response(&observation, &hydration_payload) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 println!(
@@ -164,9 +159,7 @@ async fn fetch_hydration(
     let status = response.status();
 
     if !status.is_success() {
-        return Err(format!(
-            "Orca hydration RPC returned HTTP status {status}"
-        ));
+        return Err(format!("Orca hydration RPC returned HTTP status {status}"));
     }
 
     response
@@ -175,16 +168,9 @@ async fn fetch_hydration(
         .map_err(|error| format!("invalid Orca hydration RPC JSON: {error}"))
 }
 
-async fn wait_for_subscription_confirmation<S>(
-    websocket: &mut S,
-) -> Result<(), String>
+async fn wait_for_subscription_confirmation<S>(websocket: &mut S) -> Result<(), String>
 where
-    S: StreamExt<
-            Item = Result<
-                Message,
-                tokio_tungstenite::tungstenite::Error,
-            >,
-        > + Unpin,
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     loop {
         let payload = next_json_message(websocket).await?;
@@ -202,9 +188,7 @@ where
         payload
             .get("result")
             .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                "Orca program subscription confirmation missing result".to_owned()
-            })?;
+            .ok_or_else(|| "Orca program subscription confirmation missing result".to_owned())?;
 
         println!("orca_program_subscription_confirmed");
 
@@ -214,12 +198,7 @@ where
 
 async fn next_json_message<S>(websocket: &mut S) -> Result<Value, String>
 where
-    S: StreamExt<
-            Item = Result<
-                Message,
-                tokio_tungstenite::tungstenite::Error,
-            >,
-        > + Unpin,
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     loop {
         let message = websocket
@@ -231,15 +210,11 @@ where
         match message {
             Message::Text(text) => {
                 return serde_json::from_str(text.as_ref())
-                    .map_err(|error| {
-                        format!("invalid Solana WebSocket JSON: {error}")
-                    });
+                    .map_err(|error| format!("invalid Solana WebSocket JSON: {error}"));
             }
             Message::Binary(bytes) => {
                 return serde_json::from_slice(bytes.as_ref())
-                    .map_err(|error| {
-                        format!("invalid binary Solana WebSocket JSON: {error}")
-                    });
+                    .map_err(|error| format!("invalid binary Solana WebSocket JSON: {error}"));
             }
             Message::Close(frame) => {
                 return Err(format!(
