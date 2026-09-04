@@ -52,6 +52,159 @@ impl TokenProgramKind {
     }
 }
 
+const TOKEN_2022_MINT_BASE_LEN: usize = 82;
+const TOKEN_2022_MINT_INITIALIZED_OFFSET: usize = 45;
+const TOKEN_2022_ACCOUNT_BASE_LEN: usize = 165;
+const TOKEN_2022_ACCOUNT_TYPE_OFFSET: usize = TOKEN_2022_ACCOUNT_BASE_LEN;
+const TOKEN_2022_MINT_TLV_START: usize = TOKEN_2022_ACCOUNT_TYPE_OFFSET + 1;
+const TOKEN_2022_MINT_ACCOUNT_TYPE: u8 = 1;
+const TOKEN_2022_TLV_HEADER_LEN: usize = 4;
+const TOKEN_2022_EXTENSION_UNINITIALIZED: u16 = 0;
+const TOKEN_2022_EXTENSION_TRANSFER_FEE_CONFIG: u16 = 1;
+const TOKEN_2022_EXTENSION_METADATA_POINTER: u16 = 18;
+const TOKEN_2022_EXTENSION_TOKEN_METADATA: u16 = 19;
+const TOKEN_2022_METADATA_POINTER_LEN: u16 = 64;
+
+pub fn ensure_supported_token_2022_mint_extensions(
+    data: &[u8],
+    label: &str,
+) -> Result<(), String> {
+    if data.len() < TOKEN_2022_MINT_BASE_LEN {
+        return Err(format!(
+            "{label} shorter than Token-2022 Mint base layout: expected at least \
+             {TOKEN_2022_MINT_BASE_LEN}, got {}",
+            data.len()
+        ));
+    }
+
+    match data[TOKEN_2022_MINT_INITIALIZED_OFFSET] {
+        1 => {}
+        0 => return Err(format!("{label} is not initialized")),
+        value => {
+            return Err(format!(
+                "{label} has invalid is_initialized value: {value}"
+            ));
+        }
+    }
+
+    if data.len() == TOKEN_2022_MINT_BASE_LEN {
+        return Ok(());
+    }
+
+    if data.len() < TOKEN_2022_MINT_TLV_START {
+        return Err(format!(
+            "{label} has malformed Token-2022 extension layout: length={} expected either \
+             {TOKEN_2022_MINT_BASE_LEN} or at least {TOKEN_2022_MINT_TLV_START}",
+            data.len()
+        ));
+    }
+
+    let padding = data
+        .get(TOKEN_2022_MINT_BASE_LEN..TOKEN_2022_ACCOUNT_BASE_LEN)
+        .ok_or_else(|| format!("{label} missing Token-2022 mint padding"))?;
+
+    if padding.iter().any(|byte| *byte != 0) {
+        return Err(format!("{label} has nonzero Token-2022 mint padding"));
+    }
+
+    if data[TOKEN_2022_ACCOUNT_TYPE_OFFSET] != TOKEN_2022_MINT_ACCOUNT_TYPE {
+        return Err(format!(
+            "{label} has invalid Token-2022 account type: expected \
+             {TOKEN_2022_MINT_ACCOUNT_TYPE}, got {}",
+            data[TOKEN_2022_ACCOUNT_TYPE_OFFSET]
+        ));
+    }
+
+    let mut offset = TOKEN_2022_MINT_TLV_START;
+    let mut metadata_pointer_seen = false;
+    let mut token_metadata_seen = false;
+
+    loop {
+        let remaining = data.len().saturating_sub(offset);
+        if remaining < 2 {
+            return Ok(());
+        }
+
+        let type_end = offset
+            .checked_add(2)
+            .ok_or_else(|| format!("{label} Token-2022 extension type offset overflow"))?;
+        let extension_type_bytes = data
+            .get(offset..type_end)
+            .ok_or_else(|| format!("{label} Token-2022 extension type outside account data"))?;
+        let extension_type = u16::from_le_bytes(
+            <[u8; 2]>::try_from(extension_type_bytes)
+                .map_err(|_| format!("{label} Token-2022 extension type had invalid length"))?,
+        );
+
+        if extension_type == TOKEN_2022_EXTENSION_UNINITIALIZED {
+            return Ok(());
+        }
+
+        let header_end = offset
+            .checked_add(TOKEN_2022_TLV_HEADER_LEN)
+            .ok_or_else(|| format!("{label} Token-2022 extension header offset overflow"))?;
+
+        if header_end > data.len() {
+            return Err(format!("{label} has truncated Token-2022 extension header"));
+        }
+
+        let length_bytes = data
+            .get(type_end..header_end)
+            .ok_or_else(|| format!("{label} Token-2022 extension length outside account data"))?;
+        let extension_len = usize::from(u16::from_le_bytes(
+            <[u8; 2]>::try_from(length_bytes)
+                .map_err(|_| format!("{label} Token-2022 extension length had invalid size"))?,
+        ));
+        let value_end = header_end
+            .checked_add(extension_len)
+            .ok_or_else(|| format!("{label} Token-2022 extension value offset overflow"))?;
+
+        if value_end > data.len() {
+            return Err(format!(
+                "{label} Token-2022 extension type {extension_type} exceeds account data"
+            ));
+        }
+
+        match extension_type {
+            TOKEN_2022_EXTENSION_TRANSFER_FEE_CONFIG => {
+                return Err(format!(
+                    "{label} uses Token-2022 TransferFeeConfig; transfer-fee quoting is not \
+                     supported"
+                ));
+            }
+            TOKEN_2022_EXTENSION_METADATA_POINTER => {
+                if metadata_pointer_seen {
+                    return Err(format!(
+                        "{label} contains duplicate Token-2022 MetadataPointer extensions"
+                    ));
+                }
+                if extension_len != usize::from(TOKEN_2022_METADATA_POINTER_LEN) {
+                    return Err(format!(
+                        "{label} Token-2022 MetadataPointer has invalid length: expected \
+                         {TOKEN_2022_METADATA_POINTER_LEN}, got {extension_len}"
+                    ));
+                }
+                metadata_pointer_seen = true;
+            }
+            TOKEN_2022_EXTENSION_TOKEN_METADATA => {
+                if token_metadata_seen {
+                    return Err(format!(
+                        "{label} contains duplicate Token-2022 TokenMetadata extensions"
+                    ));
+                }
+                token_metadata_seen = true;
+            }
+            _ => {
+                return Err(format!(
+                    "{label} uses unsupported Token-2022 extension type {extension_type}"
+                ));
+            }
+        }
+
+        offset = value_end;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CapabilityState {
     Supported,
@@ -289,6 +442,20 @@ mod tests {
         }
     }
 
+    fn token_2022_mint_with_extensions(extensions: &[(u16, u16)]) -> Vec<u8> {
+        let mut data = vec![0u8; TOKEN_2022_MINT_TLV_START];
+        data[TOKEN_2022_MINT_INITIALIZED_OFFSET] = 1;
+        data[TOKEN_2022_ACCOUNT_TYPE_OFFSET] = TOKEN_2022_MINT_ACCOUNT_TYPE;
+
+        for (extension_type, extension_len) in extensions {
+            data.extend_from_slice(&extension_type.to_le_bytes());
+            data.extend_from_slice(&extension_len.to_le_bytes());
+            data.resize(data.len() + usize::from(*extension_len), 0);
+        }
+
+        data
+    }
+
     #[test]
     fn adapter_capabilities_preserve_explicit_truth_states() {
         let capabilities = AdapterCapabilities {
@@ -408,5 +575,124 @@ mod tests {
         assert!(summary.contains("quote_reserves=unavailable"));
         assert!(summary.contains("received_at_ms=1000"));
         assert!(summary.contains("normalized_at_ms=1001"));
+    }
+
+    #[test]
+    fn token_2022_plain_mint_is_eligible() {
+        let mut data = vec![0u8; TOKEN_2022_MINT_BASE_LEN];
+        data[TOKEN_2022_MINT_INITIALIZED_OFFSET] = 1;
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_ok());
+    }
+
+    #[test]
+    fn token_2022_metadata_only_extensions_are_eligible() {
+        let data = token_2022_mint_with_extensions(&[
+            (
+                TOKEN_2022_EXTENSION_METADATA_POINTER,
+                TOKEN_2022_METADATA_POINTER_LEN,
+            ),
+            (TOKEN_2022_EXTENSION_TOKEN_METADATA, 8),
+        ]);
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_ok());
+    }
+
+    #[test]
+    fn token_2022_transfer_fee_config_fails_closed() {
+        let data = token_2022_mint_with_extensions(&[(
+            TOKEN_2022_EXTENSION_TRANSFER_FEE_CONFIG,
+            8,
+        )]);
+        let result = ensure_supported_token_2022_mint_extensions(&data, "test mint");
+
+        assert!(matches!(result, Err(error) if error.contains("TransferFeeConfig")));
+    }
+
+    #[test]
+    fn token_2022_unknown_extension_fails_closed() {
+        let data = token_2022_mint_with_extensions(&[(14, 4)]);
+        let result = ensure_supported_token_2022_mint_extensions(&data, "test mint");
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("unsupported Token-2022 extension")
+        ));
+    }
+
+    #[test]
+    fn token_2022_duplicate_metadata_extension_fails_closed() {
+        let data = token_2022_mint_with_extensions(&[
+            (
+                TOKEN_2022_EXTENSION_METADATA_POINTER,
+                TOKEN_2022_METADATA_POINTER_LEN,
+            ),
+            (
+                TOKEN_2022_EXTENSION_METADATA_POINTER,
+                TOKEN_2022_METADATA_POINTER_LEN,
+            ),
+        ]);
+        let result = ensure_supported_token_2022_mint_extensions(&data, "test mint");
+
+        assert!(matches!(result, Err(error) if error.contains("duplicate")));
+    }
+
+    #[test]
+    fn token_2022_nonzero_mint_padding_fails_closed() {
+        let mut data = token_2022_mint_with_extensions(&[]);
+        data[TOKEN_2022_MINT_BASE_LEN] = 1;
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_err());
+    }
+
+    #[test]
+    fn token_2022_wrong_account_type_fails_closed() {
+        let mut data = token_2022_mint_with_extensions(&[]);
+        data[TOKEN_2022_ACCOUNT_TYPE_OFFSET] = 2;
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_err());
+    }
+
+    #[test]
+    fn token_2022_truncated_header_fails_closed() {
+        let mut data = token_2022_mint_with_extensions(&[]);
+        data.extend_from_slice(&TOKEN_2022_EXTENSION_METADATA_POINTER.to_le_bytes());
+        data.push(64);
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_err());
+    }
+
+    #[test]
+    fn token_2022_truncated_value_fails_closed() {
+        let mut data = token_2022_mint_with_extensions(&[]);
+        data.extend_from_slice(&TOKEN_2022_EXTENSION_METADATA_POINTER.to_le_bytes());
+        data.extend_from_slice(&TOKEN_2022_METADATA_POINTER_LEN.to_le_bytes());
+        data.extend_from_slice(&[0u8; 3]);
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_err());
+    }
+
+    #[test]
+    fn token_2022_uninitialized_type_terminates_tlv_iteration() {
+        let mut data = token_2022_mint_with_extensions(&[]);
+        data.extend_from_slice(&TOKEN_2022_EXTENSION_UNINITIALIZED.to_le_bytes());
+        data.extend_from_slice(&[9u8; 3]);
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_ok());
+    }
+
+    #[test]
+    fn token_2022_single_byte_tail_matches_upstream_iteration_boundary() {
+        let mut data = token_2022_mint_with_extensions(&[]);
+        data.push(9);
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_ok());
+    }
+
+    #[test]
+    fn token_2022_uninitialized_mint_fails_closed() {
+        let data = vec![0u8; TOKEN_2022_MINT_BASE_LEN];
+
+        assert!(ensure_supported_token_2022_mint_extensions(&data, "test mint").is_err());
     }
 }
