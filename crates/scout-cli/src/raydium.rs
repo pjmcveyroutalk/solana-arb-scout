@@ -1387,11 +1387,7 @@ mod tests {
         )?;
 
         let snapshot = parse_hydration_response(&observation, &payload)?;
-        let quote = quote_exact_input(
-            &snapshot,
-            &snapshot.pool_state.token_0_mint,
-            100_000,
-        )?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.token_0_mint, 100_000)?;
 
         assert_eq!(snapshot.pool_state.token_0_program, TOKEN_2022_PROGRAM_ID);
         assert!(quote.amount_out_raw > 0);
@@ -1512,8 +1508,7 @@ mod tests {
             20_000,
         )?;
 
-        payload["result"]["value"][4]["owner"] =
-            Value::String(TOKEN_2022_PROGRAM_ID.to_owned());
+        payload["result"]["value"][4]["owner"] = Value::String(TOKEN_2022_PROGRAM_ID.to_owned());
 
         assert!(parse_hydration_response(&observation, &payload).is_err());
 
@@ -1757,12 +1752,8 @@ mod tests {
         token_0_mint_data: &[u8],
         token_1_mint_data: &[u8],
     ) -> Result<Value, String> {
-        let pool_data = fixture_pool_state_with_programs(
-            0,
-            1_234_567,
-            token_0_program,
-            token_1_program,
-        )?;
+        let pool_data =
+            fixture_pool_state_with_programs(0, 1_234_567, token_0_program, token_1_program)?;
         let amm_config_data = fixture_amm_config();
         let token_0_data = fixture_token_account(token_0_mint_seed, token_0_amount);
         let token_1_data = fixture_token_account(token_1_mint_seed, token_1_amount);
@@ -1832,8 +1823,7 @@ mod tests {
     }
 
     fn fixture_token_2022_metadata_mint() -> Vec<u8> {
-        let mut data =
-            fixture_token_2022_mint_with_extension(TEST_TOKEN_2022_METADATA_POINTER, 64);
+        let mut data = fixture_token_2022_mint_with_extension(TEST_TOKEN_2022_METADATA_POINTER, 64);
         data.extend_from_slice(&TEST_TOKEN_2022_TOKEN_METADATA.to_le_bytes());
         data.extend_from_slice(&8u16.to_le_bytes());
         data.extend_from_slice(&[0u8; 8]);
@@ -1900,10 +1890,8 @@ mod tests {
         let token_0_program_offset = POOL_STATE_DISCRIMINATOR.len() + (7 * 32);
         let token_1_program_offset = token_0_program_offset + 32;
 
-        data[token_0_program_offset..token_0_program_offset + 32]
-            .copy_from_slice(&token_0_bytes);
-        data[token_1_program_offset..token_1_program_offset + 32]
-            .copy_from_slice(&token_1_bytes);
+        data[token_0_program_offset..token_0_program_offset + 32].copy_from_slice(&token_0_bytes);
+        data[token_1_program_offset..token_1_program_offset + 32].copy_from_slice(&token_1_bytes);
 
         Ok(data)
     }
@@ -1983,11 +1971,7 @@ mod tests {
         let mut snapshot = quote_snapshot(0)?;
         snapshot.pool_state.token_1_program = TOKEN_2022_PROGRAM_ID.to_owned();
 
-        let quote = quote_exact_input(
-            &snapshot,
-            &snapshot.pool_state.token_0_mint,
-            100_000,
-        )?;
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.token_0_mint, 100_000)?;
 
         assert!(quote.amount_out_raw > 0);
 
