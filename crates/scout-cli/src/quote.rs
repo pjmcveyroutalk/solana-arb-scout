@@ -466,9 +466,7 @@ pub fn quote_readiness_for_pool(
                     token_a_raw,
                     token_b_raw,
                     source_slot,
-                } if *token_a_raw > 0
-                    && *token_b_raw > 0
-                    && *source_slot >= pool.source_slot => {}
+                } if *token_a_raw > 0 && *token_b_raw > 0 && *source_slot >= pool.source_slot => {}
                 QuoteReserveState::Available { .. } => {
                     return Err(format!(
                         "pool {} does not have positive fresh CPMM quote reserves",
