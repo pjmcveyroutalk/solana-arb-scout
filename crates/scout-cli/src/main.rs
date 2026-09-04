@@ -181,8 +181,7 @@ async fn main() -> Result<(), String> {
     };
 
     if initial_routes.is_empty() {
-        println!("\
-Rung 9 deterministic exact-pair route reacquisition");
+        println!("\nRung 9 deterministic exact-pair route reacquisition");
 
         let (
             discovered_raydium_states,
@@ -230,8 +229,7 @@ async fn observe_slots<S>(reader: &mut S) -> Result<(), String>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    println!("\
-Transport: live slots");
+    println!("\nTransport: live slots");
 
     let mut observed = 0usize;
 
@@ -268,8 +266,7 @@ async fn observe_raydium<S>(
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    println!("\
-Venue adapter: Raydium CPMM");
+    println!("\nVenue adapter: Raydium CPMM");
 
     let mut states = Vec::new();
     let mut quote_contexts = BTreeMap::new();
@@ -348,8 +345,7 @@ async fn observe_pumpswap<S>(
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    println!("\
-Venue adapter: PumpSwap");
+    println!("\nVenue adapter: PumpSwap");
 
     let mut states = Vec::new();
     let mut quote_contexts = BTreeMap::new();
@@ -967,15 +963,13 @@ async fn fetch_pyth_usd_price(
 }
 
 async fn fetch_pyth_usd_prices(rpc_client: &Client) -> Result<PythUsdPrices, String> {
-    println!("\
-Rung 10 sizing oracle: Pyth SOL/USD");
+    println!("\nRung 10 sizing oracle: Pyth SOL/USD");
 
     let sol = fetch_pyth_usd_price(rpc_client, PythUsdFeed::Sol).await?;
     println!("sol_usd_price: {}", sol.summary());
     println!("READ-ONLY PYTH SOL/USD VALIDATION PASS");
 
-    println!("\
-Rung 11D stablecoin external-cost conversion oracle");
+    println!("\nRung 11D stablecoin external-cost conversion oracle");
 
     let usdc = match fetch_pyth_usd_price(rpc_client, PythUsdFeed::Usdc).await {
         Ok(price) => {
@@ -1228,17 +1222,13 @@ async fn validate_registry_routes_and_sizes(
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
     usd_prices: &PythUsdPrices,
 ) -> Result<(), String> {
-    println!("\
-Registry: Active Mint");
+    println!("\nRegistry: Active Mint");
 
     let mut registry = ActiveMintRegistry::new();
 
     for state in raydium_states.into_iter().chain(pumpswap_states) {
-        let readiness = quote_readiness_from_contexts(
-            &state,
-            raydium_quote_contexts,
-            pumpswap_quote_contexts,
-        );
+        let readiness =
+            quote_readiness_from_contexts(&state, raydium_quote_contexts, pumpswap_quote_contexts);
 
         registry.upsert(state, readiness)?;
     }
@@ -1258,8 +1248,7 @@ Registry: Active Mint");
     println!("READ-ONLY ACTIVE-MINT REGISTRY PASS");
     println!("READ-ONLY RUNG 8 ACTIVE-MINT DETECTION PASS");
 
-    println!("\
-Route engine: Two-Leg Circular");
+    println!("\nRoute engine: Two-Leg Circular");
 
     let eligible_pools = registry.current_eligible_pools();
     let route_candidates = generate_two_leg_routes(&eligible_pools);
@@ -1294,8 +1283,7 @@ Route engine: Two-Leg Circular");
         shadow_recorder.output_path().display()
     );
 
-    println!("\
-Rung 10 deterministic USD size-grid quote engine");
+    println!("\nRung 10 deterministic USD size-grid quote engine");
 
     let mut successful_routes = 0usize;
     let mut successful_grid_quotes = 0usize;
@@ -1459,8 +1447,7 @@ Rung 10 deterministic USD size-grid quote engine");
     println!("rung10_successful_grid_quote_count={successful_grid_quotes}");
     println!("READ-ONLY RUNG 10 SIZE + QUOTE ENGINE PASS");
 
-    println!("\
-Rung 11C read-only cost observation");
+    println!("\nRung 11C read-only cost observation");
 
     let jito_observation = observe_jito_tip_floor(rpc_client).await;
     let mut priority_cache = BTreeMap::<Vec<String>, costs::PriorityObservationState>::new();
@@ -1712,8 +1699,7 @@ Rung 11C read-only cost observation");
     recorder::validate_jsonl_replay(&shadow_output)?;
     println!("READ-ONLY RUNG 12 SHADOW RECORDER PASS");
 
-    println!("\
-Rung 13 captureability forensics");
+    println!("\nRung 13 captureability forensics");
 
     let forensics_plan = forensics::load_plan(&shadow_output)?;
     println!(
