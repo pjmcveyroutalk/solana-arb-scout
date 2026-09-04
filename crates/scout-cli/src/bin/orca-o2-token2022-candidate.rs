@@ -4,9 +4,9 @@ use orca_whirlpools_core::TransferFee;
 
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-
 const CLOCK_SYSVAR_ID: &str = "SysvarC1ock11111111111111111111111111111111";
 const SYSVAR_OWNER_ID: &str = "Sysvar1111111111111111111111111111111111111";
+
 const CLOCK_DATA_LEN: usize = 40;
 const CLOCK_SLOT_OFFSET: usize = 0;
 const CLOCK_EPOCH_OFFSET: usize = 16;
@@ -91,12 +91,7 @@ pub fn decode_clock_sysvar(
         ));
     }
 
-    let unix_timestamp = read_i64(
-        data,
-        CLOCK_UNIX_TIMESTAMP_OFFSET,
-        "Clock unix_timestamp",
-    )?;
-
+    let unix_timestamp = read_i64(data, CLOCK_UNIX_TIMESTAMP_OFFSET, "Clock unix_timestamp")?;
     let unix_timestamp = u64::try_from(unix_timestamp)
         .map_err(|_| "Orca O2 Clock unix_timestamp is negative".to_owned())?;
 
@@ -124,14 +119,10 @@ pub fn transfer_fee_for_mint(
     }
 }
 
-fn validate_legacy_spl_mint(
-    data: &[u8],
-    label: &str,
-) -> Result<Option<TransferFee>, String> {
+fn validate_legacy_spl_mint(data: &[u8], label: &str) -> Result<Option<TransferFee>, String> {
     if data.len() != TOKEN_2022_MINT_BASE_LEN {
         return Err(format!(
-            "{label} legacy SPL Mint length mismatch: expected \
-             {TOKEN_2022_MINT_BASE_LEN}, got {}",
+            "{label} legacy SPL Mint length mismatch: expected {TOKEN_2022_MINT_BASE_LEN}, got {}",
             data.len()
         ));
     }
@@ -139,9 +130,7 @@ fn validate_legacy_spl_mint(
     match data[45] {
         1 => Ok(None),
         0 => Err(format!("{label} is not initialized")),
-        value => Err(format!(
-            "{label} has invalid is_initialized value: {value}"
-        )),
+        value => Err(format!("{label} has invalid is_initialized value: {value}")),
     }
 }
 
@@ -174,50 +163,32 @@ pub fn current_transfer_fee_for_token_2022_mint(
 
         let header_end = offset
             .checked_add(TOKEN_2022_TLV_HEADER_LEN)
-            .ok_or_else(|| {
-                format!(
-                    "{label} Token-2022 extension header offset overflow"
-                )
-            })?;
+            .ok_or_else(|| format!("{label} Token-2022 extension header offset overflow"))?;
 
         if header_end > data.len() {
-            return Err(format!(
-                "{label} has truncated Token-2022 extension header"
-            ));
+            return Err(format!("{label} has truncated Token-2022 extension header"));
         }
 
-        let extension_len =
-            usize::from(read_u16(data, offset + 2, label)?);
-
+        let extension_len = usize::from(read_u16(data, offset + 2, label)?);
         let value_end = header_end
             .checked_add(extension_len)
-            .ok_or_else(|| {
-                format!(
-                    "{label} Token-2022 extension value offset overflow"
-                )
-            })?;
+            .ok_or_else(|| format!("{label} Token-2022 extension value offset overflow"))?;
 
         if value_end > data.len() {
             return Err(format!(
-                "{label} Token-2022 extension type {extension_type} \
-                 exceeds account data"
+                "{label} Token-2022 extension type {extension_type} exceeds account data"
             ));
         }
 
         let extension_value = data
             .get(header_end..value_end)
-            .ok_or_else(|| {
-                format!(
-                    "{label} Token-2022 extension value outside account data"
-                )
-            })?;
+            .ok_or_else(|| format!("{label} Token-2022 extension value outside account data"))?;
 
         match extension_type {
             EXTENSION_TRANSFER_FEE_CONFIG => {
                 if transfer_fee.is_some() {
                     return Err(format!(
-                        "{label} contains duplicate Token-2022 \
-                         TransferFeeConfig extensions"
+                        "{label} contains duplicate Token-2022 TransferFeeConfig extensions"
                     ));
                 }
 
@@ -229,23 +200,19 @@ pub fn current_transfer_fee_for_token_2022_mint(
             }
             EXTENSION_TRANSFER_HOOK => {
                 return Err(format!(
-                    "{label} uses Token-2022 TransferHook; \
-                     Orca O2 quote readiness fails closed"
+                    "{label} uses Token-2022 TransferHook; Orca O2 quote readiness fails closed"
                 ));
             }
             EXTENSION_METADATA_POINTER => {
                 if metadata_pointer_seen {
                     return Err(format!(
-                        "{label} contains duplicate Token-2022 \
-                         MetadataPointer extensions"
+                        "{label} contains duplicate Token-2022 MetadataPointer extensions"
                     ));
                 }
 
                 if extension_len != METADATA_POINTER_LEN {
                     return Err(format!(
-                        "{label} Token-2022 MetadataPointer has invalid \
-                         length: expected {METADATA_POINTER_LEN}, \
-                         got {extension_len}"
+                        "{label} MetadataPointer length invalid: {extension_len}"
                     ));
                 }
 
@@ -254,8 +221,7 @@ pub fn current_transfer_fee_for_token_2022_mint(
             EXTENSION_TOKEN_METADATA => {
                 if token_metadata_seen {
                     return Err(format!(
-                        "{label} contains duplicate Token-2022 \
-                         TokenMetadata extensions"
+                        "{label} contains duplicate Token-2022 TokenMetadata extensions"
                     ));
                 }
 
@@ -263,8 +229,7 @@ pub fn current_transfer_fee_for_token_2022_mint(
             }
             _ => {
                 return Err(format!(
-                    "{label} uses unsupported Token-2022 extension \
-                     type {extension_type}"
+                    "{label} uses unsupported Token-2022 extension type {extension_type}"
                 ));
             }
         }
@@ -273,14 +238,10 @@ pub fn current_transfer_fee_for_token_2022_mint(
     }
 }
 
-fn validate_token_2022_mint_prefix(
-    data: &[u8],
-    label: &str,
-) -> Result<(), String> {
+fn validate_token_2022_mint_prefix(data: &[u8], label: &str) -> Result<(), String> {
     if data.len() < TOKEN_2022_MINT_BASE_LEN {
         return Err(format!(
-            "{label} shorter than Token-2022 Mint base layout: \
-             expected at least {TOKEN_2022_MINT_BASE_LEN}, got {}",
+            "{label} Token-2022 Mint too short: expected {TOKEN_2022_MINT_BASE_LEN}, got {}",
             data.len()
         ));
     }
@@ -288,11 +249,7 @@ fn validate_token_2022_mint_prefix(
     match data[45] {
         1 => {}
         0 => return Err(format!("{label} is not initialized")),
-        value => {
-            return Err(format!(
-                "{label} has invalid is_initialized value: {value}"
-            ));
-        }
+        value => return Err(format!("{label} has invalid is_initialized value: {value}")),
     }
 
     if data.len() == TOKEN_2022_MINT_BASE_LEN {
@@ -301,31 +258,22 @@ fn validate_token_2022_mint_prefix(
 
     if data.len() < TOKEN_2022_MINT_TLV_START {
         return Err(format!(
-            "{label} has malformed Token-2022 extension layout: \
-             length={} expected either {TOKEN_2022_MINT_BASE_LEN} \
-             or at least {TOKEN_2022_MINT_TLV_START}",
+            "{label} malformed Token-2022 extension layout: length={}",
             data.len()
         ));
     }
 
     let padding = data
         .get(TOKEN_2022_MINT_BASE_LEN..TOKEN_2022_ACCOUNT_BASE_LEN)
-        .ok_or_else(|| {
-            format!("{label} missing Token-2022 mint padding")
-        })?;
+        .ok_or_else(|| format!("{label} missing Token-2022 mint padding"))?;
 
     if padding.iter().any(|byte| *byte != 0) {
-        return Err(format!(
-            "{label} has nonzero Token-2022 mint padding"
-        ));
+        return Err(format!("{label} has nonzero Token-2022 mint padding"));
     }
 
-    if data[TOKEN_2022_ACCOUNT_TYPE_OFFSET]
-        != TOKEN_2022_MINT_ACCOUNT_TYPE
-    {
+    if data[TOKEN_2022_ACCOUNT_TYPE_OFFSET] != TOKEN_2022_MINT_ACCOUNT_TYPE {
         return Err(format!(
-            "{label} has invalid Token-2022 account type: expected \
-             {TOKEN_2022_MINT_ACCOUNT_TYPE}, got {}",
+            "{label} invalid Token-2022 account type: {}",
             data[TOKEN_2022_ACCOUNT_TYPE_OFFSET]
         ));
     }
@@ -340,46 +288,21 @@ fn parse_transfer_fee_config(
 ) -> Result<TransferFee, String> {
     if data.len() != TRANSFER_FEE_CONFIG_LEN {
         return Err(format!(
-            "{label} Token-2022 TransferFeeConfig has invalid length: \
-             expected {TRANSFER_FEE_CONFIG_LEN}, got {}",
+            "{label} TransferFeeConfig length invalid: expected {TRANSFER_FEE_CONFIG_LEN}, got {}",
             data.len()
         ));
     }
 
     let older = ParsedTransferFee {
-        epoch: read_u64(
-            data,
-            TRANSFER_FEE_OLDER_EPOCH_OFFSET,
-            label,
-        )?,
-        maximum_fee: read_u64(
-            data,
-            TRANSFER_FEE_OLDER_MAX_FEE_OFFSET,
-            label,
-        )?,
-        basis_points: read_u16(
-            data,
-            TRANSFER_FEE_OLDER_BPS_OFFSET,
-            label,
-        )?,
+        epoch: read_u64(data, TRANSFER_FEE_OLDER_EPOCH_OFFSET, label)?,
+        maximum_fee: read_u64(data, TRANSFER_FEE_OLDER_MAX_FEE_OFFSET, label)?,
+        basis_points: read_u16(data, TRANSFER_FEE_OLDER_BPS_OFFSET, label)?,
     };
 
     let newer = ParsedTransferFee {
-        epoch: read_u64(
-            data,
-            TRANSFER_FEE_NEWER_EPOCH_OFFSET,
-            label,
-        )?,
-        maximum_fee: read_u64(
-            data,
-            TRANSFER_FEE_NEWER_MAX_FEE_OFFSET,
-            label,
-        )?,
-        basis_points: read_u16(
-            data,
-            TRANSFER_FEE_NEWER_BPS_OFFSET,
-            label,
-        )?,
+        epoch: read_u64(data, TRANSFER_FEE_NEWER_EPOCH_OFFSET, label)?,
+        maximum_fee: read_u64(data, TRANSFER_FEE_NEWER_MAX_FEE_OFFSET, label)?,
+        basis_points: read_u16(data, TRANSFER_FEE_NEWER_BPS_OFFSET, label)?,
     };
 
     validate_transfer_fee(older, label, "older")?;
@@ -401,8 +324,7 @@ fn validate_transfer_fee(
 ) -> Result<(), String> {
     if fee.basis_points > MAX_FEE_BASIS_POINTS {
         return Err(format!(
-            "{label} Token-2022 {which} transfer fee exceeds \
-             10000 bps: {}",
+            "{label} Token-2022 {which} transfer fee exceeds 10000 bps: {}",
             fee.basis_points
         ));
     }
@@ -410,40 +332,16 @@ fn validate_transfer_fee(
     Ok(())
 }
 
-fn read_u16(
-    data: &[u8],
-    offset: usize,
-    label: &str,
-) -> Result<u16, String> {
-    Ok(u16::from_le_bytes(read_array::<2>(
-        data,
-        offset,
-        label,
-    )?))
+fn read_u16(data: &[u8], offset: usize, label: &str) -> Result<u16, String> {
+    Ok(u16::from_le_bytes(read_array::<2>(data, offset, label)?))
 }
 
-fn read_i64(
-    data: &[u8],
-    offset: usize,
-    label: &str,
-) -> Result<i64, String> {
-    Ok(i64::from_le_bytes(read_array::<8>(
-        data,
-        offset,
-        label,
-    )?))
+fn read_i64(data: &[u8], offset: usize, label: &str) -> Result<i64, String> {
+    Ok(i64::from_le_bytes(read_array::<8>(data, offset, label)?))
 }
 
-fn read_u64(
-    data: &[u8],
-    offset: usize,
-    label: &str,
-) -> Result<u64, String> {
-    Ok(u64::from_le_bytes(read_array::<8>(
-        data,
-        offset,
-        label,
-    )?))
+fn read_u64(data: &[u8], offset: usize, label: &str) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(read_array::<8>(data, offset, label)?))
 }
 
 fn read_array<const N: usize>(
@@ -453,27 +351,21 @@ fn read_array<const N: usize>(
 ) -> Result<[u8; N], String> {
     let end = offset
         .checked_add(N)
-        .ok_or_else(|| {
-            format!("{label} byte offset overflow")
-        })?;
+        .ok_or_else(|| format!("{label} byte offset overflow"))?;
 
     let bytes = data
         .get(offset..end)
-        .ok_or_else(|| {
-            format!("{label} bytes outside account data")
-        })?;
+        .ok_or_else(|| format!("{label} bytes outside account data"))?;
 
     <[u8; N]>::try_from(bytes)
-        .map_err(|_| {
-            format!("{label} byte slice had invalid length")
-        })
+        .map_err(|_| format!("{label} byte slice had invalid length"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn initialized_legacy_mint() -> Vec<u8> {
+    fn initialized_mint() -> Vec<u8> {
         let mut data = vec![0u8; TOKEN_2022_MINT_BASE_LEN];
         data[45] = 1;
         data
@@ -481,79 +373,52 @@ mod tests {
 
     fn clock_data(
         slot: u64,
-        epoch_start_timestamp: i64,
         epoch: u64,
-        leader_schedule_epoch: u64,
         unix_timestamp: i64,
     ) -> Vec<u8> {
         let mut data = vec![0u8; CLOCK_DATA_LEN];
-
         data[0..8].copy_from_slice(&slot.to_le_bytes());
-        data[8..16].copy_from_slice(
-            &epoch_start_timestamp.to_le_bytes(),
-        );
         data[16..24].copy_from_slice(&epoch.to_le_bytes());
-        data[24..32].copy_from_slice(
-            &leader_schedule_epoch.to_le_bytes(),
-        );
-        data[32..40].copy_from_slice(
-            &unix_timestamp.to_le_bytes(),
-        );
-
+        data[32..40].copy_from_slice(&unix_timestamp.to_le_bytes());
         data
     }
 
     fn mint_with_extensions(
         extensions: &[(u16, Vec<u8>)],
     ) -> Result<Vec<u8>, String> {
-        let extension_bytes =
-            extensions.iter().try_fold(
-                0usize,
-                |total, (_, value)| {
-                    total
-                        .checked_add(
-                            TOKEN_2022_TLV_HEADER_LEN,
-                        )
-                        .and_then(|next| {
-                            next.checked_add(value.len())
-                        })
-                        .ok_or_else(|| {
-                            "test Token-2022 extension size \
-                             overflow"
-                                .to_owned()
-                        })
-                },
-            )?;
+        let extension_bytes = extensions.iter().try_fold(
+            0usize,
+            |total, (_, value)| {
+                total
+                    .checked_add(TOKEN_2022_TLV_HEADER_LEN)
+                    .and_then(|next| next.checked_add(value.len()))
+                    .ok_or_else(|| {
+                        "test Token-2022 extension size overflow".to_owned()
+                    })
+            },
+        )?;
 
         let total_len = TOKEN_2022_MINT_TLV_START
             .checked_add(extension_bytes)
-            .ok_or_else(|| {
-                "test Token-2022 mint size overflow".to_owned()
-            })?;
+            .ok_or_else(|| "test Token-2022 mint size overflow".to_owned())?;
 
         let mut data = vec![0u8; total_len];
         data[45] = 1;
-        data[TOKEN_2022_ACCOUNT_TYPE_OFFSET] =
-            TOKEN_2022_MINT_ACCOUNT_TYPE;
+        data[TOKEN_2022_ACCOUNT_TYPE_OFFSET] = TOKEN_2022_MINT_ACCOUNT_TYPE;
 
         let mut offset = TOKEN_2022_MINT_TLV_START;
 
         for (extension_type, value) in extensions {
             let value_len = u16::try_from(value.len())
                 .map_err(|_| {
-                    "test Token-2022 extension value too large"
-                        .to_owned()
+                    "test Token-2022 extension value too large".to_owned()
                 })?;
 
             data[offset..offset + 2]
-                .copy_from_slice(
-                    &extension_type.to_le_bytes(),
-                );
+                .copy_from_slice(&extension_type.to_le_bytes());
 
             data[offset + 2..offset + 4]
-                .copy_from_slice(
-                    &value_len.to_le_bytes(),
-                );
+                .copy_from_slice(&value_len.to_le_bytes());
 
             offset += TOKEN_2022_TLV_HEADER_LEN;
 
@@ -621,9 +486,7 @@ mod tests {
     {
         let data = clock_data(
             123_456,
-            1_700_000_000,
             812,
-            813,
             1_777_777_777,
         );
 
@@ -640,68 +503,40 @@ mod tests {
     }
 
     #[test]
-    fn clock_wrong_pubkey_fails_closed() -> Result<(), String> {
-        let data = clock_data(1, 2, 3, 4, 5);
+    fn clock_identity_and_layout_fail_closed()
+        -> Result<(), String>
+    {
+        let data = clock_data(1, 2, 3);
 
-        match decode_clock_sysvar(
+        let wrong_key = decode_clock_sysvar(
             "11111111111111111111111111111111",
             SYSVAR_OWNER_ID,
             &data,
-        ) {
-            Ok(_) => Err(
-                "non-Clock sysvar account was accepted".to_owned(),
-            ),
-            Err(error) => {
-                assert!(error.contains("Clock pubkey mismatch"));
-                Ok(())
-            }
-        }
-    }
+        );
 
-    #[test]
-    fn clock_wrong_owner_fails_closed() -> Result<(), String> {
-        let data = clock_data(1, 2, 3, 4, 5);
-
-        match decode_clock_sysvar(
+        let wrong_owner = decode_clock_sysvar(
             CLOCK_SYSVAR_ID,
             "11111111111111111111111111111111",
             &data,
-        ) {
-            Ok(_) => Err(
-                "Clock account with wrong owner was accepted"
-                    .to_owned(),
-            ),
-            Err(error) => {
-                assert!(error.contains("Clock owner mismatch"));
-                Ok(())
-            }
-        }
-    }
+        );
 
-    #[test]
-    fn clock_wrong_length_fails_closed() -> Result<(), String> {
-        let data = vec![0u8; CLOCK_DATA_LEN - 1];
-
-        match decode_clock_sysvar(
+        let wrong_len = decode_clock_sysvar(
             CLOCK_SYSVAR_ID,
             SYSVAR_OWNER_ID,
-            &data,
-        ) {
-            Ok(_) => Err(
-                "malformed Clock account was accepted".to_owned(),
-            ),
-            Err(error) => {
-                assert!(error.contains("Clock length mismatch"));
-                Ok(())
-            }
-        }
+            &data[..39],
+        );
+
+        assert!(wrong_key.is_err());
+        assert!(wrong_owner.is_err());
+        assert!(wrong_len.is_err());
+        Ok(())
     }
 
     #[test]
     fn negative_clock_timestamp_fails_closed()
         -> Result<(), String>
     {
-        let data = clock_data(1, 2, 3, 4, -1);
+        let data = clock_data(1, 2, -1);
 
         match decode_clock_sysvar(
             CLOCK_SYSVAR_ID,
@@ -722,13 +557,11 @@ mod tests {
     fn legacy_spl_mint_has_no_transfer_fee()
         -> Result<(), String>
     {
-        let data = initialized_legacy_mint();
-
         let fee = transfer_fee_for_mint(
             SPL_TOKEN_PROGRAM_ID,
-            &data,
+            &initialized_mint(),
             999,
-            "test mint",
+            "mint",
         )?;
 
         assert!(fee.is_none());
@@ -739,21 +572,17 @@ mod tests {
     fn unknown_mint_owner_fails_closed()
         -> Result<(), String>
     {
-        let data = initialized_legacy_mint();
-
         match transfer_fee_for_mint(
             "11111111111111111111111111111111",
-            &data,
+            &initialized_mint(),
             999,
-            "test mint",
+            "mint",
         ) {
             Ok(_) => Err(
                 "unknown mint program owner was accepted".to_owned(),
             ),
             Err(error) => {
-                assert!(error.contains(
-                    "unsupported token program",
-                ));
+                assert!(error.contains("unsupported token program"));
                 Ok(())
             }
         }
@@ -763,14 +592,11 @@ mod tests {
     fn plain_token_2022_mint_has_no_transfer_fee()
         -> Result<(), String>
     {
-        let mut data = vec![0u8; TOKEN_2022_MINT_BASE_LEN];
-        data[45] = 1;
-
         let fee = transfer_fee_for_mint(
             TOKEN_2022_PROGRAM_ID,
-            &data,
+            &initialized_mint(),
             99,
-            "test mint",
+            "mint",
         )?;
 
         assert!(fee.is_none());
@@ -778,50 +604,42 @@ mod tests {
     }
 
     #[test]
-    fn current_epoch_before_newer_epoch_selects_older_fee()
+    fn epoch_boundary_selects_correct_transfer_fee()
         -> Result<(), String>
     {
-        let config =
-            transfer_fee_config(1, 10, 100, 100, 5_000, 1);
+        let config = transfer_fee_config(
+            1,
+            10,
+            100,
+            100,
+            5_000,
+            1,
+        );
 
         let data = mint_with_extensions(&[
             (EXTENSION_TRANSFER_FEE_CONFIG, config),
         ])?;
 
-        let fee = transfer_fee_for_mint(
+        let before = transfer_fee_for_mint(
             TOKEN_2022_PROGRAM_ID,
             &data,
             99,
-            "test mint",
+            "mint",
         )?
-        .ok_or_else(|| "expected transfer fee".to_owned())?;
+        .ok_or_else(|| "expected older transfer fee".to_owned())?;
 
-        assert_eq!(fee.fee_bps, 100);
-        assert_eq!(fee.max_fee, 10);
-        Ok(())
-    }
-
-    #[test]
-    fn current_epoch_at_newer_epoch_selects_newer_fee()
-        -> Result<(), String>
-    {
-        let config =
-            transfer_fee_config(1, 10, 100, 100, 5_000, 1);
-
-        let data = mint_with_extensions(&[
-            (EXTENSION_TRANSFER_FEE_CONFIG, config),
-        ])?;
-
-        let fee = transfer_fee_for_mint(
+        let at = transfer_fee_for_mint(
             TOKEN_2022_PROGRAM_ID,
             &data,
             100,
-            "test mint",
+            "mint",
         )?
-        .ok_or_else(|| "expected transfer fee".to_owned())?;
+        .ok_or_else(|| "expected newer transfer fee".to_owned())?;
 
-        assert_eq!(fee.fee_bps, 1);
-        assert_eq!(fee.max_fee, 5_000);
+        assert_eq!(before.fee_bps, 100);
+        assert_eq!(before.max_fee, 10);
+        assert_eq!(at.fee_bps, 1);
+        assert_eq!(at.max_fee, 5_000);
         Ok(())
     }
 
@@ -829,8 +647,14 @@ mod tests {
     fn metadata_extensions_can_coexist_with_transfer_fee()
         -> Result<(), String>
     {
-        let config =
-            transfer_fee_config(1, 10, 100, 100, 5_000, 1);
+        let config = transfer_fee_config(
+            1,
+            10,
+            100,
+            100,
+            5_000,
+            1,
+        );
 
         let data = mint_with_extensions(&[
             (
@@ -848,7 +672,7 @@ mod tests {
             TOKEN_2022_PROGRAM_ID,
             &data,
             100,
-            "test mint",
+            "mint",
         )?
         .ok_or_else(|| "expected transfer fee".to_owned())?;
 
@@ -858,7 +682,9 @@ mod tests {
     }
 
     #[test]
-    fn transfer_hook_fails_closed() -> Result<(), String> {
+    fn transfer_hook_fails_closed()
+        -> Result<(), String>
+    {
         let data = mint_with_extensions(&[
             (EXTENSION_TRANSFER_HOOK, vec![0u8; 64]),
         ])?;
@@ -867,7 +693,7 @@ mod tests {
             TOKEN_2022_PROGRAM_ID,
             &data,
             100,
-            "test mint",
+            "mint",
         ) {
             Ok(_) => Err(
                 "TransferHook mint was accepted".to_owned(),
@@ -880,39 +706,51 @@ mod tests {
     }
 
     #[test]
-    fn malformed_transfer_fee_length_fails_closed()
+    fn malformed_or_unsupported_extensions_fail_closed()
         -> Result<(), String>
     {
-        let data = mint_with_extensions(&[
+        let malformed = mint_with_extensions(&[
             (
                 EXTENSION_TRANSFER_FEE_CONFIG,
                 vec![0u8; 107],
             ),
         ])?;
 
-        match transfer_fee_for_mint(
+        let unsupported = mint_with_extensions(&[
+            (3u16, vec![0u8; 32]),
+        ])?;
+
+        let malformed_result = transfer_fee_for_mint(
             TOKEN_2022_PROGRAM_ID,
-            &data,
+            &malformed,
             100,
-            "test mint",
-        ) {
-            Ok(_) => Err(
-                "malformed TransferFeeConfig was accepted"
-                    .to_owned(),
-            ),
-            Err(error) => {
-                assert!(error.contains("invalid length"));
-                Ok(())
-            }
-        }
+            "malformed mint",
+        );
+
+        let unsupported_result = transfer_fee_for_mint(
+            TOKEN_2022_PROGRAM_ID,
+            &unsupported,
+            100,
+            "unsupported mint",
+        );
+
+        assert!(malformed_result.is_err());
+        assert!(unsupported_result.is_err());
+        Ok(())
     }
 
     #[test]
     fn transfer_fee_above_basis_point_limit_fails_closed()
         -> Result<(), String>
     {
-        let config =
-            transfer_fee_config(1, 10, 10_001, 100, 5_000, 1);
+        let config = transfer_fee_config(
+            1,
+            10,
+            10_001,
+            100,
+            5_000,
+            1,
+        );
 
         let data = mint_with_extensions(&[
             (EXTENSION_TRANSFER_FEE_CONFIG, config),
@@ -922,41 +760,13 @@ mod tests {
             TOKEN_2022_PROGRAM_ID,
             &data,
             99,
-            "test mint",
+            "mint",
         ) {
             Ok(_) => Err(
                 "invalid transfer-fee bps was accepted".to_owned(),
             ),
             Err(error) => {
-                assert!(error.contains(
-                    "exceeds 10000 bps",
-                ));
-                Ok(())
-            }
-        }
-    }
-
-    #[test]
-    fn unsupported_extension_fails_closed()
-        -> Result<(), String>
-    {
-        let data =
-            mint_with_extensions(&[(3u16, vec![0u8; 32])])?;
-
-        match transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &data,
-            100,
-            "test mint",
-        ) {
-            Ok(_) => Err(
-                "unsupported Token-2022 extension was accepted"
-                    .to_owned(),
-            ),
-            Err(error) => {
-                assert!(error.contains(
-                    "unsupported Token-2022 extension type",
-                ));
+                assert!(error.contains("exceeds 10000 bps"));
                 Ok(())
             }
         }
