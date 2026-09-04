@@ -465,13 +465,14 @@ pub fn quote_readiness_for_pool(
                 QuoteReserveState::Available {
                     token_a_raw,
                     token_b_raw,
-                    source_slot,
-                } if *token_a_raw > 0 && *token_b_raw > 0 && *source_slot >= pool.source_slot => {}
-                QuoteReserveState::Available { .. } => {
-                    return Err(format!(
-                        "pool {} does not have positive fresh CPMM quote reserves",
-                        pool.pool_id
-                    ));
+                    ..
+                } => {
+                    if *token_a_raw == 0 || *token_b_raw == 0 {
+                        return Err(format!(
+                            "pool {} does not have positive CPMM quote reserves",
+                            pool.pool_id
+                        ));
+                    }
                 }
                 QuoteReserveState::Unavailable => {
                     return Err(format!(
@@ -622,6 +623,7 @@ mod tests {
     use scout_core::NormalizedToken;
 
     const TEST_MINT: &str = "ApZuxdpzMrbEYTGEzeY9afh5pj9d6qPRJCTgQYiipbKg";
+    const THIRD_MINT: &str = "9xQeWvG816bUx9EPjHmaT23yvVM8hGe3ucGWnZ6b9S4Y";
     const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
     fn normalized_pool(
@@ -896,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn cpmm_quote_readiness_binds_live_context_and_positive_reserves() -> Result<(), String> {
+    fn raydium_quote_readiness_binds_live_context_and_positive_reserves() -> Result<(), String> {
         let pool = normalized_pool(
             Venue::RaydiumCpmm,
             "raydium-pool",
@@ -920,8 +922,62 @@ mod tests {
         assert_eq!(readiness.token_b_mint, TEST_MINT);
         assert_eq!(readiness.source_slot, 101);
         assert_eq!(readiness.capabilities.liquidity_model, LiquidityModel::Cpmm);
+        Ok(())
+    }
 
-        let mut zero_reserve_pool = pool;
+    #[test]
+    fn pumpswap_quote_readiness_binds_live_context_and_positive_reserves() -> Result<(), String> {
+        let pool = normalized_pool(
+            Venue::PumpSwap,
+            "pumpswap-pool",
+            TEST_MINT,
+            WRAPPED_SOL_MINT,
+            6,
+            9,
+            100,
+        );
+        let pump = pumpswap_snapshot();
+        let context = VenueQuoteContext::PumpSwap {
+            pool_id: "pumpswap-pool".to_owned(),
+            snapshot: &pump,
+        };
+
+        let readiness = quote_readiness_for_pool(&pool, &context)?;
+
+        assert_eq!(readiness.venue, Venue::PumpSwap);
+        assert_eq!(readiness.pool_id, "pumpswap-pool");
+        assert_eq!(readiness.source_slot, 102);
+        assert_eq!(readiness.capabilities.liquidity_model, LiquidityModel::Cpmm);
+        Ok(())
+    }
+
+    #[test]
+    fn cpmm_readiness_rejects_unavailable_and_zero_reserves() {
+        let base_pool = normalized_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        let ray = raydium_snapshot();
+        let context = VenueQuoteContext::Raydium {
+            pool_id: "raydium-pool".to_owned(),
+            snapshot: &ray,
+        };
+
+        let mut unavailable_pool = base_pool.clone();
+        unavailable_pool.quote_reserves = QuoteReserveState::Unavailable;
+
+        let result = quote_readiness_for_pool(&unavailable_pool, &context);
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("does not have CPMM quote reserves")
+        ));
+
+        let mut zero_reserve_pool = base_pool;
         zero_reserve_pool.quote_reserves = QuoteReserveState::Available {
             token_a_raw: 0,
             token_b_raw: 20_000_000_000,
@@ -929,13 +985,137 @@ mod tests {
         };
 
         let result = quote_readiness_for_pool(&zero_reserve_pool, &context);
-
         assert!(matches!(
             result,
-            Err(error) if error.contains("positive fresh CPMM quote reserves")
+            Err(error) if error.contains("positive CPMM quote reserves")
         ));
+    }
 
-        Ok(())
+    #[test]
+    fn cpmm_readiness_preserves_reserve_source_slot_semantics() {
+        let mut pool = normalized_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        pool.quote_reserves = QuoteReserveState::Available {
+            token_a_raw: 10_000_000_000,
+            token_b_raw: 20_000_000_000,
+            source_slot: 99,
+        };
+
+        let ray = raydium_snapshot();
+        let context = VenueQuoteContext::Raydium {
+            pool_id: "raydium-pool".to_owned(),
+            snapshot: &ray,
+        };
+
+        assert!(quote_readiness_for_pool(&pool, &context).is_ok());
+    }
+
+    #[test]
+    fn quote_readiness_rejects_nontradable_pool() {
+        let mut pool = normalized_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        pool.trading_state = PoolTradingState::SwapDisabled;
+        let ray = raydium_snapshot();
+        let context = VenueQuoteContext::Raydium {
+            pool_id: "raydium-pool".to_owned(),
+            snapshot: &ray,
+        };
+
+        let result = quote_readiness_for_pool(&pool, &context);
+        assert!(matches!(result, Err(error) if error.contains("is not tradable")));
+    }
+
+    #[test]
+    fn quote_readiness_rejects_venue_and_pool_mismatch() {
+        let pool = normalized_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        let pump = pumpswap_snapshot();
+        let wrong_venue = VenueQuoteContext::PumpSwap {
+            pool_id: "raydium-pool".to_owned(),
+            snapshot: &pump,
+        };
+
+        let result = quote_readiness_for_pool(&pool, &wrong_venue);
+        assert!(matches!(result, Err(error) if error.contains("venue mismatch")));
+
+        let ray = raydium_snapshot();
+        let wrong_pool = VenueQuoteContext::Raydium {
+            pool_id: "wrong-pool".to_owned(),
+            snapshot: &ray,
+        };
+
+        let result = quote_readiness_for_pool(&pool, &wrong_pool);
+        assert!(matches!(result, Err(error) if error.contains("pool mismatch")));
+    }
+
+    #[test]
+    fn quote_readiness_rejects_token_pair_mismatch() {
+        let pool = normalized_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            THIRD_MINT,
+            9,
+            6,
+            100,
+        );
+        let ray = raydium_snapshot();
+        let context = VenueQuoteContext::Raydium {
+            pool_id: "raydium-pool".to_owned(),
+            snapshot: &ray,
+        };
+
+        let result = quote_readiness_for_pool(&pool, &context);
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("does not contain normalized pool pair")
+        ));
+    }
+
+    #[test]
+    fn quote_readiness_rejects_stale_context() {
+        let pool = normalized_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        let mut ray = raydium_snapshot();
+        ray.slot = 99;
+        let context = VenueQuoteContext::Raydium {
+            pool_id: "raydium-pool".to_owned(),
+            snapshot: &ray,
+        };
+
+        let result = quote_readiness_for_pool(&pool, &context);
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("stale quote context")
+        ));
     }
 
     #[test]
@@ -1088,7 +1268,6 @@ mod tests {
 
         assert!(raydium_first_seen);
         assert!(pumpswap_first_seen);
-
         Ok(())
     }
 
@@ -1107,7 +1286,6 @@ mod tests {
         };
 
         let result = one_whole_anchor_input_raw(route, &context);
-
         assert!(matches!(result, Err(error) if error.contains("stale quote context")));
         Ok(())
     }
@@ -1126,7 +1304,6 @@ mod tests {
         };
 
         let result = one_whole_anchor_input_raw(route, &context);
-
         assert!(matches!(result, Err(error) if error.contains("pool mismatch")));
         Ok(())
     }
