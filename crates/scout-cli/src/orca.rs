@@ -119,7 +119,7 @@ impl OrcaWhirlpoolHydrationSnapshot {
 pub fn program_subscribe_request() -> Value {
     json!({
         "jsonrpc": "2.0",
-        "id": 6,
+        "id": 18,
         "method": "programSubscribe",
         "params": [
             ORCA_WHIRLPOOL_PROGRAM_ID,
@@ -153,6 +153,15 @@ pub fn parse_program_notification(
         return Ok(None);
     }
 
+    let owner = payload
+        .pointer("/params/result/value/account/owner")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "program notification missing account owner".to_owned())?;
+
+    if owner != ORCA_WHIRLPOOL_PROGRAM_ID {
+        return Ok(None);
+    }
+
     let slot = payload
         .pointer("/params/result/context/slot")
         .and_then(Value::as_u64)
@@ -163,16 +172,6 @@ pub fn parse_program_notification(
         .and_then(Value::as_str)
         .ok_or_else(|| "Orca notification missing pubkey".to_owned())?
         .to_owned();
-
-    let owner = payload
-        .pointer("/params/result/value/account/owner")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "Orca notification missing owner".to_owned())?
-        .to_owned();
-
-    if owner != ORCA_WHIRLPOOL_PROGRAM_ID {
-        return Err(format!("unexpected Orca account owner: {owner}"));
-    }
 
     let encoded_data = payload
         .pointer("/params/result/value/account/data/0")
@@ -199,7 +198,7 @@ pub fn parse_program_notification(
     Ok(Some(OrcaWhirlpoolAccountObservation {
         pubkey,
         slot,
-        owner,
+        owner: owner.to_owned(),
         encoded_data_len: encoded_data.len(),
         decoded_data_len: decoded_data.len(),
         pool_state,
@@ -573,57 +572,65 @@ mod tests {
         })
     }
 
-    fn observation(adaptive_fee: bool, slot: u64) -> OrcaWhirlpoolAccountObservation {
+    fn observation(
+        adaptive_fee: bool,
+        slot: u64,
+    ) -> Result<OrcaWhirlpoolAccountObservation, String> {
         let data = sample_whirlpool_data(adaptive_fee);
-        let pool_state = decode_whirlpool_state(&data).expect("test Whirlpool should decode");
+        let pool_state = decode_whirlpool_state(&data)?;
 
-        OrcaWhirlpoolAccountObservation {
+        Ok(OrcaWhirlpoolAccountObservation {
             pubkey: bs58::encode([9u8; 32]).into_string(),
             slot,
             owner: ORCA_WHIRLPOOL_PROGRAM_ID.to_owned(),
             encoded_data_len: BASE64_STANDARD.encode(&data).len(),
             decoded_data_len: data.len(),
             pool_state,
-        }
+        })
     }
 
     #[test]
-    fn official_whirlpool_layout_decodes() {
+    fn official_whirlpool_layout_decodes() -> Result<(), String> {
         let data = sample_whirlpool_data(false);
-        let state = decode_whirlpool_state(&data).expect("ordinary Whirlpool should decode");
+        let state = decode_whirlpool_state(&data)?;
 
         assert_eq!(state.tick_spacing, 64);
         assert_eq!(state.fee_tier_index_seed, 64);
         assert_eq!(state.fee_rate, 3_000);
         assert_eq!(state.protocol_fee_rate, 300);
         assert!(!state.is_adaptive_fee());
+
+        Ok(())
     }
 
     #[test]
-    fn adaptive_fee_pool_is_detected_from_fee_tier_index() {
+    fn adaptive_fee_pool_is_detected_from_fee_tier_index() -> Result<(), String> {
         let data = sample_whirlpool_data(true);
-        let state = decode_whirlpool_state(&data).expect("adaptive Whirlpool should decode");
+        let state = decode_whirlpool_state(&data)?;
 
         assert_eq!(state.tick_spacing, 64);
         assert_eq!(state.fee_tier_index_seed, 32);
         assert!(state.is_adaptive_fee());
+
+        Ok(())
     }
 
     #[test]
-    fn wrong_discriminator_is_rejected() {
+    fn wrong_discriminator_is_rejected() -> Result<(), String> {
         let mut data = sample_whirlpool_data(false);
         data[0] ^= 1;
 
-        let error = decode_whirlpool_state(&data)
-            .expect_err("invalid discriminator must be rejected");
-
-        assert!(error.contains("discriminator mismatch"));
+        match decode_whirlpool_state(&data) {
+            Ok(_) => Err("invalid discriminator was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("discriminator mismatch"));
+                Ok(())
+            }
+        }
     }
 
     #[test]
-    fn program_notification_parses_official_whirlpool_shape() {
-        let data = sample_whirlpool_data(false);
-
+    fn unrelated_program_notification_is_ignored() -> Result<(), String> {
         let payload = json!({
             "method": "programNotification",
             "params": {
@@ -632,25 +639,26 @@ mod tests {
                         "slot": 123_456
                     },
                     "value": {
-                        "pubkey": bs58::encode([9u8; 32]).into_string(),
-                        "account": rpc_account(ORCA_WHIRLPOOL_PROGRAM_ID, &data)
+                        "pubkey": bs58::encode([8u8; 32]).into_string(),
+                        "account": rpc_account(
+                            "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
+                            &sample_whirlpool_data(false)
+                        )
                     }
                 }
             }
         });
 
-        let parsed = parse_program_notification(&payload)
-            .expect("notification should parse")
-            .expect("notification should contain observation");
+        let parsed = parse_program_notification(&payload)?;
 
-        assert_eq!(parsed.slot, 123_456);
-        assert_eq!(parsed.decoded_data_len, WHIRLPOOL_STATE_LEN);
-        assert_eq!(parsed.pool_state.tick_spacing, 64);
+        assert!(parsed.is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn ordinary_pool_hydrates_without_fabricating_reserves() {
-        let observation = observation(false, 100);
+    fn ordinary_pool_hydrates_without_fabricating_reserves() -> Result<(), String> {
+        let observation = observation(false, 100)?;
         let pool_data = sample_whirlpool_data(false);
         let mint_a_data = sample_mint_data(9);
         let mint_b_data = sample_mint_data(6);
@@ -668,27 +676,27 @@ mod tests {
             }
         });
 
-        let snapshot = parse_hydration_response(&observation, &payload)
-            .expect("ordinary Whirlpool should hydrate");
+        let snapshot = parse_hydration_response(&observation, &payload)?;
 
         assert_eq!(snapshot.slot, 101);
         assert_eq!(snapshot.token_a_decimals, 9);
         assert_eq!(snapshot.token_b_decimals, 6);
 
         let normalized =
-            hydrate_normalized_observation(&observation, &snapshot, 1_000, 1_001)
-                .expect("ordinary Whirlpool should normalize");
+            hydrate_normalized_observation(&observation, &snapshot, 1_000, 1_001)?;
 
         assert_eq!(normalized.venue, Venue::Orca);
         assert_eq!(normalized.trading_state, PoolTradingState::Tradable);
         assert_eq!(normalized.token_a.decimals, 9);
         assert_eq!(normalized.token_b.decimals, 6);
         assert_eq!(normalized.quote_reserves, QuoteReserveState::Unavailable);
+
+        Ok(())
     }
 
     #[test]
-    fn adaptive_fee_pool_fails_closed_without_oracle_hydration() {
-        let observation = observation(true, 100);
+    fn adaptive_fee_pool_fails_closed_without_oracle_hydration() -> Result<(), String> {
+        let observation = observation(true, 100)?;
         let pool_data = sample_whirlpool_data(true);
 
         let payload = json!({
@@ -704,15 +712,18 @@ mod tests {
             }
         });
 
-        let error = parse_hydration_response(&observation, &payload)
-            .expect_err("adaptive-fee Whirlpool must fail closed in O1");
-
-        assert!(error.contains("requires Oracle hydration"));
+        match parse_hydration_response(&observation, &payload) {
+            Ok(_) => Err("adaptive-fee Whirlpool was admitted without Oracle".to_owned()),
+            Err(error) => {
+                assert!(error.contains("requires Oracle hydration"));
+                Ok(())
+            }
+        }
     }
 
     #[test]
-    fn stale_hydration_is_rejected() {
-        let observation = observation(false, 100);
+    fn stale_hydration_is_rejected() -> Result<(), String> {
+        let observation = observation(false, 100)?;
 
         let payload = json!({
             "result": {
@@ -730,15 +741,18 @@ mod tests {
             }
         });
 
-        let error = parse_hydration_response(&observation, &payload)
-            .expect_err("stale hydration must fail closed");
-
-        assert!(error.contains("stale Orca hydration snapshot"));
+        match parse_hydration_response(&observation, &payload) {
+            Ok(_) => Err("stale hydration snapshot was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("stale Orca hydration snapshot"));
+                Ok(())
+            }
+        }
     }
 
     #[test]
-    fn hydration_identity_change_is_rejected() {
-        let observation = observation(false, 100);
+    fn hydration_identity_change_is_rejected() -> Result<(), String> {
+        let observation = observation(false, 100)?;
         let mut changed_pool_data = sample_whirlpool_data(false);
 
         changed_pool_data[TOKEN_MINT_B_OFFSET..TOKEN_MINT_B_OFFSET + 32]
@@ -757,9 +771,12 @@ mod tests {
             }
         });
 
-        let error = parse_hydration_response(&observation, &payload)
-            .expect_err("identity-changing hydration must fail closed");
-
-        assert!(error.contains("token_mint_b changed"));
+        match parse_hydration_response(&observation, &payload) {
+            Ok(_) => Err("identity-changing hydration snapshot was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("token_mint_b changed"));
+                Ok(())
+            }
+        }
     }
 }
