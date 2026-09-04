@@ -11,8 +11,7 @@ use orca_whirlpools_core::{
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
-const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] =
-    [0x45, 0x61, 0xbd, 0xbe, 0x07, 0x42, 0xbb];
+const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x07, 0x42, 0xbb];
 
 const TICK_SERIALIZED_LEN: usize = 113;
 const FIXED_TICK_ARRAY_LEN: usize = 8 + 4 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN) + 32;
@@ -25,15 +24,12 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-pub fn bounded_tick_array_start_indexes(
-    pool: &OrcaWhirlpoolState,
-) -> Result<[i32; 5], String> {
+pub fn bounded_tick_array_start_indexes(pool: &OrcaWhirlpoolState) -> Result<[i32; 5], String> {
     if pool.tick_spacing == 0 {
         return Err("Orca tick spacing must be greater than zero".to_owned());
     }
 
-    let current =
-        get_tick_array_start_tick_index(pool.tick_current_index, pool.tick_spacing);
+    let current = get_tick_array_start_tick_index(pool.tick_current_index, pool.tick_spacing);
 
     let tick_array_size = i32::try_from(TICK_ARRAY_SIZE)
         .map_err(|_| "Orca tick-array size does not fit i32".to_owned())?;
@@ -65,10 +61,7 @@ pub fn bounded_tick_array_start_indexes(
     Ok([current, plus_one, plus_two, minus_one, minus_two])
 }
 
-pub fn tick_array_pda(
-    whirlpool: &str,
-    start_tick_index: i32,
-) -> Result<String, String> {
+pub fn tick_array_pda(whirlpool: &str, start_tick_index: i32) -> Result<String, String> {
     let whirlpool_pubkey = Pubkey::from_str(whirlpool)
         .map_err(|error| format!("invalid Orca Whirlpool pubkey: {error}"))?;
 
@@ -137,9 +130,7 @@ pub fn decode_fixed_tick_array(
             0 => false,
             1 => true,
             other => {
-                return Err(format!(
-                    "Orca tick initialized flag invalid: {other}"
-                ));
+                return Err(format!("Orca tick initialized flag invalid: {other}"));
             }
         };
 
@@ -151,24 +142,19 @@ pub fn decode_fixed_tick_array(
         let liquidity_gross = read_u128(data, offset, "tick liquidity_gross")?;
         offset = checked_advance(offset, 16, "liquidity_gross")?;
 
-        let fee_growth_outside_a =
-            read_u128(data, offset, "tick fee_growth_outside_a")?;
+        let fee_growth_outside_a = read_u128(data, offset, "tick fee_growth_outside_a")?;
         offset = checked_advance(offset, 16, "fee_growth_outside_a")?;
 
-        let fee_growth_outside_b =
-            read_u128(data, offset, "tick fee_growth_outside_b")?;
+        let fee_growth_outside_b = read_u128(data, offset, "tick fee_growth_outside_b")?;
         offset = checked_advance(offset, 16, "fee_growth_outside_b")?;
 
-        let reward_growth_0 =
-            read_u128(data, offset, "tick reward_growth_outside_0")?;
+        let reward_growth_0 = read_u128(data, offset, "tick reward_growth_outside_0")?;
         offset = checked_advance(offset, 16, "reward_growth_outside_0")?;
 
-        let reward_growth_1 =
-            read_u128(data, offset, "tick reward_growth_outside_1")?;
+        let reward_growth_1 = read_u128(data, offset, "tick reward_growth_outside_1")?;
         offset = checked_advance(offset, 16, "reward_growth_outside_1")?;
 
-        let reward_growth_2 =
-            read_u128(data, offset, "tick reward_growth_outside_2")?;
+        let reward_growth_2 = read_u128(data, offset, "tick reward_growth_outside_2")?;
         offset = checked_advance(offset, 16, "reward_growth_outside_2")?;
 
         *tick = TickFacade {
@@ -177,16 +163,11 @@ pub fn decode_fixed_tick_array(
             liquidity_gross,
             fee_growth_outside_a,
             fee_growth_outside_b,
-            reward_growths_outside: [
-                reward_growth_0,
-                reward_growth_1,
-                reward_growth_2,
-            ],
+            reward_growths_outside: [reward_growth_0, reward_growth_1, reward_growth_2],
         };
     }
 
-    let whirlpool_bytes =
-        read_array::<32>(data, offset, "tick-array Whirlpool identity")?;
+    let whirlpool_bytes = read_array::<32>(data, offset, "tick-array Whirlpool identity")?;
 
     let decoded_whirlpool = Pubkey::new_from_array(whirlpool_bytes).to_string();
 
@@ -269,14 +250,10 @@ pub fn quote_exact_input(
 
     match (pool.is_adaptive_fee(), oracle) {
         (true, None) => {
-            return Err(
-                "adaptive-fee Orca Whirlpool requires Oracle state".to_owned()
-            );
+            return Err("adaptive-fee Orca Whirlpool requires Oracle state".to_owned());
         }
         (false, Some(_)) => {
-            return Err(
-                "non-adaptive Orca Whirlpool must not receive Oracle state".to_owned()
-            );
+            return Err("non-adaptive Orca Whirlpool must not receive Oracle state".to_owned());
         }
         _ => {}
     }
@@ -313,39 +290,25 @@ pub fn quote_exact_input(
     .map_err(|error| format!("Orca authoritative exact-input quote failed: {error:?}"))
 }
 
-fn checked_advance(
-    offset: usize,
-    amount: usize,
-    label: &str,
-) -> Result<usize, String> {
+fn checked_advance(offset: usize, amount: usize, label: &str) -> Result<usize, String> {
     offset
         .checked_add(amount)
         .ok_or_else(|| format!("Orca {label} offset overflow"))
 }
 
 fn read_i32(data: &[u8], offset: usize, label: &str) -> Result<i32, String> {
-    Ok(i32::from_le_bytes(read_array::<4>(
-        data, offset, label,
-    )?))
+    Ok(i32::from_le_bytes(read_array::<4>(data, offset, label)?))
 }
 
 fn read_i128(data: &[u8], offset: usize, label: &str) -> Result<i128, String> {
-    Ok(i128::from_le_bytes(read_array::<16>(
-        data, offset, label,
-    )?))
+    Ok(i128::from_le_bytes(read_array::<16>(data, offset, label)?))
 }
 
 fn read_u128(data: &[u8], offset: usize, label: &str) -> Result<u128, String> {
-    Ok(u128::from_le_bytes(read_array::<16>(
-        data, offset, label,
-    )?))
+    Ok(u128::from_le_bytes(read_array::<16>(data, offset, label)?))
 }
 
-fn read_array<const N: usize>(
-    data: &[u8],
-    offset: usize,
-    label: &str,
-) -> Result<[u8; N], String> {
+fn read_array<const N: usize>(data: &[u8], offset: usize, label: &str) -> Result<[u8; N], String> {
     let end = offset
         .checked_add(N)
         .ok_or_else(|| format!("Orca {label} offset overflow"))?;
@@ -354,8 +317,7 @@ fn read_array<const N: usize>(
         .get(offset..end)
         .ok_or_else(|| format!("Orca {label} outside account data"))?;
 
-    <[u8; N]>::try_from(bytes)
-        .map_err(|_| format!("Orca {label} had invalid byte length"))
+    <[u8; N]>::try_from(bytes).map_err(|_| format!("Orca {label} had invalid byte length"))
 }
 
 #[cfg(test)]
@@ -425,23 +387,16 @@ mod tests {
         data[0..8].copy_from_slice(&FIXED_TICK_ARRAY_DISCRIMINATOR);
         data[8..12].copy_from_slice(&0i32.to_le_bytes());
 
-        let whirlpool_offset =
-            12 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN);
+        let whirlpool_offset = 12 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN);
 
-        data[whirlpool_offset..whirlpool_offset + 32]
-            .copy_from_slice(whirlpool.as_ref());
+        data[whirlpool_offset..whirlpool_offset + 32].copy_from_slice(whirlpool.as_ref());
 
-        let decoded =
-            decode_fixed_tick_array(&data, &whirlpool.to_string(), 0)?;
+        let decoded = decode_fixed_tick_array(&data, &whirlpool.to_string(), 0)?;
 
         assert_eq!(decoded.start_tick_index, 0);
         assert!(decoded.ticks.iter().all(|tick| !tick.initialized));
 
-        match decode_fixed_tick_array(
-            &data,
-            &Pubkey::new_unique().to_string(),
-            0,
-        ) {
+        match decode_fixed_tick_array(&data, &Pubkey::new_unique().to_string(), 0) {
             Ok(_) => Err("wrong Whirlpool identity was accepted".to_owned()),
             Err(error) => {
                 assert!(error.contains("Whirlpool mismatch"));
@@ -454,11 +409,7 @@ mod tests {
     fn unsupported_tick_array_representation_fails_closed() -> Result<(), String> {
         let data = vec![0u8; 64];
 
-        match decode_fixed_tick_array(
-            &data,
-            &Pubkey::new_unique().to_string(),
-            0,
-        ) {
+        match decode_fixed_tick_array(&data, &Pubkey::new_unique().to_string(), 0) {
             Ok(_) => Err("unsupported tick-array representation was accepted".to_owned()),
             Err(_) => Ok(()),
         }
@@ -479,16 +430,7 @@ mod tests {
 
         let input_mint = pool.token_mint_a.clone();
 
-        match quote_exact_input(
-            &pool,
-            &input_mint,
-            1_000,
-            arrays,
-            1_000,
-            None,
-            None,
-            None,
-        ) {
+        match quote_exact_input(&pool, &input_mint, 1_000, arrays, 1_000, None, None, None) {
             Ok(_) => Err("adaptive pool quoted without Oracle".to_owned()),
             Err(error) => {
                 assert!(error.contains("requires Oracle"));
