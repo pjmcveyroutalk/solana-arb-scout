@@ -13,11 +13,13 @@ mod sizing;
 
 use discovery::{parse_raydium_pair_lookup_response, raydium_pair_lookup_requests};
 use futures_util::{SinkExt, StreamExt};
-use quote::{quote_two_leg_exact_input, VenueQuoteContext};
+use quote::{
+    quote_readiness_for_pool, quote_two_leg_exact_input, QuoteReadiness, VenueQuoteContext,
+};
 use registry::ActiveMintRegistry;
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
-use scout_core::{NormalizedPoolState, PoolTradingState, QuoteReserveState};
+use scout_core::NormalizedPoolState;
 use serde_json::{json, Value};
 use sizing::{
     parse_pyth_usd_price, pyth_usd_price_request, usd_dollars_to_anchor_raw, PythUsdFeed,
@@ -166,14 +168,21 @@ async fn main() -> Result<(), String> {
             .cloned()
             .chain(pumpswap_states.iter().cloned())
         {
-            registry.upsert(state);
+            let readiness = quote_readiness_from_contexts(
+                &state,
+                &raydium_quote_contexts,
+                &pumpswap_quote_contexts,
+            );
+
+            registry.upsert(state, readiness)?;
         }
 
         generate_two_leg_routes(&registry.current_eligible_pools())
     };
 
     if initial_routes.is_empty() {
-        println!("\nRung 9 deterministic exact-pair route reacquisition");
+        println!("\
+Rung 9 deterministic exact-pair route reacquisition");
 
         let (
             discovered_raydium_states,
@@ -221,7 +230,8 @@ async fn observe_slots<S>(reader: &mut S) -> Result<(), String>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    println!("\nTransport: live slots");
+    println!("\
+Transport: live slots");
 
     let mut observed = 0usize;
 
@@ -258,7 +268,8 @@ async fn observe_raydium<S>(
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    println!("\nVenue adapter: Raydium CPMM");
+    println!("\
+Venue adapter: Raydium CPMM");
 
     let mut states = Vec::new();
     let mut quote_contexts = BTreeMap::new();
@@ -290,9 +301,22 @@ where
                 println!("raydium_hydration: {}", snapshot.summary());
                 println!("raydium_normalized_pool: {}", normalized.summary());
 
-                if normalized_pool_is_eligible(&normalized) {
-                    quote_contexts.insert(normalized.pool_id.clone(), snapshot);
-                    states.push(normalized);
+                let context = VenueQuoteContext::Raydium {
+                    pool_id: normalized.pool_id.clone(),
+                    snapshot: &snapshot,
+                };
+
+                match quote_readiness_for_pool(&normalized, &context) {
+                    Ok(_) => {
+                        quote_contexts.insert(normalized.pool_id.clone(), snapshot);
+                        states.push(normalized);
+                    }
+                    Err(error) => {
+                        println!(
+                            "raydium_quote_readiness_rejected: pool={} reason={error}",
+                            normalized.pool_id
+                        );
+                    }
                 }
             }
             Err(error) => {
@@ -324,7 +348,8 @@ async fn observe_pumpswap<S>(
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    println!("\nVenue adapter: PumpSwap");
+    println!("\
+Venue adapter: PumpSwap");
 
     let mut states = Vec::new();
     let mut quote_contexts = BTreeMap::new();
@@ -356,9 +381,22 @@ where
                 println!("pumpswap_hydration: {}", snapshot.summary());
                 println!("pumpswap_normalized_pool: {}", normalized.summary());
 
-                if normalized_pool_is_eligible(&normalized) {
-                    quote_contexts.insert(normalized.pool_id.clone(), snapshot);
-                    states.push(normalized);
+                let context = VenueQuoteContext::PumpSwap {
+                    pool_id: normalized.pool_id.clone(),
+                    snapshot: &snapshot,
+                };
+
+                match quote_readiness_for_pool(&normalized, &context) {
+                    Ok(_) => {
+                        quote_contexts.insert(normalized.pool_id.clone(), snapshot);
+                        states.push(normalized);
+                    }
+                    Err(error) => {
+                        println!(
+                            "pumpswap_quote_readiness_rejected: pool={} reason={error}",
+                            normalized.pool_id
+                        );
+                    }
                 }
             }
             Err(error) => {
@@ -496,7 +534,17 @@ async fn discover_deterministic_cross_venue_overlap(
                     }
                 };
 
-                if !normalized_pool_is_eligible(&pumpswap_normalized) {
+                let pumpswap_context = VenueQuoteContext::PumpSwap {
+                    pool_id: pumpswap_normalized.pool_id.clone(),
+                    snapshot: &pumpswap_snapshot,
+                };
+
+                if let Err(error) =
+                    quote_readiness_for_pool(&pumpswap_normalized, &pumpswap_context)
+                {
+                    let reason = format!("pool={} reason={error}", pumpswap_normalized.pool_id);
+                    println!("deterministic_exact_pair_candidate_rejected: {reason}");
+                    completeness.record_incomplete(reason);
                     continue;
                 }
 
@@ -639,7 +687,16 @@ async fn discover_deterministic_cross_venue_overlap(
                     }
                 };
 
-                if !normalized_pool_is_eligible(&raydium_normalized) {
+                let raydium_context = VenueQuoteContext::Raydium {
+                    pool_id: raydium_normalized.pool_id.clone(),
+                    snapshot: &raydium_snapshot,
+                };
+
+                if let Err(error) = quote_readiness_for_pool(&raydium_normalized, &raydium_context)
+                {
+                    let reason = format!("pool={} reason={error}", raydium_normalized.pool_id);
+                    println!("deterministic_raydium_exact_pair_candidate_rejected: {reason}");
+                    completeness.record_incomplete(reason);
                     continue;
                 }
 
@@ -910,13 +967,15 @@ async fn fetch_pyth_usd_price(
 }
 
 async fn fetch_pyth_usd_prices(rpc_client: &Client) -> Result<PythUsdPrices, String> {
-    println!("\nRung 10 sizing oracle: Pyth SOL/USD");
+    println!("\
+Rung 10 sizing oracle: Pyth SOL/USD");
 
     let sol = fetch_pyth_usd_price(rpc_client, PythUsdFeed::Sol).await?;
     println!("sol_usd_price: {}", sol.summary());
     println!("READ-ONLY PYTH SOL/USD VALIDATION PASS");
 
-    println!("\nRung 11D stablecoin external-cost conversion oracle");
+    println!("\
+Rung 11D stablecoin external-cost conversion oracle");
 
     let usdc = match fetch_pyth_usd_price(rpc_client, PythUsdFeed::Usdc).await {
         Ok(price) => {
@@ -1015,19 +1074,67 @@ fn pumpswap_observation_matches_pair(
         || (quote_mint == anchor_mint && base_mint == intermediate_mint)
 }
 
-fn normalized_pool_is_eligible(pool: &NormalizedPoolState) -> bool {
-    if pool.trading_state != PoolTradingState::Tradable {
-        return false;
-    }
+fn quote_readiness_from_contexts(
+    pool: &NormalizedPoolState,
+    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+) -> Option<QuoteReadiness> {
+    let result = match pool.venue {
+        scout_core::Venue::RaydiumCpmm => {
+            let Some(snapshot) = raydium_quote_contexts.get(&pool.pool_id) else {
+                println!(
+                    "quote_readiness_unavailable: venue={} pool={} reason=missing quote context",
+                    pool.venue.label(),
+                    pool.pool_id
+                );
+                return None;
+            };
 
-    matches!(
-        &pool.quote_reserves,
-        QuoteReserveState::Available {
-            token_a_raw,
-            token_b_raw,
-            ..
-        } if *token_a_raw > 0 && *token_b_raw > 0
-    )
+            let context = VenueQuoteContext::Raydium {
+                pool_id: pool.pool_id.clone(),
+                snapshot,
+            };
+
+            quote_readiness_for_pool(pool, &context)
+        }
+        scout_core::Venue::PumpSwap => {
+            let Some(snapshot) = pumpswap_quote_contexts.get(&pool.pool_id) else {
+                println!(
+                    "quote_readiness_unavailable: venue={} pool={} reason=missing quote context",
+                    pool.venue.label(),
+                    pool.pool_id
+                );
+                return None;
+            };
+
+            let context = VenueQuoteContext::PumpSwap {
+                pool_id: pool.pool_id.clone(),
+                snapshot,
+            };
+
+            quote_readiness_for_pool(pool, &context)
+        }
+        other => {
+            println!(
+                "quote_readiness_unavailable: venue={} pool={} reason=unsupported venue",
+                other.label(),
+                pool.pool_id
+            );
+            return None;
+        }
+    };
+
+    match result {
+        Ok(readiness) => Some(readiness),
+        Err(error) => {
+            println!(
+                "quote_readiness_unavailable: venue={} pool={} reason={error}",
+                pool.venue.label(),
+                pool.pool_id
+            );
+            None
+        }
+    }
 }
 
 async fn wait_for_r13_window_maturity(
@@ -1121,12 +1228,19 @@ async fn validate_registry_routes_and_sizes(
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
     usd_prices: &PythUsdPrices,
 ) -> Result<(), String> {
-    println!("\nRegistry: Active Mint");
+    println!("\
+Registry: Active Mint");
 
     let mut registry = ActiveMintRegistry::new();
 
     for state in raydium_states.into_iter().chain(pumpswap_states) {
-        registry.upsert(state);
+        let readiness = quote_readiness_from_contexts(
+            &state,
+            raydium_quote_contexts,
+            pumpswap_quote_contexts,
+        );
+
+        registry.upsert(state, readiness)?;
     }
 
     let active_mints = registry.active_mints();
@@ -1144,7 +1258,8 @@ async fn validate_registry_routes_and_sizes(
     println!("READ-ONLY ACTIVE-MINT REGISTRY PASS");
     println!("READ-ONLY RUNG 8 ACTIVE-MINT DETECTION PASS");
 
-    println!("\nRoute engine: Two-Leg Circular");
+    println!("\
+Route engine: Two-Leg Circular");
 
     let eligible_pools = registry.current_eligible_pools();
     let route_candidates = generate_two_leg_routes(&eligible_pools);
@@ -1179,7 +1294,8 @@ async fn validate_registry_routes_and_sizes(
         shadow_recorder.output_path().display()
     );
 
-    println!("\nRung 10 deterministic USD size-grid quote engine");
+    println!("\
+Rung 10 deterministic USD size-grid quote engine");
 
     let mut successful_routes = 0usize;
     let mut successful_grid_quotes = 0usize;
@@ -1343,7 +1459,8 @@ async fn validate_registry_routes_and_sizes(
     println!("rung10_successful_grid_quote_count={successful_grid_quotes}");
     println!("READ-ONLY RUNG 10 SIZE + QUOTE ENGINE PASS");
 
-    println!("\nRung 11C read-only cost observation");
+    println!("\
+Rung 11C read-only cost observation");
 
     let jito_observation = observe_jito_tip_floor(rpc_client).await;
     let mut priority_cache = BTreeMap::<Vec<String>, costs::PriorityObservationState>::new();
@@ -1595,7 +1712,8 @@ async fn validate_registry_routes_and_sizes(
     recorder::validate_jsonl_replay(&shadow_output)?;
     println!("READ-ONLY RUNG 12 SHADOW RECORDER PASS");
 
-    println!("\nRung 13 captureability forensics");
+    println!("\
+Rung 13 captureability forensics");
 
     let forensics_plan = forensics::load_plan(&shadow_output)?;
     println!(
