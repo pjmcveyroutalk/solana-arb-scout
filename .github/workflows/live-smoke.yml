@@ -53,7 +53,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout 300s cargo run --locked -p scout-cli
+          timeout 300s cargo run --locked -p scout-cli --bin scout-cli
+
+      - name: Run Orca O1 live pool-state observation
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 150s cargo run --locked -p scout-cli --bin orca-o1-live
 
       - name: Upload Rung 12 shadow evidence
         if: always()
