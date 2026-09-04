@@ -65,10 +65,7 @@ const TOKEN_2022_EXTENSION_METADATA_POINTER: u16 = 18;
 const TOKEN_2022_EXTENSION_TOKEN_METADATA: u16 = 19;
 const TOKEN_2022_METADATA_POINTER_LEN: u16 = 64;
 
-pub fn ensure_supported_token_2022_mint_extensions(
-    data: &[u8],
-    label: &str,
-) -> Result<(), String> {
+pub fn ensure_supported_token_2022_mint_extensions(data: &[u8], label: &str) -> Result<(), String> {
     if data.len() < TOKEN_2022_MINT_BASE_LEN {
         return Err(format!(
             "{label} shorter than Token-2022 Mint base layout: expected at least \
@@ -81,9 +78,7 @@ pub fn ensure_supported_token_2022_mint_extensions(
         1 => {}
         0 => return Err(format!("{label} is not initialized")),
         value => {
-            return Err(format!(
-                "{label} has invalid is_initialized value: {value}"
-            ));
+            return Err(format!("{label} has invalid is_initialized value: {value}"));
         }
     }
 
@@ -600,10 +595,8 @@ mod tests {
 
     #[test]
     fn token_2022_transfer_fee_config_fails_closed() {
-        let data = token_2022_mint_with_extensions(&[(
-            TOKEN_2022_EXTENSION_TRANSFER_FEE_CONFIG,
-            8,
-        )]);
+        let data =
+            token_2022_mint_with_extensions(&[(TOKEN_2022_EXTENSION_TRANSFER_FEE_CONFIG, 8)]);
         let result = ensure_supported_token_2022_mint_extensions(&data, "test mint");
 
         assert!(matches!(result, Err(error) if error.contains("TransferFeeConfig")));
