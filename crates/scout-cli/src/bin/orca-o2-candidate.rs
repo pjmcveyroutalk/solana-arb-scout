@@ -6,13 +6,32 @@ mod orca;
 use orca::OrcaWhirlpoolState;
 use orca_whirlpools_core::{
     get_tick_array_start_tick_index, swap_quote_by_input_token, ExactInSwapQuote, OracleFacade,
-    TickArrayFacade, TickArrays, TickFacade, TransferFee, WhirlpoolFacade, TICK_ARRAY_SIZE,
+    TickArrayFacade, TickArrays, TickFacade, TransferFee, WhirlpoolFacade,
+    WhirlpoolRewardInfoFacade, TICK_ARRAY_SIZE,
 };
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
-const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0x07, 0x42, 0xbb];
+const WHIRLPOOL_STATE_LEN: usize = 653;
+const WHIRLPOOL_DISCRIMINATOR: [u8; 8] = [63, 149, 209, 12, 225, 128, 99, 9];
 
+const WHIRLPOOL_TICK_SPACING_OFFSET: usize = 41;
+const WHIRLPOOL_FEE_TIER_INDEX_SEED_OFFSET: usize = 43;
+const WHIRLPOOL_FEE_RATE_OFFSET: usize = 45;
+const WHIRLPOOL_PROTOCOL_FEE_RATE_OFFSET: usize = 47;
+const WHIRLPOOL_LIQUIDITY_OFFSET: usize = 49;
+const WHIRLPOOL_SQRT_PRICE_OFFSET: usize = 65;
+const WHIRLPOOL_TICK_CURRENT_INDEX_OFFSET: usize = 81;
+const WHIRLPOOL_FEE_GROWTH_GLOBAL_A_OFFSET: usize = 165;
+const WHIRLPOOL_FEE_GROWTH_GLOBAL_B_OFFSET: usize = 245;
+const WHIRLPOOL_REWARD_LAST_UPDATED_TIMESTAMP_OFFSET: usize = 261;
+const WHIRLPOOL_REWARD_INFOS_OFFSET: usize = 269;
+const WHIRLPOOL_REWARD_INFO_LEN: usize = 128;
+const WHIRLPOOL_REWARD_EMISSIONS_OFFSET: usize = 96;
+const WHIRLPOOL_REWARD_GROWTH_OFFSET: usize = 112;
+const WHIRLPOOL_REWARD_COUNT: usize = 3;
+
+const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0x07, 0x42, 0xbb];
 const TICK_SERIALIZED_LEN: usize = 113;
 const FIXED_TICK_ARRAY_LEN: usize = 8 + 4 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN) + 32;
 
@@ -80,6 +99,146 @@ pub fn tick_array_pda(whirlpool: &str, start_tick_index: i32) -> Result<String, 
         .ok_or_else(|| "could not derive Orca tick-array PDA".to_owned())?;
 
     Ok(address.to_string())
+}
+
+pub fn decode_whirlpool_facade(data: &[u8]) -> Result<WhirlpoolFacade, String> {
+    if data.len() != WHIRLPOOL_STATE_LEN {
+        return Err(format!(
+            "Orca Whirlpool account length mismatch: expected {WHIRLPOOL_STATE_LEN}, got {}",
+            data.len()
+        ));
+    }
+
+    let discriminator = read_array::<8>(data, 0, "Whirlpool discriminator")?;
+
+    if discriminator != WHIRLPOOL_DISCRIMINATOR {
+        return Err(format!(
+            "Orca Whirlpool discriminator mismatch: expected {:?}, got {:?}",
+            WHIRLPOOL_DISCRIMINATOR, discriminator
+        ));
+    }
+
+    let fee_tier_index_seed = read_array::<2>(
+        data,
+        WHIRLPOOL_FEE_TIER_INDEX_SEED_OFFSET,
+        "fee_tier_index_seed",
+    )?;
+
+    let tick_spacing = read_u16(
+        data,
+        WHIRLPOOL_TICK_SPACING_OFFSET,
+        "Whirlpool tick_spacing",
+    )?;
+    let fee_rate = read_u16(data, WHIRLPOOL_FEE_RATE_OFFSET, "Whirlpool fee_rate")?;
+    let protocol_fee_rate = read_u16(
+        data,
+        WHIRLPOOL_PROTOCOL_FEE_RATE_OFFSET,
+        "Whirlpool protocol_fee_rate",
+    )?;
+    let liquidity = read_u128(data, WHIRLPOOL_LIQUIDITY_OFFSET, "Whirlpool liquidity")?;
+    let sqrt_price = read_u128(data, WHIRLPOOL_SQRT_PRICE_OFFSET, "Whirlpool sqrt_price")?;
+    let tick_current_index = read_i32(
+        data,
+        WHIRLPOOL_TICK_CURRENT_INDEX_OFFSET,
+        "Whirlpool tick_current_index",
+    )?;
+    let fee_growth_global_a = read_u128(
+        data,
+        WHIRLPOOL_FEE_GROWTH_GLOBAL_A_OFFSET,
+        "Whirlpool fee_growth_global_a",
+    )?;
+    let fee_growth_global_b = read_u128(
+        data,
+        WHIRLPOOL_FEE_GROWTH_GLOBAL_B_OFFSET,
+        "Whirlpool fee_growth_global_b",
+    )?;
+    let reward_last_updated_timestamp = read_u64(
+        data,
+        WHIRLPOOL_REWARD_LAST_UPDATED_TIMESTAMP_OFFSET,
+        "Whirlpool reward_last_updated_timestamp",
+    )?;
+
+    let mut reward_infos = [WhirlpoolRewardInfoFacade::default(); WHIRLPOOL_REWARD_COUNT];
+
+    for (reward_index, reward_info) in reward_infos.iter_mut().enumerate() {
+        let reward_stride = reward_index
+            .checked_mul(WHIRLPOOL_REWARD_INFO_LEN)
+            .ok_or_else(|| "Orca reward-info index overflow".to_owned())?;
+
+        let reward_offset = WHIRLPOOL_REWARD_INFOS_OFFSET
+            .checked_add(reward_stride)
+            .ok_or_else(|| "Orca reward-info offset overflow".to_owned())?;
+
+        let emissions_offset = reward_offset
+            .checked_add(WHIRLPOOL_REWARD_EMISSIONS_OFFSET)
+            .ok_or_else(|| "Orca reward emissions offset overflow".to_owned())?;
+
+        let growth_offset = reward_offset
+            .checked_add(WHIRLPOOL_REWARD_GROWTH_OFFSET)
+            .ok_or_else(|| "Orca reward growth offset overflow".to_owned())?;
+
+        *reward_info = WhirlpoolRewardInfoFacade {
+            emissions_per_second_x64: read_u128(
+                data,
+                emissions_offset,
+                "Whirlpool reward emissions_per_second_x64",
+            )?,
+            growth_global_x64: read_u128(
+                data,
+                growth_offset,
+                "Whirlpool reward growth_global_x64",
+            )?,
+        };
+    }
+
+    Ok(WhirlpoolFacade {
+        fee_tier_index_seed,
+        tick_spacing,
+        fee_rate,
+        protocol_fee_rate,
+        liquidity,
+        sqrt_price,
+        tick_current_index,
+        fee_growth_global_a,
+        fee_growth_global_b,
+        reward_last_updated_timestamp,
+        reward_infos,
+    })
+}
+
+pub fn verify_whirlpool_facade_matches_pool(
+    pool: &OrcaWhirlpoolState,
+    facade: &WhirlpoolFacade,
+) -> Result<(), String> {
+    if facade.tick_spacing != pool.tick_spacing {
+        return Err("Orca Whirlpool facade tick_spacing mismatch".to_owned());
+    }
+
+    if u16::from_le_bytes(facade.fee_tier_index_seed) != pool.fee_tier_index_seed {
+        return Err("Orca Whirlpool facade fee_tier_index_seed mismatch".to_owned());
+    }
+
+    if facade.fee_rate != pool.fee_rate {
+        return Err("Orca Whirlpool facade fee_rate mismatch".to_owned());
+    }
+
+    if facade.protocol_fee_rate != pool.protocol_fee_rate {
+        return Err("Orca Whirlpool facade protocol_fee_rate mismatch".to_owned());
+    }
+
+    if facade.liquidity != pool.liquidity {
+        return Err("Orca Whirlpool facade liquidity mismatch".to_owned());
+    }
+
+    if facade.sqrt_price != pool.sqrt_price {
+        return Err("Orca Whirlpool facade sqrt_price mismatch".to_owned());
+    }
+
+    if facade.tick_current_index != pool.tick_current_index {
+        return Err("Orca Whirlpool facade tick_current_index mismatch".to_owned());
+    }
+
+    Ok(())
 }
 
 pub fn decode_fixed_tick_array(
@@ -168,7 +327,6 @@ pub fn decode_fixed_tick_array(
     }
 
     let whirlpool_bytes = read_array::<32>(data, offset, "tick-array Whirlpool identity")?;
-
     let decoded_whirlpool = Pubkey::new_from_array(whirlpool_bytes).to_string();
 
     if decoded_whirlpool != expected_whirlpool {
@@ -207,25 +365,10 @@ pub fn zeroed_tick_array(start_tick_index: i32) -> TickArrayFacade {
     }
 }
 
-pub fn whirlpool_facade(pool: &OrcaWhirlpoolState) -> WhirlpoolFacade {
-    WhirlpoolFacade {
-        fee_tier_index_seed: pool.fee_tier_index_seed.to_le_bytes(),
-        tick_spacing: pool.tick_spacing,
-        fee_rate: pool.fee_rate,
-        protocol_fee_rate: pool.protocol_fee_rate,
-        liquidity: pool.liquidity,
-        sqrt_price: pool.sqrt_price,
-        tick_current_index: pool.tick_current_index,
-        fee_growth_global_a: 0,
-        fee_growth_global_b: 0,
-        reward_last_updated_timestamp: 0,
-        reward_infos: Default::default(),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn quote_exact_input(
     pool: &OrcaWhirlpoolState,
+    whirlpool: WhirlpoolFacade,
     input_mint: &str,
     amount_in_raw: u64,
     tick_arrays: [TickArrayFacade; 5],
@@ -238,6 +381,8 @@ pub fn quote_exact_input(
         return Err("Orca exact-input quote amount must be greater than zero".to_owned());
     }
 
+    verify_whirlpool_facade_matches_pool(pool, &whirlpool)?;
+
     let specified_token_a = if input_mint == pool.token_mint_a {
         true
     } else if input_mint == pool.token_mint_b {
@@ -248,7 +393,7 @@ pub fn quote_exact_input(
         ));
     };
 
-    match (pool.is_adaptive_fee(), oracle) {
+    match (whirlpool.is_initialized_with_adaptive_fee(), oracle) {
         (true, None) => {
             return Err("adaptive-fee Orca Whirlpool requires Oracle state".to_owned());
         }
@@ -274,7 +419,7 @@ pub fn quote_exact_input(
         amount_in_raw,
         specified_token_a,
         0,
-        whirlpool_facade(pool),
+        whirlpool,
         oracle,
         TickArrays::Five(
             tick_arrays[0],
@@ -296,8 +441,16 @@ fn checked_advance(offset: usize, amount: usize, label: &str) -> Result<usize, S
         .ok_or_else(|| format!("Orca {label} offset overflow"))
 }
 
+fn read_u16(data: &[u8], offset: usize, label: &str) -> Result<u16, String> {
+    Ok(u16::from_le_bytes(read_array::<2>(data, offset, label)?))
+}
+
 fn read_i32(data: &[u8], offset: usize, label: &str) -> Result<i32, String> {
     Ok(i32::from_le_bytes(read_array::<4>(data, offset, label)?))
+}
+
+fn read_u64(data: &[u8], offset: usize, label: &str) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(read_array::<8>(data, offset, label)?))
 }
 
 fn read_i128(data: &[u8], offset: usize, label: &str) -> Result<i128, String> {
@@ -342,6 +495,50 @@ mod tests {
         }
     }
 
+    fn sample_whirlpool_account(pool: &OrcaWhirlpoolState) -> Vec<u8> {
+        let mut data = vec![0u8; WHIRLPOOL_STATE_LEN];
+
+        data[0..8].copy_from_slice(&WHIRLPOOL_DISCRIMINATOR);
+        data[WHIRLPOOL_TICK_SPACING_OFFSET..WHIRLPOOL_TICK_SPACING_OFFSET + 2]
+            .copy_from_slice(&pool.tick_spacing.to_le_bytes());
+        data[WHIRLPOOL_FEE_TIER_INDEX_SEED_OFFSET..WHIRLPOOL_FEE_TIER_INDEX_SEED_OFFSET + 2]
+            .copy_from_slice(&pool.fee_tier_index_seed.to_le_bytes());
+        data[WHIRLPOOL_FEE_RATE_OFFSET..WHIRLPOOL_FEE_RATE_OFFSET + 2]
+            .copy_from_slice(&pool.fee_rate.to_le_bytes());
+        data[WHIRLPOOL_PROTOCOL_FEE_RATE_OFFSET..WHIRLPOOL_PROTOCOL_FEE_RATE_OFFSET + 2]
+            .copy_from_slice(&pool.protocol_fee_rate.to_le_bytes());
+        data[WHIRLPOOL_LIQUIDITY_OFFSET..WHIRLPOOL_LIQUIDITY_OFFSET + 16]
+            .copy_from_slice(&pool.liquidity.to_le_bytes());
+        data[WHIRLPOOL_SQRT_PRICE_OFFSET..WHIRLPOOL_SQRT_PRICE_OFFSET + 16]
+            .copy_from_slice(&pool.sqrt_price.to_le_bytes());
+        data[WHIRLPOOL_TICK_CURRENT_INDEX_OFFSET..WHIRLPOOL_TICK_CURRENT_INDEX_OFFSET + 4]
+            .copy_from_slice(&pool.tick_current_index.to_le_bytes());
+
+        data[WHIRLPOOL_FEE_GROWTH_GLOBAL_A_OFFSET..WHIRLPOOL_FEE_GROWTH_GLOBAL_A_OFFSET + 16]
+            .copy_from_slice(&111u128.to_le_bytes());
+        data[WHIRLPOOL_FEE_GROWTH_GLOBAL_B_OFFSET..WHIRLPOOL_FEE_GROWTH_GLOBAL_B_OFFSET + 16]
+            .copy_from_slice(&222u128.to_le_bytes());
+        data[WHIRLPOOL_REWARD_LAST_UPDATED_TIMESTAMP_OFFSET
+            ..WHIRLPOOL_REWARD_LAST_UPDATED_TIMESTAMP_OFFSET + 8]
+            .copy_from_slice(&333u64.to_le_bytes());
+
+        for reward_index in 0..WHIRLPOOL_REWARD_COUNT {
+            let reward_offset =
+                WHIRLPOOL_REWARD_INFOS_OFFSET + (reward_index * WHIRLPOOL_REWARD_INFO_LEN);
+            let emissions_offset = reward_offset + WHIRLPOOL_REWARD_EMISSIONS_OFFSET;
+            let growth_offset = reward_offset + WHIRLPOOL_REWARD_GROWTH_OFFSET;
+
+            let emissions = 1_000u128 + reward_index as u128;
+            let growth = 2_000u128 + reward_index as u128;
+
+            data[emissions_offset..emissions_offset + 16]
+                .copy_from_slice(&emissions.to_le_bytes());
+            data[growth_offset..growth_offset + 16].copy_from_slice(&growth.to_le_bytes());
+        }
+
+        data
+    }
+
     #[test]
     fn official_tick_array_pda_vector_matches() -> Result<(), String> {
         let whirlpool = "2kJmUjxWBwL2NGPBV2PiA5hWtmLCqcKY6reQgkrPtaeS";
@@ -377,6 +574,48 @@ mod tests {
         assert_eq!(indexes[4], -double_width);
 
         Ok(())
+    }
+
+    #[test]
+    fn whirlpool_facade_decoder_preserves_authoritative_quote_state() -> Result<(), String> {
+        let pool = sample_pool();
+        let data = sample_whirlpool_account(&pool);
+
+        let facade = decode_whirlpool_facade(&data)?;
+
+        assert_eq!(facade.tick_spacing, pool.tick_spacing);
+        assert_eq!(
+            u16::from_le_bytes(facade.fee_tier_index_seed),
+            pool.fee_tier_index_seed
+        );
+        assert_eq!(facade.fee_rate, pool.fee_rate);
+        assert_eq!(facade.protocol_fee_rate, pool.protocol_fee_rate);
+        assert_eq!(facade.liquidity, pool.liquidity);
+        assert_eq!(facade.sqrt_price, pool.sqrt_price);
+        assert_eq!(facade.tick_current_index, pool.tick_current_index);
+        assert_eq!(facade.fee_growth_global_a, 111);
+        assert_eq!(facade.fee_growth_global_b, 222);
+        assert_eq!(facade.reward_last_updated_timestamp, 333);
+        assert_eq!(facade.reward_infos[0].emissions_per_second_x64, 1_000);
+        assert_eq!(facade.reward_infos[0].growth_global_x64, 2_000);
+        assert_eq!(facade.reward_infos[1].emissions_per_second_x64, 1_001);
+        assert_eq!(facade.reward_infos[1].growth_global_x64, 2_001);
+        assert_eq!(facade.reward_infos[2].emissions_per_second_x64, 1_002);
+        assert_eq!(facade.reward_infos[2].growth_global_x64, 2_002);
+
+        verify_whirlpool_facade_matches_pool(&pool, &facade)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn whirlpool_facade_decoder_fails_closed_on_wrong_layout() -> Result<(), String> {
+        let data = vec![0u8; 64];
+
+        match decode_whirlpool_facade(&data) {
+            Ok(_) => Err("invalid Whirlpool layout was accepted".to_owned()),
+            Err(_) => Ok(()),
+        }
     }
 
     #[test]
@@ -420,6 +659,9 @@ mod tests {
         let mut pool = sample_pool();
         pool.fee_tier_index_seed = 32;
 
+        let whirlpool_data = sample_whirlpool_account(&pool);
+        let whirlpool = decode_whirlpool_facade(&whirlpool_data)?;
+
         let arrays = [
             zeroed_tick_array(0),
             zeroed_tick_array(5_632),
@@ -430,7 +672,17 @@ mod tests {
 
         let input_mint = pool.token_mint_a.clone();
 
-        match quote_exact_input(&pool, &input_mint, 1_000, arrays, 1_000, None, None, None) {
+        match quote_exact_input(
+            &pool,
+            whirlpool,
+            &input_mint,
+            1_000,
+            arrays,
+            1_000,
+            None,
+            None,
+            None,
+        ) {
             Ok(_) => Err("adaptive pool quoted without Oracle".to_owned()),
             Err(error) => {
                 assert!(error.contains("requires Oracle"));
