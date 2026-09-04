@@ -536,12 +536,7 @@ mod tests {
     fn synthetic_clmm_ticks_readiness_is_eligible_without_cpmm_reserves() -> Result<(), String> {
         let mut registry = ActiveMintRegistry::new();
 
-        let mut pool = sample_pool(
-            Venue::Orca,
-            "orca-pool",
-            20,
-            PoolTradingState::Tradable,
-        );
+        let mut pool = sample_pool(Venue::Orca, "orca-pool", 20, PoolTradingState::Tradable);
         pool.quote_reserves = QuoteReserveState::Unavailable;
 
         let readiness = QuoteReadiness::synthetic_for_test(
