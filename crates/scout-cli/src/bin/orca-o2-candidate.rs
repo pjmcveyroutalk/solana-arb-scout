@@ -12,7 +12,7 @@ use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
 const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] =
-    [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0x07, 0x42, 0xbb];
+    [0x45, 0x61, 0xbd, 0xbe, 0x07, 0x42, 0xbb];
 
 const TICK_SERIALIZED_LEN: usize = 113;
 const FIXED_TICK_ARRAY_LEN: usize = 8 + 4 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN) + 32;
@@ -35,23 +35,23 @@ pub fn bounded_tick_array_start_indexes(
     let current =
         get_tick_array_start_tick_index(pool.tick_current_index, pool.tick_spacing);
 
+    let tick_array_size = i32::try_from(TICK_ARRAY_SIZE)
+        .map_err(|_| "Orca tick-array size does not fit i32".to_owned())?;
+
     let offset = i32::from(pool.tick_spacing)
-        .checked_mul(
-            i32::try_from(TICK_ARRAY_SIZE)
-                .map_err(|_| "Orca tick-array size does not fit i32".to_owned())?,
-        )
+        .checked_mul(tick_array_size)
         .ok_or_else(|| "Orca tick-array offset overflow".to_owned())?;
+
+    let double_offset = offset
+        .checked_mul(2)
+        .ok_or_else(|| "Orca doubled tick-array offset overflow".to_owned())?;
 
     let plus_one = current
         .checked_add(offset)
         .ok_or_else(|| "Orca +1 tick-array index overflow".to_owned())?;
 
     let plus_two = current
-        .checked_add(
-            offset
-                .checked_mul(2)
-                .ok_or_else(|| "Orca +2 tick-array offset overflow".to_owned())?,
-        )
+        .checked_add(double_offset)
         .ok_or_else(|| "Orca +2 tick-array index overflow".to_owned())?;
 
     let minus_one = current
@@ -59,11 +59,7 @@ pub fn bounded_tick_array_start_indexes(
         .ok_or_else(|| "Orca -1 tick-array index overflow".to_owned())?;
 
     let minus_two = current
-        .checked_sub(
-            offset
-                .checked_mul(2)
-                .ok_or_else(|| "Orca -2 tick-array offset overflow".to_owned())?,
-        )
+        .checked_sub(double_offset)
         .ok_or_else(|| "Orca -2 tick-array index overflow".to_owned())?;
 
     Ok([current, plus_one, plus_two, minus_one, minus_two])
@@ -143,13 +139,11 @@ pub fn decode_fixed_tick_array(
             other => {
                 return Err(format!(
                     "Orca tick initialized flag invalid: {other}"
-                ))
+                ));
             }
         };
 
-        offset = offset
-            .checked_add(1)
-            .ok_or_else(|| "Orca tick offset overflow".to_owned())?;
+        offset = checked_advance(offset, 1, "tick initialized")?;
 
         let liquidity_net = read_i128(data, offset, "tick liquidity_net")?;
         offset = checked_advance(offset, 16, "liquidity_net")?;
@@ -193,6 +187,7 @@ pub fn decode_fixed_tick_array(
 
     let whirlpool_bytes =
         read_array::<32>(data, offset, "tick-array Whirlpool identity")?;
+
     let decoded_whirlpool = Pubkey::new_from_array(whirlpool_bytes).to_string();
 
     if decoded_whirlpool != expected_whirlpool {
@@ -209,7 +204,11 @@ pub fn decode_fixed_tick_array(
 
     if offset != data.len() {
         return Err(format!(
-            "Orca fixed tick-array decoder did not consume account: consumed={offset} len={}",
+            concat!(
+                "Orca fixed tick-array decoder did not consume account: ",
+                "consumed={} len={}"
+            ),
+            offset,
             data.len()
         ));
     }
@@ -272,12 +271,12 @@ pub fn quote_exact_input(
         (true, None) => {
             return Err(
                 "adaptive-fee Orca Whirlpool requires Oracle state".to_owned()
-            )
+            );
         }
         (false, Some(_)) => {
             return Err(
                 "non-adaptive Orca Whirlpool must not receive Oracle state".to_owned()
-            )
+            );
         }
         _ => {}
     }
@@ -398,15 +397,22 @@ mod tests {
 
         let indexes = bounded_tick_array_start_indexes(&pool)?;
 
+        let tick_array_size = i32::try_from(TICK_ARRAY_SIZE)
+            .map_err(|_| "tick-array size does not fit i32".to_owned())?;
+
         let width = i32::from(pool.tick_spacing)
-            * i32::try_from(TICK_ARRAY_SIZE)
-                .map_err(|_| "tick-array size does not fit i32".to_owned())?;
+            .checked_mul(tick_array_size)
+            .ok_or_else(|| "tick-array width overflow".to_owned())?;
+
+        let double_width = width
+            .checked_mul(2)
+            .ok_or_else(|| "double tick-array width overflow".to_owned())?;
 
         assert_eq!(indexes[0], 0);
         assert_eq!(indexes[1], width);
-        assert_eq!(indexes[2], width * 2);
+        assert_eq!(indexes[2], double_width);
         assert_eq!(indexes[3], -width);
-        assert_eq!(indexes[4], -(width * 2));
+        assert_eq!(indexes[4], -double_width);
 
         Ok(())
     }
@@ -445,20 +451,21 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_tick_array_representation_fails_closed() {
+    fn unsupported_tick_array_representation_fails_closed() -> Result<(), String> {
         let data = vec![0u8; 64];
 
-        let result = decode_fixed_tick_array(
+        match decode_fixed_tick_array(
             &data,
             &Pubkey::new_unique().to_string(),
             0,
-        );
-
-        assert!(result.is_err());
+        ) {
+            Ok(_) => Err("unsupported tick-array representation was accepted".to_owned()),
+            Err(_) => Ok(()),
+        }
     }
 
     #[test]
-    fn adaptive_pool_requires_oracle_before_quote() {
+    fn adaptive_pool_requires_oracle_before_quote() -> Result<(), String> {
         let mut pool = sample_pool();
         pool.fee_tier_index_seed = 32;
 
@@ -472,7 +479,7 @@ mod tests {
 
         let input_mint = pool.token_mint_a.clone();
 
-        let result = quote_exact_input(
+        match quote_exact_input(
             &pool,
             &input_mint,
             1_000,
@@ -481,12 +488,11 @@ mod tests {
             None,
             None,
             None,
-        );
-
-        match result {
-            Ok(_) => panic!("adaptive pool quoted without Oracle"),
+        ) {
+            Ok(_) => Err("adaptive pool quoted without Oracle".to_owned()),
             Err(error) => {
                 assert!(error.contains("requires Oracle"));
+                Ok(())
             }
         }
     }
