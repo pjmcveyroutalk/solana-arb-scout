@@ -166,9 +166,7 @@ fn validate_token_2022_mint_prefix(data: &[u8], label: &str) -> Result<(), Strin
         1 => {}
         0 => return Err(format!("{label} is not initialized")),
         value => {
-            return Err(format!(
-                "{label} has invalid is_initialized value: {value}"
-            ));
+            return Err(format!("{label} has invalid is_initialized value: {value}"));
         }
     }
 
@@ -240,11 +238,7 @@ fn parse_transfer_fee_config(
     Ok(active.into_core())
 }
 
-fn validate_transfer_fee(
-    fee: ParsedTransferFee,
-    label: &str,
-    which: &str,
-) -> Result<(), String> {
+fn validate_transfer_fee(fee: ParsedTransferFee, label: &str, which: &str) -> Result<(), String> {
     if fee.basis_points > MAX_FEE_BASIS_POINTS {
         return Err(format!(
             "{label} Token-2022 {which} transfer fee exceeds 10000 bps: {}",
@@ -263,11 +257,7 @@ fn read_u64(data: &[u8], offset: usize, label: &str) -> Result<u64, String> {
     Ok(u64::from_le_bytes(read_array::<8>(data, offset, label)?))
 }
 
-fn read_array<const N: usize>(
-    data: &[u8],
-    offset: usize,
-    label: &str,
-) -> Result<[u8; N], String> {
+fn read_array<const N: usize>(data: &[u8], offset: usize, label: &str) -> Result<[u8; N], String> {
     let end = offset
         .checked_add(N)
         .ok_or_else(|| format!("{label} byte offset overflow"))?;
@@ -386,10 +376,7 @@ mod tests {
         let config = transfer_fee_config(1, 10, 100, 100, 5_000, 1);
 
         let data = mint_with_extensions(&[
-            (
-                EXTENSION_METADATA_POINTER,
-                vec![0u8; METADATA_POINTER_LEN],
-            ),
+            (EXTENSION_METADATA_POINTER, vec![0u8; METADATA_POINTER_LEN]),
             (EXTENSION_TRANSFER_FEE_CONFIG, config),
             (EXTENSION_TOKEN_METADATA, vec![7u8; 12]),
         ])?;
@@ -417,8 +404,7 @@ mod tests {
 
     #[test]
     fn malformed_transfer_fee_length_fails_closed() -> Result<(), String> {
-        let data =
-            mint_with_extensions(&[(EXTENSION_TRANSFER_FEE_CONFIG, vec![0u8; 107])])?;
+        let data = mint_with_extensions(&[(EXTENSION_TRANSFER_FEE_CONFIG, vec![0u8; 107])])?;
 
         match current_transfer_fee_for_token_2022_mint(&data, 100, "test mint") {
             Ok(_) => Err("malformed TransferFeeConfig was accepted".to_owned()),
