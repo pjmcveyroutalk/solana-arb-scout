@@ -5,9 +5,9 @@ mod orca;
 
 use orca::OrcaWhirlpoolState;
 use orca_whirlpools_core::{
-    get_tick_array_start_tick_index, swap_quote_by_input_token, ExactInSwapQuote, OracleFacade,
-    TickArrayFacade, TickArrays, TickFacade, TransferFee, WhirlpoolFacade,
-    WhirlpoolRewardInfoFacade, TICK_ARRAY_SIZE,
+    get_tick_array_start_tick_index, swap_quote_by_input_token, AdaptiveFeeConstantsFacade,
+    AdaptiveFeeVariablesFacade, ExactInSwapQuote, OracleFacade, TickArrayFacade, TickArrays,
+    TickFacade, TransferFee, WhirlpoolFacade, WhirlpoolRewardInfoFacade, TICK_ARRAY_SIZE,
 };
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
@@ -30,6 +30,23 @@ const WHIRLPOOL_REWARD_INFO_LEN: usize = 128;
 const WHIRLPOOL_REWARD_EMISSIONS_OFFSET: usize = 96;
 const WHIRLPOOL_REWARD_GROWTH_OFFSET: usize = 112;
 const WHIRLPOOL_REWARD_COUNT: usize = 3;
+
+const ORACLE_STATE_LEN: usize = 254;
+const ORACLE_DISCRIMINATOR: [u8; 8] = [139, 194, 131, 179, 140, 179, 229, 244];
+const ORACLE_WHIRLPOOL_OFFSET: usize = 8;
+const ORACLE_TRADE_ENABLE_TIMESTAMP_OFFSET: usize = 40;
+const ORACLE_FILTER_PERIOD_OFFSET: usize = 48;
+const ORACLE_DECAY_PERIOD_OFFSET: usize = 50;
+const ORACLE_REDUCTION_FACTOR_OFFSET: usize = 52;
+const ORACLE_ADAPTIVE_FEE_CONTROL_FACTOR_OFFSET: usize = 54;
+const ORACLE_MAX_VOLATILITY_ACCUMULATOR_OFFSET: usize = 58;
+const ORACLE_TICK_GROUP_SIZE_OFFSET: usize = 62;
+const ORACLE_MAJOR_SWAP_THRESHOLD_TICKS_OFFSET: usize = 64;
+const ORACLE_LAST_REFERENCE_UPDATE_TIMESTAMP_OFFSET: usize = 82;
+const ORACLE_LAST_MAJOR_SWAP_TIMESTAMP_OFFSET: usize = 90;
+const ORACLE_VOLATILITY_REFERENCE_OFFSET: usize = 98;
+const ORACLE_TICK_GROUP_INDEX_REFERENCE_OFFSET: usize = 102;
+const ORACLE_VOLATILITY_ACCUMULATOR_OFFSET: usize = 106;
 
 const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0x07, 0x42, 0xbb];
 const TICK_SERIALIZED_LEN: usize = 113;
@@ -97,6 +114,21 @@ pub fn tick_array_pda(whirlpool: &str, start_tick_index: i32) -> Result<String, 
 
     let (address, _) = Pubkey::try_find_program_address(&seeds, &program_id)
         .ok_or_else(|| "could not derive Orca tick-array PDA".to_owned())?;
+
+    Ok(address.to_string())
+}
+
+pub fn oracle_pda(whirlpool: &str) -> Result<String, String> {
+    let whirlpool_pubkey = Pubkey::from_str(whirlpool)
+        .map_err(|error| format!("invalid Orca Whirlpool pubkey: {error}"))?;
+
+    let program_id = Pubkey::from_str(orca::ORCA_WHIRLPOOL_PROGRAM_ID)
+        .map_err(|error| format!("invalid Orca program id: {error}"))?;
+
+    let seeds: [&[u8]; 2] = [b"oracle", whirlpool_pubkey.as_ref()];
+
+    let (address, _) = Pubkey::try_find_program_address(&seeds, &program_id)
+        .ok_or_else(|| "could not derive Orca Oracle PDA".to_owned())?;
 
     Ok(address.to_string())
 }
@@ -203,6 +235,109 @@ pub fn decode_whirlpool_facade(data: &[u8]) -> Result<WhirlpoolFacade, String> {
         fee_growth_global_b,
         reward_last_updated_timestamp,
         reward_infos,
+    })
+}
+
+pub fn decode_oracle_facade(
+    data: &[u8],
+    account_owner: &str,
+    expected_whirlpool: &str,
+) -> Result<OracleFacade, String> {
+    if account_owner != orca::ORCA_WHIRLPOOL_PROGRAM_ID {
+        return Err(format!(
+            "Orca Oracle owner mismatch: expected {}, got {}",
+            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            account_owner
+        ));
+    }
+
+    if data.len() != ORACLE_STATE_LEN {
+        return Err(format!(
+            "Orca Oracle account length mismatch: expected {ORACLE_STATE_LEN}, got {}",
+            data.len()
+        ));
+    }
+
+    let discriminator = read_array::<8>(data, 0, "Oracle discriminator")?;
+
+    if discriminator != ORACLE_DISCRIMINATOR {
+        return Err(format!(
+            "Orca Oracle discriminator mismatch: expected {:?}, got {:?}",
+            ORACLE_DISCRIMINATOR, discriminator
+        ));
+    }
+
+    let whirlpool_bytes = read_array::<32>(data, ORACLE_WHIRLPOOL_OFFSET, "Oracle Whirlpool")?;
+    let decoded_whirlpool = Pubkey::new_from_array(whirlpool_bytes).to_string();
+
+    if decoded_whirlpool != expected_whirlpool {
+        return Err(format!(
+            "Orca Oracle Whirlpool mismatch: expected {expected_whirlpool}, got {decoded_whirlpool}"
+        ));
+    }
+
+    Ok(OracleFacade {
+        trade_enable_timestamp: read_u64(
+            data,
+            ORACLE_TRADE_ENABLE_TIMESTAMP_OFFSET,
+            "Oracle trade_enable_timestamp",
+        )?,
+        adaptive_fee_constants: AdaptiveFeeConstantsFacade {
+            filter_period: read_u16(data, ORACLE_FILTER_PERIOD_OFFSET, "Oracle filter_period")?,
+            decay_period: read_u16(data, ORACLE_DECAY_PERIOD_OFFSET, "Oracle decay_period")?,
+            reduction_factor: read_u16(
+                data,
+                ORACLE_REDUCTION_FACTOR_OFFSET,
+                "Oracle reduction_factor",
+            )?,
+            adaptive_fee_control_factor: read_u32(
+                data,
+                ORACLE_ADAPTIVE_FEE_CONTROL_FACTOR_OFFSET,
+                "Oracle adaptive_fee_control_factor",
+            )?,
+            max_volatility_accumulator: read_u32(
+                data,
+                ORACLE_MAX_VOLATILITY_ACCUMULATOR_OFFSET,
+                "Oracle max_volatility_accumulator",
+            )?,
+            tick_group_size: read_u16(
+                data,
+                ORACLE_TICK_GROUP_SIZE_OFFSET,
+                "Oracle tick_group_size",
+            )?,
+            major_swap_threshold_ticks: read_u16(
+                data,
+                ORACLE_MAJOR_SWAP_THRESHOLD_TICKS_OFFSET,
+                "Oracle major_swap_threshold_ticks",
+            )?,
+        },
+        adaptive_fee_variables: AdaptiveFeeVariablesFacade {
+            last_reference_update_timestamp: read_u64(
+                data,
+                ORACLE_LAST_REFERENCE_UPDATE_TIMESTAMP_OFFSET,
+                "Oracle last_reference_update_timestamp",
+            )?,
+            last_major_swap_timestamp: read_u64(
+                data,
+                ORACLE_LAST_MAJOR_SWAP_TIMESTAMP_OFFSET,
+                "Oracle last_major_swap_timestamp",
+            )?,
+            volatility_reference: read_u32(
+                data,
+                ORACLE_VOLATILITY_REFERENCE_OFFSET,
+                "Oracle volatility_reference",
+            )?,
+            tick_group_index_reference: read_i32(
+                data,
+                ORACLE_TICK_GROUP_INDEX_REFERENCE_OFFSET,
+                "Oracle tick_group_index_reference",
+            )?,
+            volatility_accumulator: read_u32(
+                data,
+                ORACLE_VOLATILITY_ACCUMULATOR_OFFSET,
+                "Oracle volatility_accumulator",
+            )?,
+        },
     })
 }
 
@@ -445,6 +580,10 @@ fn read_u16(data: &[u8], offset: usize, label: &str) -> Result<u16, String> {
     Ok(u16::from_le_bytes(read_array::<2>(data, offset, label)?))
 }
 
+fn read_u32(data: &[u8], offset: usize, label: &str) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(read_array::<4>(data, offset, label)?))
+}
+
 fn read_i32(data: &[u8], offset: usize, label: &str) -> Result<i32, String> {
     Ok(i32::from_le_bytes(read_array::<4>(data, offset, label)?))
 }
@@ -538,12 +677,69 @@ mod tests {
         data
     }
 
+    fn sample_oracle_account(
+        whirlpool: &str,
+        trade_enable_timestamp: u64,
+    ) -> Result<Vec<u8>, String> {
+        let whirlpool_pubkey = Pubkey::from_str(whirlpool)
+            .map_err(|error| format!("invalid test Whirlpool pubkey: {error}"))?;
+        let mut data = vec![0u8; ORACLE_STATE_LEN];
+
+        data[0..8].copy_from_slice(&ORACLE_DISCRIMINATOR);
+        data[ORACLE_WHIRLPOOL_OFFSET..ORACLE_WHIRLPOOL_OFFSET + 32]
+            .copy_from_slice(whirlpool_pubkey.as_ref());
+        data[ORACLE_TRADE_ENABLE_TIMESTAMP_OFFSET..ORACLE_TRADE_ENABLE_TIMESTAMP_OFFSET + 8]
+            .copy_from_slice(&trade_enable_timestamp.to_le_bytes());
+        data[ORACLE_FILTER_PERIOD_OFFSET..ORACLE_FILTER_PERIOD_OFFSET + 2]
+            .copy_from_slice(&30u16.to_le_bytes());
+        data[ORACLE_DECAY_PERIOD_OFFSET..ORACLE_DECAY_PERIOD_OFFSET + 2]
+            .copy_from_slice(&120u16.to_le_bytes());
+        data[ORACLE_REDUCTION_FACTOR_OFFSET..ORACLE_REDUCTION_FACTOR_OFFSET + 2]
+            .copy_from_slice(&5_000u16.to_le_bytes());
+        data[ORACLE_ADAPTIVE_FEE_CONTROL_FACTOR_OFFSET
+            ..ORACLE_ADAPTIVE_FEE_CONTROL_FACTOR_OFFSET + 4]
+            .copy_from_slice(&9_000u32.to_le_bytes());
+        data[ORACLE_MAX_VOLATILITY_ACCUMULATOR_OFFSET
+            ..ORACLE_MAX_VOLATILITY_ACCUMULATOR_OFFSET + 4]
+            .copy_from_slice(&88_000u32.to_le_bytes());
+        data[ORACLE_TICK_GROUP_SIZE_OFFSET..ORACLE_TICK_GROUP_SIZE_OFFSET + 2]
+            .copy_from_slice(&64u16.to_le_bytes());
+        data[ORACLE_MAJOR_SWAP_THRESHOLD_TICKS_OFFSET
+            ..ORACLE_MAJOR_SWAP_THRESHOLD_TICKS_OFFSET + 2]
+            .copy_from_slice(&32u16.to_le_bytes());
+        data[ORACLE_LAST_REFERENCE_UPDATE_TIMESTAMP_OFFSET
+            ..ORACLE_LAST_REFERENCE_UPDATE_TIMESTAMP_OFFSET + 8]
+            .copy_from_slice(&777u64.to_le_bytes());
+        data[ORACLE_LAST_MAJOR_SWAP_TIMESTAMP_OFFSET..ORACLE_LAST_MAJOR_SWAP_TIMESTAMP_OFFSET + 8]
+            .copy_from_slice(&778u64.to_le_bytes());
+        data[ORACLE_VOLATILITY_REFERENCE_OFFSET..ORACLE_VOLATILITY_REFERENCE_OFFSET + 4]
+            .copy_from_slice(&123u32.to_le_bytes());
+        data[ORACLE_TICK_GROUP_INDEX_REFERENCE_OFFSET
+            ..ORACLE_TICK_GROUP_INDEX_REFERENCE_OFFSET + 4]
+            .copy_from_slice(&(-7i32).to_le_bytes());
+        data[ORACLE_VOLATILITY_ACCUMULATOR_OFFSET..ORACLE_VOLATILITY_ACCUMULATOR_OFFSET + 4]
+            .copy_from_slice(&456u32.to_le_bytes());
+
+        Ok(data)
+    }
+
     #[test]
     fn official_tick_array_pda_vector_matches() -> Result<(), String> {
         let whirlpool = "2kJmUjxWBwL2NGPBV2PiA5hWtmLCqcKY6reQgkrPtaeS";
         let expected = "8PhPzk7n4wU98Z6XCbVtPai2LtXSxYnfjkmgWuoAU8Zy";
 
         let actual = tick_array_pda(whirlpool, 0)?;
+
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn official_oracle_pda_vector_matches() -> Result<(), String> {
+        let whirlpool = "2kJmUjxWBwL2NGPBV2PiA5hWtmLCqcKY6reQgkrPtaeS";
+        let expected = "821SHenpVGYY7BCXUzNhs8Xi4grG557fqRw4wzgaPQcS";
+
+        let actual = oracle_pda(whirlpool)?;
 
         assert_eq!(actual, expected);
         Ok(())
@@ -605,6 +801,81 @@ mod tests {
         verify_whirlpool_facade_matches_pool(&pool, &facade)?;
 
         Ok(())
+    }
+
+    #[test]
+    fn oracle_facade_decoder_preserves_authoritative_adaptive_fee_state() -> Result<(), String> {
+        let whirlpool = Pubkey::new_unique().to_string();
+        let data = sample_oracle_account(&whirlpool, 900)?;
+
+        let oracle =
+            decode_oracle_facade(&data, orca::ORCA_WHIRLPOOL_PROGRAM_ID, &whirlpool)?;
+
+        assert_eq!(oracle.trade_enable_timestamp, 900);
+        assert_eq!(oracle.adaptive_fee_constants.filter_period, 30);
+        assert_eq!(oracle.adaptive_fee_constants.decay_period, 120);
+        assert_eq!(oracle.adaptive_fee_constants.reduction_factor, 5_000);
+        assert_eq!(
+            oracle.adaptive_fee_constants.adaptive_fee_control_factor,
+            9_000
+        );
+        assert_eq!(
+            oracle.adaptive_fee_constants.max_volatility_accumulator,
+            88_000
+        );
+        assert_eq!(oracle.adaptive_fee_constants.tick_group_size, 64);
+        assert_eq!(
+            oracle.adaptive_fee_constants.major_swap_threshold_ticks,
+            32
+        );
+        assert_eq!(
+            oracle
+                .adaptive_fee_variables
+                .last_reference_update_timestamp,
+            777
+        );
+        assert_eq!(
+            oracle.adaptive_fee_variables.last_major_swap_timestamp,
+            778
+        );
+        assert_eq!(oracle.adaptive_fee_variables.volatility_reference, 123);
+        assert_eq!(
+            oracle.adaptive_fee_variables.tick_group_index_reference,
+            -7
+        );
+        assert_eq!(
+            oracle.adaptive_fee_variables.volatility_accumulator,
+            456
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn oracle_facade_decoder_fails_closed_on_owner_and_identity_mismatch() -> Result<(), String> {
+        let whirlpool = Pubkey::new_unique().to_string();
+        let data = sample_oracle_account(&whirlpool, 900)?;
+
+        match decode_oracle_facade(&data, &Pubkey::new_unique().to_string(), &whirlpool) {
+            Ok(_) => {
+                return Err("Oracle with wrong owner was accepted".to_owned());
+            }
+            Err(error) => {
+                assert!(error.contains("owner mismatch"));
+            }
+        }
+
+        match decode_oracle_facade(
+            &data,
+            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            &Pubkey::new_unique().to_string(),
+        ) {
+            Ok(_) => Err("Oracle with wrong Whirlpool identity was accepted".to_owned()),
+            Err(error) => {
+                assert!(error.contains("Whirlpool mismatch"));
+                Ok(())
+            }
+        }
     }
 
     #[test]
@@ -685,6 +956,51 @@ mod tests {
             Ok(_) => Err("adaptive pool quoted without Oracle".to_owned()),
             Err(error) => {
                 assert!(error.contains("requires Oracle"));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_pool_rejects_quote_before_trade_enable_timestamp() -> Result<(), String> {
+        let mut pool = sample_pool();
+        pool.fee_tier_index_seed = 32;
+
+        let whirlpool_data = sample_whirlpool_account(&pool);
+        let whirlpool = decode_whirlpool_facade(&whirlpool_data)?;
+
+        let oracle_whirlpool = Pubkey::new_unique().to_string();
+        let oracle_data = sample_oracle_account(&oracle_whirlpool, 2_000)?;
+        let oracle = decode_oracle_facade(
+            &oracle_data,
+            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            &oracle_whirlpool,
+        )?;
+
+        let arrays = [
+            zeroed_tick_array(0),
+            zeroed_tick_array(5_632),
+            zeroed_tick_array(11_264),
+            zeroed_tick_array(-5_632),
+            zeroed_tick_array(-11_264),
+        ];
+
+        let input_mint = pool.token_mint_a.clone();
+
+        match quote_exact_input(
+            &pool,
+            whirlpool,
+            &input_mint,
+            1_000,
+            arrays,
+            1_000,
+            Some(oracle),
+            None,
+            None,
+        ) {
+            Ok(_) => Err("adaptive pool quoted before trade enable timestamp".to_owned()),
+            Err(error) => {
+                assert!(error.contains("trading is not enabled yet"));
                 Ok(())
             }
         }
