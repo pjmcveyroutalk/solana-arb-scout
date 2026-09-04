@@ -52,16 +52,14 @@ const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0
 const TICK_SERIALIZED_LEN: usize = 113;
 const FIXED_TICK_ARRAY_LEN: usize = 8 + 4 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN) + 32;
 
-const DYNAMIC_TICK_ARRAY_DISCRIMINATOR: [u8; 8] =
-    [17, 216, 246, 142, 225, 199, 218, 56];
+const DYNAMIC_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [17, 216, 246, 142, 225, 199, 218, 56];
 const DYNAMIC_TICK_ARRAY_START_TICK_INDEX_OFFSET: usize = 8;
 const DYNAMIC_TICK_ARRAY_WHIRLPOOL_OFFSET: usize = 12;
 const DYNAMIC_TICK_ARRAY_BITMAP_OFFSET: usize = 44;
 const DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET: usize = 60;
 const DYNAMIC_TICK_UNINITIALIZED_LEN: usize = 1;
 const DYNAMIC_TICK_INITIALIZED_LEN: usize = 113;
-const DYNAMIC_TICK_DATA_LEN: usize =
-    DYNAMIC_TICK_INITIALIZED_LEN - DYNAMIC_TICK_UNINITIALIZED_LEN;
+const DYNAMIC_TICK_DATA_LEN: usize = DYNAMIC_TICK_INITIALIZED_LEN - DYNAMIC_TICK_UNINITIALIZED_LEN;
 const DYNAMIC_TICK_ARRAY_MIN_LEN: usize =
     DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET + (TICK_ARRAY_SIZE * DYNAMIC_TICK_UNINITIALIZED_LEN);
 const DYNAMIC_TICK_ARRAY_MAX_LEN: usize =
@@ -1221,14 +1219,13 @@ mod tests {
         let whirlpool = Pubkey::new_unique().to_string();
         let data = sample_dynamic_tick_array(&whirlpool, 0, &[1, 86])?;
 
-        assert_eq!(data.len(), DYNAMIC_TICK_ARRAY_MIN_LEN + (2 * DYNAMIC_TICK_DATA_LEN));
+        assert_eq!(
+            data.len(),
+            DYNAMIC_TICK_ARRAY_MIN_LEN + (2 * DYNAMIC_TICK_DATA_LEN)
+        );
 
-        let decoded = decode_tick_array_account(
-            &data,
-            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
-            &whirlpool,
-            0,
-        )?;
+        let decoded =
+            decode_tick_array_account(&data, orca::ORCA_WHIRLPOOL_PROGRAM_ID, &whirlpool, 0)?;
 
         assert_eq!(decoded.start_tick_index, 0);
         assert!(!decoded.ticks[0].initialized);
@@ -1321,12 +1318,7 @@ mod tests {
 
         data[0..8].copy_from_slice(&[9u8; 8]);
 
-        match decode_tick_array_account(
-            &data,
-            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
-            &whirlpool,
-            0,
-        ) {
+        match decode_tick_array_account(&data, orca::ORCA_WHIRLPOOL_PROGRAM_ID, &whirlpool, 0) {
             Ok(_) => Err("unknown tick-array discriminator was accepted".to_owned()),
             Err(error) => {
                 assert!(error.contains("unsupported Orca tick-array discriminator"));
