@@ -4,8 +4,7 @@ use scout_core::{
 };
 use serde_json::{json, Value};
 
-pub const ORCA_WHIRLPOOL_PROGRAM_ID: &str =
-    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+pub const ORCA_WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -136,9 +135,7 @@ pub fn program_subscribe_request() -> Value {
     })
 }
 
-pub fn hydration_account_pubkeys(
-    observation: &OrcaWhirlpoolAccountObservation,
-) -> [String; 3] {
+pub fn hydration_account_pubkeys(observation: &OrcaWhirlpoolAccountObservation) -> [String; 3] {
     [
         observation.pubkey.clone(),
         observation.pool_state.token_mint_a.clone(),
@@ -184,9 +181,7 @@ pub fn parse_program_notification(
         .ok_or_else(|| "Orca notification missing account-data encoding".to_owned())?;
 
     if encoding != "base64" {
-        return Err(format!(
-            "unexpected Orca account-data encoding: {encoding}"
-        ));
+        return Err(format!("unexpected Orca account-data encoding: {encoding}"));
     }
 
     let decoded_data = BASE64_STANDARD
@@ -341,24 +336,12 @@ fn decode_whirlpool_state(data: &[u8]) -> Result<OrcaWhirlpoolState, String> {
             .get(WHIRLPOOL_BUMP_OFFSET)
             .ok_or_else(|| "Orca Whirlpool missing bump".to_owned())?,
         tick_spacing: read_u16(data, TICK_SPACING_OFFSET, "tick_spacing")?,
-        fee_tier_index_seed: read_u16(
-            data,
-            FEE_TIER_INDEX_SEED_OFFSET,
-            "fee_tier_index_seed",
-        )?,
+        fee_tier_index_seed: read_u16(data, FEE_TIER_INDEX_SEED_OFFSET, "fee_tier_index_seed")?,
         fee_rate: read_u16(data, FEE_RATE_OFFSET, "fee_rate")?,
-        protocol_fee_rate: read_u16(
-            data,
-            PROTOCOL_FEE_RATE_OFFSET,
-            "protocol_fee_rate",
-        )?,
+        protocol_fee_rate: read_u16(data, PROTOCOL_FEE_RATE_OFFSET, "protocol_fee_rate")?,
         liquidity: read_u128(data, LIQUIDITY_OFFSET, "liquidity")?,
         sqrt_price: read_u128(data, SQRT_PRICE_OFFSET, "sqrt_price")?,
-        tick_current_index: read_i32(
-            data,
-            TICK_CURRENT_INDEX_OFFSET,
-            "tick_current_index",
-        )?,
+        tick_current_index: read_i32(data, TICK_CURRENT_INDEX_OFFSET, "tick_current_index")?,
         token_mint_a: read_pubkey(data, TOKEN_MINT_A_OFFSET, "token_mint_a")?,
         token_vault_a: read_pubkey(data, TOKEN_VAULT_A_OFFSET, "token_vault_a")?,
         token_mint_b: read_pubkey(data, TOKEN_MINT_B_OFFSET, "token_mint_b")?,
@@ -492,16 +475,10 @@ fn read_i32(data: &[u8], offset: usize, label: &str) -> Result<i32, String> {
 }
 
 fn read_u128(data: &[u8], offset: usize, label: &str) -> Result<u128, String> {
-    Ok(u128::from_le_bytes(read_array::<16>(
-        data, offset, label,
-    )?))
+    Ok(u128::from_le_bytes(read_array::<16>(data, offset, label)?))
 }
 
-fn read_array<const N: usize>(
-    data: &[u8],
-    offset: usize,
-    label: &str,
-) -> Result<[u8; N], String> {
+fn read_array<const N: usize>(data: &[u8], offset: usize, label: &str) -> Result<[u8; N], String> {
     let end = offset
         .checked_add(N)
         .ok_or_else(|| format!("Orca {label} offset overflow"))?;
@@ -522,23 +499,19 @@ mod tests {
         let mut data = vec![0u8; WHIRLPOOL_STATE_LEN];
 
         data[0..8].copy_from_slice(&WHIRLPOOL_DISCRIMINATOR);
-        data[WHIRLPOOLS_CONFIG_OFFSET..WHIRLPOOLS_CONFIG_OFFSET + 32]
-            .copy_from_slice(&[1u8; 32]);
+        data[WHIRLPOOLS_CONFIG_OFFSET..WHIRLPOOLS_CONFIG_OFFSET + 32].copy_from_slice(&[1u8; 32]);
         data[WHIRLPOOL_BUMP_OFFSET] = 255;
 
-        data[TICK_SPACING_OFFSET..TICK_SPACING_OFFSET + 2]
-            .copy_from_slice(&64u16.to_le_bytes());
+        data[TICK_SPACING_OFFSET..TICK_SPACING_OFFSET + 2].copy_from_slice(&64u16.to_le_bytes());
 
         let fee_tier_index = if adaptive_fee { 32u16 } else { 64u16 };
         data[FEE_TIER_INDEX_SEED_OFFSET..FEE_TIER_INDEX_SEED_OFFSET + 2]
             .copy_from_slice(&fee_tier_index.to_le_bytes());
 
-        data[FEE_RATE_OFFSET..FEE_RATE_OFFSET + 2]
-            .copy_from_slice(&3_000u16.to_le_bytes());
+        data[FEE_RATE_OFFSET..FEE_RATE_OFFSET + 2].copy_from_slice(&3_000u16.to_le_bytes());
         data[PROTOCOL_FEE_RATE_OFFSET..PROTOCOL_FEE_RATE_OFFSET + 2]
             .copy_from_slice(&300u16.to_le_bytes());
-        data[LIQUIDITY_OFFSET..LIQUIDITY_OFFSET + 16]
-            .copy_from_slice(&1_000_000u128.to_le_bytes());
+        data[LIQUIDITY_OFFSET..LIQUIDITY_OFFSET + 16].copy_from_slice(&1_000_000u128.to_le_bytes());
         data[SQRT_PRICE_OFFSET..SQRT_PRICE_OFFSET + 16]
             .copy_from_slice(&18_446_744_073_709_551_616u128.to_le_bytes());
         data[TICK_CURRENT_INDEX_OFFSET..TICK_CURRENT_INDEX_OFFSET + 4]
@@ -682,8 +655,7 @@ mod tests {
         assert_eq!(snapshot.token_a_decimals, 9);
         assert_eq!(snapshot.token_b_decimals, 6);
 
-        let normalized =
-            hydrate_normalized_observation(&observation, &snapshot, 1_000, 1_001)?;
+        let normalized = hydrate_normalized_observation(&observation, &snapshot, 1_000, 1_001)?;
 
         assert_eq!(normalized.venue, Venue::Orca);
         assert_eq!(normalized.trading_state, PoolTradingState::Tradable);
