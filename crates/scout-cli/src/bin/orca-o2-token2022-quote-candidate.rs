@@ -4,8 +4,7 @@
 mod token2022;
 
 use orca_whirlpools_core::{
-    swap_quote_by_input_token, ExactInSwapQuote, OracleFacade, TickArrayFacade, TickArrays,
-    TickFacade, WhirlpoolFacade, TICK_ARRAY_SIZE,
+    swap_quote_by_input_token, ExactInSwapQuote, OracleFacade, TickArrays, WhirlpoolFacade,
 };
 
 fn main() -> Result<(), String> {
@@ -74,6 +73,7 @@ pub fn quote_exact_input_with_mint_fees(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orca_whirlpools_core::{TickArrayFacade, TickFacade, TICK_ARRAY_SIZE};
 
     const TOKEN_2022_MINT_BASE_LEN: usize = 82;
     const TOKEN_2022_ACCOUNT_BASE_LEN: usize = 165;
