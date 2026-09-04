@@ -10,6 +10,7 @@ use orca_whirlpools_core::{
 fn main() -> Result<(), String> {
     println!("Orca O2 Token-2022 quote integration candidate");
     println!("Read-only. Current-epoch transfer fees feed authoritative Orca quote core.");
+    println!("Exact input/output fee rounding and max-fee parity are deterministic.");
     println!("TransferHook and unsupported extensions fail closed before quoting.");
     println!("Rust contract: 1.80");
     Ok(())
@@ -81,8 +82,10 @@ mod tests {
     const TOKEN_2022_MINT_TLV_START: usize = TOKEN_2022_ACCOUNT_TYPE_OFFSET + 1;
     const TOKEN_2022_MINT_ACCOUNT_TYPE: u8 = 1;
     const TOKEN_2022_TLV_HEADER_LEN: usize = 4;
+
     const EXTENSION_TRANSFER_FEE_CONFIG: u16 = 1;
     const EXTENSION_TRANSFER_HOOK: u16 = 14;
+
     const TRANSFER_FEE_CONFIG_LEN: usize = 108;
     const TRANSFER_FEE_OLDER_EPOCH_OFFSET: usize = 72;
     const TRANSFER_FEE_OLDER_MAX_FEE_OFFSET: usize = 80;
@@ -90,6 +93,10 @@ mod tests {
     const TRANSFER_FEE_NEWER_EPOCH_OFFSET: usize = 90;
     const TRANSFER_FEE_NEWER_MAX_FEE_OFFSET: usize = 98;
     const TRANSFER_FEE_NEWER_BPS_OFFSET: usize = 106;
+
+    const BPS_DENOMINATOR: u128 = 10_000;
+    const TEST_TIMESTAMP: u64 = 1_700_000_000;
+    const TEST_EPOCH: u64 = 100;
 
     fn fixture_whirlpool() -> WhirlpoolFacade {
         WhirlpoolFacade {
@@ -138,6 +145,7 @@ mod tests {
     fn mint_with_extension(extension_type: u16, value: &[u8]) -> Result<Vec<u8>, String> {
         let value_len = u16::try_from(value.len())
             .map_err(|_| "test Token-2022 extension value too large".to_owned())?;
+
         let total_len = TOKEN_2022_MINT_TLV_START
             .checked_add(TOKEN_2022_TLV_HEADER_LEN)
             .and_then(|len| len.checked_add(value.len()))
@@ -149,6 +157,7 @@ mod tests {
 
         data[TOKEN_2022_MINT_TLV_START..TOKEN_2022_MINT_TLV_START + 2]
             .copy_from_slice(&extension_type.to_le_bytes());
+
         data[TOKEN_2022_MINT_TLV_START + 2..TOKEN_2022_MINT_TLV_START + 4]
             .copy_from_slice(&value_len.to_le_bytes());
 
@@ -170,25 +179,267 @@ mod tests {
 
         data[TRANSFER_FEE_OLDER_EPOCH_OFFSET..TRANSFER_FEE_OLDER_EPOCH_OFFSET + 8]
             .copy_from_slice(&older_epoch.to_le_bytes());
+
         data[TRANSFER_FEE_OLDER_MAX_FEE_OFFSET..TRANSFER_FEE_OLDER_MAX_FEE_OFFSET + 8]
             .copy_from_slice(&older_max_fee.to_le_bytes());
+
         data[TRANSFER_FEE_OLDER_BPS_OFFSET..TRANSFER_FEE_OLDER_BPS_OFFSET + 2]
             .copy_from_slice(&older_bps.to_le_bytes());
 
         data[TRANSFER_FEE_NEWER_EPOCH_OFFSET..TRANSFER_FEE_NEWER_EPOCH_OFFSET + 8]
             .copy_from_slice(&newer_epoch.to_le_bytes());
+
         data[TRANSFER_FEE_NEWER_MAX_FEE_OFFSET..TRANSFER_FEE_NEWER_MAX_FEE_OFFSET + 8]
             .copy_from_slice(&newer_max_fee.to_le_bytes());
+
         data[TRANSFER_FEE_NEWER_BPS_OFFSET..TRANSFER_FEE_NEWER_BPS_OFFSET + 2]
             .copy_from_slice(&newer_bps.to_le_bytes());
 
         data
     }
 
+    fn transfer_fee_mint(fee_bps: u16, max_fee: u64) -> Result<Vec<u8>, String> {
+        let config = transfer_fee_config(1, max_fee, fee_bps, 200, max_fee, fee_bps);
+        mint_with_extension(EXTENSION_TRANSFER_FEE_CONFIG, &config)
+    }
+
     fn plain_token_2022_mint() -> Vec<u8> {
         let mut data = vec![0u8; TOKEN_2022_MINT_BASE_LEN];
         data[45] = 1;
         data
+    }
+
+    fn reference_apply_transfer_fee(
+        amount: u64,
+        fee_bps: u16,
+        max_fee: u64,
+    ) -> Result<u64, String> {
+        if fee_bps > 10_000 {
+            return Err("reference transfer fee exceeds 10000 bps".to_owned());
+        }
+
+        if fee_bps == 0 || amount == 0 {
+            return Ok(amount);
+        }
+
+        let numerator = u128::from(amount)
+            .checked_mul(u128::from(fee_bps))
+            .ok_or_else(|| "reference transfer-fee numerator overflow".to_owned())?;
+
+        let adjusted = numerator
+            .checked_add(BPS_DENOMINATOR - 1)
+            .ok_or_else(|| "reference transfer-fee rounding overflow".to_owned())?;
+
+        let raw_fee = adjusted / BPS_DENOMINATOR;
+
+        let raw_fee = u64::try_from(raw_fee)
+            .map_err(|_| "reference transfer fee does not fit u64".to_owned())?;
+
+        let fee = raw_fee.min(max_fee);
+
+        amount
+            .checked_sub(fee)
+            .ok_or_else(|| "reference transfer fee exceeds amount".to_owned())
+    }
+
+    fn baseline_quote(token_in: u64, specified_token_a: bool) -> Result<ExactInSwapQuote, String> {
+        quote_exact_input_with_mint_fees(
+            token_in,
+            specified_token_a,
+            0,
+            fixture_whirlpool(),
+            None,
+            fixture_tick_arrays(),
+            TEST_TIMESTAMP,
+            TEST_EPOCH,
+            MintFeeSource::SplToken,
+            MintFeeSource::SplToken,
+        )
+    }
+
+    fn assert_input_fee_parity(specified_token_a: bool) -> Result<(), String> {
+        let gross_input = 10_001;
+        let fee_bps = 100;
+        let max_fee = u64::MAX;
+        let net_input = reference_apply_transfer_fee(gross_input, fee_bps, max_fee)?;
+        let fee_mint = transfer_fee_mint(fee_bps, max_fee)?;
+
+        let expected = baseline_quote(net_input, specified_token_a)?;
+
+        let actual = if specified_token_a {
+            quote_exact_input_with_mint_fees(
+                gross_input,
+                true,
+                0,
+                fixture_whirlpool(),
+                None,
+                fixture_tick_arrays(),
+                TEST_TIMESTAMP,
+                TEST_EPOCH,
+                MintFeeSource::Token2022(&fee_mint),
+                MintFeeSource::SplToken,
+            )?
+        } else {
+            quote_exact_input_with_mint_fees(
+                gross_input,
+                false,
+                0,
+                fixture_whirlpool(),
+                None,
+                fixture_tick_arrays(),
+                TEST_TIMESTAMP,
+                TEST_EPOCH,
+                MintFeeSource::SplToken,
+                MintFeeSource::Token2022(&fee_mint),
+            )?
+        };
+
+        assert_eq!(net_input, 9_900);
+        assert_eq!(actual.token_est_out, expected.token_est_out);
+        assert_eq!(actual.trade_fee, expected.trade_fee);
+        Ok(())
+    }
+
+    fn assert_output_fee_parity(specified_token_a: bool) -> Result<(), String> {
+        let gross_input = 10_000;
+        let fee_bps = 100;
+        let max_fee = u64::MAX;
+        let fee_mint = transfer_fee_mint(fee_bps, max_fee)?;
+
+        let baseline = baseline_quote(gross_input, specified_token_a)?;
+
+        let expected_output =
+            reference_apply_transfer_fee(baseline.token_est_out, fee_bps, max_fee)?;
+
+        let actual = if specified_token_a {
+            quote_exact_input_with_mint_fees(
+                gross_input,
+                true,
+                0,
+                fixture_whirlpool(),
+                None,
+                fixture_tick_arrays(),
+                TEST_TIMESTAMP,
+                TEST_EPOCH,
+                MintFeeSource::SplToken,
+                MintFeeSource::Token2022(&fee_mint),
+            )?
+        } else {
+            quote_exact_input_with_mint_fees(
+                gross_input,
+                false,
+                0,
+                fixture_whirlpool(),
+                None,
+                fixture_tick_arrays(),
+                TEST_TIMESTAMP,
+                TEST_EPOCH,
+                MintFeeSource::Token2022(&fee_mint),
+                MintFeeSource::SplToken,
+            )?
+        };
+
+        assert_eq!(actual.token_est_out, expected_output);
+        assert_eq!(actual.trade_fee, baseline.trade_fee);
+        Ok(())
+    }
+
+    fn assert_both_fee_parity(specified_token_a: bool) -> Result<(), String> {
+        let gross_input = 10_001;
+        let input_fee_bps = 100;
+        let output_fee_bps = 250;
+        let input_max_fee = u64::MAX;
+        let output_max_fee = u64::MAX;
+
+        let net_input =
+            reference_apply_transfer_fee(gross_input, input_fee_bps, input_max_fee)?;
+
+        let input_fee_mint = transfer_fee_mint(input_fee_bps, input_max_fee)?;
+        let output_fee_mint = transfer_fee_mint(output_fee_bps, output_max_fee)?;
+
+        let baseline = baseline_quote(net_input, specified_token_a)?;
+
+        let expected_output = reference_apply_transfer_fee(
+            baseline.token_est_out,
+            output_fee_bps,
+            output_max_fee,
+        )?;
+
+        let actual = if specified_token_a {
+            quote_exact_input_with_mint_fees(
+                gross_input,
+                true,
+                0,
+                fixture_whirlpool(),
+                None,
+                fixture_tick_arrays(),
+                TEST_TIMESTAMP,
+                TEST_EPOCH,
+                MintFeeSource::Token2022(&input_fee_mint),
+                MintFeeSource::Token2022(&output_fee_mint),
+            )?
+        } else {
+            quote_exact_input_with_mint_fees(
+                gross_input,
+                false,
+                0,
+                fixture_whirlpool(),
+                None,
+                fixture_tick_arrays(),
+                TEST_TIMESTAMP,
+                TEST_EPOCH,
+                MintFeeSource::Token2022(&output_fee_mint),
+                MintFeeSource::Token2022(&input_fee_mint),
+            )?
+        };
+
+        assert_eq!(actual.token_est_out, expected_output);
+        assert_eq!(actual.trade_fee, baseline.trade_fee);
+        Ok(())
+    }
+
+    fn assert_max_fee_cap_parity(specified_token_a: bool) -> Result<(), String> {
+        let gross_input = 10_000;
+        let fee_bps = 5_000;
+        let max_fee = 7;
+
+        let net_input = reference_apply_transfer_fee(gross_input, fee_bps, max_fee)?;
+        assert_eq!(net_input, 9_993);
+
+        let fee_mint = transfer_fee_mint(fee_bps, max_fee)?;
+        let expected = baseline_quote(net_input, specified_token_a)?;
+
+        let actual = if specified_token_a {
+            quote_exact_input_with_mint_fees(
+                gross_input,
+                true,
+                0,
+                fixture_whirlpool(),
+                None,
+                fixture_tick_arrays(),
+                TEST_TIMESTAMP,
+                TEST_EPOCH,
+                MintFeeSource::Token2022(&fee_mint),
+                MintFeeSource::SplToken,
+            )?
+        } else {
+            quote_exact_input_with_mint_fees(
+                gross_input,
+                false,
+                0,
+                fixture_whirlpool(),
+                None,
+                fixture_tick_arrays(),
+                TEST_TIMESTAMP,
+                TEST_EPOCH,
+                MintFeeSource::SplToken,
+                MintFeeSource::Token2022(&fee_mint),
+            )?
+        };
+
+        assert_eq!(actual.token_est_out, expected.token_est_out);
+        assert_eq!(actual.trade_fee, expected.trade_fee);
+        Ok(())
     }
 
     #[test]
@@ -200,8 +451,8 @@ mod tests {
             fixture_whirlpool(),
             None,
             fixture_tick_arrays(),
-            1_700_000_000,
-            100,
+            TEST_TIMESTAMP,
+            TEST_EPOCH,
             MintFeeSource::SplToken,
             MintFeeSource::SplToken,
         )?;
@@ -225,8 +476,8 @@ mod tests {
             fixture_whirlpool(),
             None,
             fixture_tick_arrays(),
-            1_700_000_000,
-            100,
+            TEST_TIMESTAMP,
+            TEST_EPOCH,
             MintFeeSource::Token2022(&token_a),
             MintFeeSource::Token2022(&token_b),
         )?;
@@ -239,81 +490,49 @@ mod tests {
     }
 
     #[test]
-    fn input_transfer_fee_reduces_effective_swap_input() -> Result<(), String> {
-        let fee_config = transfer_fee_config(1, u64::MAX, 100, 200, u64::MAX, 100);
-        let token_a = mint_with_extension(EXTENSION_TRANSFER_FEE_CONFIG, &fee_config)?;
-
-        let baseline = quote_exact_input_with_mint_fees(
-            10_000,
-            true,
-            0,
-            fixture_whirlpool(),
-            None,
-            fixture_tick_arrays(),
-            1_700_000_000,
-            100,
-            MintFeeSource::SplToken,
-            MintFeeSource::SplToken,
-        )?;
-
-        let with_fee = quote_exact_input_with_mint_fees(
-            10_000,
-            true,
-            0,
-            fixture_whirlpool(),
-            None,
-            fixture_tick_arrays(),
-            1_700_000_000,
-            100,
-            MintFeeSource::Token2022(&token_a),
-            MintFeeSource::SplToken,
-        )?;
-
-        assert!(with_fee.token_est_out < baseline.token_est_out);
-        assert!(with_fee.token_in <= 10_000);
-        Ok(())
+    fn a_to_b_input_fee_matches_independent_rounding_reference() -> Result<(), String> {
+        assert_input_fee_parity(true)
     }
 
     #[test]
-    fn output_transfer_fee_reduces_received_output() -> Result<(), String> {
-        let fee_config = transfer_fee_config(1, u64::MAX, 100, 200, u64::MAX, 100);
-        let token_b = mint_with_extension(EXTENSION_TRANSFER_FEE_CONFIG, &fee_config)?;
+    fn b_to_a_input_fee_matches_independent_rounding_reference() -> Result<(), String> {
+        assert_input_fee_parity(false)
+    }
 
-        let baseline = quote_exact_input_with_mint_fees(
-            10_000,
-            true,
-            0,
-            fixture_whirlpool(),
-            None,
-            fixture_tick_arrays(),
-            1_700_000_000,
-            100,
-            MintFeeSource::SplToken,
-            MintFeeSource::SplToken,
-        )?;
+    #[test]
+    fn a_to_b_output_fee_matches_independent_rounding_reference() -> Result<(), String> {
+        assert_output_fee_parity(true)
+    }
 
-        let with_fee = quote_exact_input_with_mint_fees(
-            10_000,
-            true,
-            0,
-            fixture_whirlpool(),
-            None,
-            fixture_tick_arrays(),
-            1_700_000_000,
-            100,
-            MintFeeSource::SplToken,
-            MintFeeSource::Token2022(&token_b),
-        )?;
+    #[test]
+    fn b_to_a_output_fee_matches_independent_rounding_reference() -> Result<(), String> {
+        assert_output_fee_parity(false)
+    }
 
-        assert!(with_fee.token_est_out < baseline.token_est_out);
-        assert_eq!(with_fee.trade_fee, baseline.trade_fee);
-        Ok(())
+    #[test]
+    fn a_to_b_both_fees_match_independent_reference() -> Result<(), String> {
+        assert_both_fee_parity(true)
+    }
+
+    #[test]
+    fn b_to_a_both_fees_match_independent_reference() -> Result<(), String> {
+        assert_both_fee_parity(false)
+    }
+
+    #[test]
+    fn a_to_b_max_fee_cap_matches_independent_reference() -> Result<(), String> {
+        assert_max_fee_cap_parity(true)
+    }
+
+    #[test]
+    fn b_to_a_max_fee_cap_matches_independent_reference() -> Result<(), String> {
+        assert_max_fee_cap_parity(false)
     }
 
     #[test]
     fn current_epoch_changes_quote_when_newer_fee_activates() -> Result<(), String> {
-        let fee_config = transfer_fee_config(1, u64::MAX, 10, 100, u64::MAX, 500);
-        let token_a = mint_with_extension(EXTENSION_TRANSFER_FEE_CONFIG, &fee_config)?;
+        let config = transfer_fee_config(1, u64::MAX, 10, 100, u64::MAX, 500);
+        let token_a = mint_with_extension(EXTENSION_TRANSFER_FEE_CONFIG, &config)?;
 
         let before = quote_exact_input_with_mint_fees(
             10_000,
@@ -322,7 +541,7 @@ mod tests {
             fixture_whirlpool(),
             None,
             fixture_tick_arrays(),
-            1_700_000_000,
+            TEST_TIMESTAMP,
             99,
             MintFeeSource::Token2022(&token_a),
             MintFeeSource::SplToken,
@@ -335,7 +554,7 @@ mod tests {
             fixture_whirlpool(),
             None,
             fixture_tick_arrays(),
-            1_700_000_000,
+            TEST_TIMESTAMP,
             100,
             MintFeeSource::Token2022(&token_a),
             MintFeeSource::SplToken,
@@ -356,8 +575,8 @@ mod tests {
             fixture_whirlpool(),
             None,
             fixture_tick_arrays(),
-            1_700_000_000,
-            100,
+            TEST_TIMESTAMP,
+            TEST_EPOCH,
             MintFeeSource::Token2022(&token_a),
             MintFeeSource::SplToken,
         ) {
@@ -380,8 +599,8 @@ mod tests {
             fixture_whirlpool(),
             None,
             fixture_tick_arrays(),
-            1_700_000_000,
-            100,
+            TEST_TIMESTAMP,
+            TEST_EPOCH,
             MintFeeSource::Token2022(&token_a),
             MintFeeSource::SplToken,
         ) {
