@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use scout_core::{
-    NormalizedPoolState, NormalizedToken, PoolTradingState, QuoteReserveState, Venue,
+    ensure_supported_token_2022_mint_extensions, NormalizedPoolState, NormalizedToken,
+    PoolTradingState, QuoteReserveState, Venue,
 };
 use serde_json::{json, Value};
 use solana_pubkey::Pubkey;
@@ -265,14 +266,8 @@ pub fn quote_exact_input(
 }
 
 fn ensure_quote_token_program(program: &str, label: &str) -> Result<(), String> {
-    if program == SPL_TOKEN_PROGRAM_ID {
+    if program == SPL_TOKEN_PROGRAM_ID || program == TOKEN_2022_PROGRAM_ID {
         return Ok(());
-    }
-
-    if program == TOKEN_2022_PROGRAM_ID {
-        return Err(format!(
-            "{label} uses Token-2022; transfer-fee extension state is not hydrated, so quoting fails closed"
-        ));
     }
 
     Err(format!("{label} uses unsupported token program {program}"))
@@ -1193,6 +1188,10 @@ fn decode_supported_mint_account(
 
     let data = decode_rpc_account_data(account, owner, label)?;
 
+    if owner == TOKEN_2022_PROGRAM_ID {
+        ensure_supported_token_2022_mint_extensions(&data, label)?;
+    }
+
     Ok((owner.to_owned(), data))
 }
 
@@ -1341,6 +1340,12 @@ fn optional_bool_label(value: Option<bool>) -> &'static str {
 mod tests {
     use super::*;
 
+    const TEST_TOKEN_2022_ACCOUNT_TYPE_OFFSET: usize = 165;
+    const TEST_TOKEN_2022_TLV_START: usize = 166;
+    const TEST_TOKEN_2022_TRANSFER_FEE_CONFIG: u16 = 1;
+    const TEST_TOKEN_2022_METADATA_POINTER: u16 = 18;
+    const TEST_TOKEN_2022_TOKEN_METADATA: u16 = 19;
+
     fn sample_pool_data() -> Vec<u8> {
         let mut data = vec![0u8; POOL_VIRTUAL_QUOTE_END];
 
@@ -1415,9 +1420,33 @@ mod tests {
 
     fn initialized_mint(decimals: u8) -> Vec<u8> {
         let mut data = vec![0u8; MINT_ACCOUNT_BASE_LEN];
-        data[MINT_SUPPLY_OFFSET..MINT_SUPPLY_OFFSET + 8].copy_from_slice(&123_456u64.to_le_bytes());
+        data[MINT_SUPPLY_OFFSET..MINT_SUPPLY_OFFSET + 8]
+            .copy_from_slice(&123_456u64.to_le_bytes());
         data[MINT_DECIMALS_OFFSET] = decimals;
         data[MINT_INITIALIZED_OFFSET] = 1;
+        data
+    }
+
+    fn token_2022_mint_base(decimals: u8) -> Vec<u8> {
+        let mut data = vec![0u8; TEST_TOKEN_2022_TLV_START];
+        data[MINT_SUPPLY_OFFSET..MINT_SUPPLY_OFFSET + 8]
+            .copy_from_slice(&123_456u64.to_le_bytes());
+        data[MINT_DECIMALS_OFFSET] = decimals;
+        data[MINT_INITIALIZED_OFFSET] = 1;
+        data[TEST_TOKEN_2022_ACCOUNT_TYPE_OFFSET] = 1;
+        data
+    }
+
+    fn append_token_2022_extension(data: &mut Vec<u8>, extension_type: u16, length: u16) {
+        data.extend_from_slice(&extension_type.to_le_bytes());
+        data.extend_from_slice(&length.to_le_bytes());
+        data.resize(data.len() + usize::from(length), 0);
+    }
+
+    fn metadata_only_token_2022_mint(decimals: u8) -> Vec<u8> {
+        let mut data = token_2022_mint_base(decimals);
+        append_token_2022_extension(&mut data, TEST_TOKEN_2022_METADATA_POINTER, 64);
+        append_token_2022_extension(&mut data, TEST_TOKEN_2022_TOKEN_METADATA, 8);
         data
     }
 
@@ -1524,6 +1553,59 @@ mod tests {
         assert_eq!(accounts[6], PUMPSWAP_FEE_CONFIG);
 
         Ok(())
+    }
+
+    #[test]
+    fn token_2022_metadata_only_mint_is_supported() -> Result<(), String> {
+        let account = rpc_account(
+            TOKEN_2022_PROGRAM_ID,
+            &metadata_only_token_2022_mint(6),
+        );
+
+        let (owner, data) = decode_supported_mint_account(&account, "test mint")?;
+
+        assert_eq!(owner, TOKEN_2022_PROGRAM_ID);
+        assert_eq!(parse_mint_decimals(&data, "test mint")?, 6);
+
+        Ok(())
+    }
+
+    #[test]
+    fn token_2022_transfer_fee_config_fails_closed() {
+        let mut data = token_2022_mint_base(6);
+        append_token_2022_extension(&mut data, TEST_TOKEN_2022_TRANSFER_FEE_CONFIG, 8);
+        let account = rpc_account(TOKEN_2022_PROGRAM_ID, &data);
+
+        let result = decode_supported_mint_account(&account, "test mint");
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("TransferFeeConfig")
+        ));
+    }
+
+    #[test]
+    fn token_2022_unsupported_extension_fails_closed() {
+        let mut data = token_2022_mint_base(6);
+        append_token_2022_extension(&mut data, 14, 4);
+        let account = rpc_account(TOKEN_2022_PROGRAM_ID, &data);
+
+        let result = decode_supported_mint_account(&account, "test mint");
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("unsupported Token-2022 extension")
+        ));
+    }
+
+    #[test]
+    fn token_2022_malformed_tlv_fails_closed() {
+        let mut data = token_2022_mint_base(6);
+        data.extend_from_slice(&TEST_TOKEN_2022_METADATA_POINTER.to_le_bytes());
+        data.push(64);
+        let account = rpc_account(TOKEN_2022_PROGRAM_ID, &data);
+
+        assert!(decode_supported_mint_account(&account, "test mint").is_err());
     }
 
     #[test]
@@ -1945,13 +2027,14 @@ mod tests {
     }
 
     #[test]
-    fn quote_fails_closed_for_token_2022() -> Result<(), String> {
+    fn quote_accepts_hydrated_token_2022_program() -> Result<(), String> {
         let mut snapshot = quote_snapshot(true, true)?;
         snapshot.base_token_program = TOKEN_2022_PROGRAM_ID.to_owned();
 
-        let result = quote_exact_input(&snapshot, &snapshot.pool_state.base_mint, 100_000);
+        let quote = quote_exact_input(&snapshot, &snapshot.pool_state.base_mint, 100_000)?;
 
-        assert!(matches!(result, Err(error) if error.contains("Token-2022")));
+        assert!(quote.amount_out_raw > 0);
+
         Ok(())
     }
 
