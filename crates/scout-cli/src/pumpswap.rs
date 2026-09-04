@@ -1420,8 +1420,7 @@ mod tests {
 
     fn initialized_mint(decimals: u8) -> Vec<u8> {
         let mut data = vec![0u8; MINT_ACCOUNT_BASE_LEN];
-        data[MINT_SUPPLY_OFFSET..MINT_SUPPLY_OFFSET + 8]
-            .copy_from_slice(&123_456u64.to_le_bytes());
+        data[MINT_SUPPLY_OFFSET..MINT_SUPPLY_OFFSET + 8].copy_from_slice(&123_456u64.to_le_bytes());
         data[MINT_DECIMALS_OFFSET] = decimals;
         data[MINT_INITIALIZED_OFFSET] = 1;
         data
@@ -1429,8 +1428,7 @@ mod tests {
 
     fn token_2022_mint_base(decimals: u8) -> Vec<u8> {
         let mut data = vec![0u8; TEST_TOKEN_2022_TLV_START];
-        data[MINT_SUPPLY_OFFSET..MINT_SUPPLY_OFFSET + 8]
-            .copy_from_slice(&123_456u64.to_le_bytes());
+        data[MINT_SUPPLY_OFFSET..MINT_SUPPLY_OFFSET + 8].copy_from_slice(&123_456u64.to_le_bytes());
         data[MINT_DECIMALS_OFFSET] = decimals;
         data[MINT_INITIALIZED_OFFSET] = 1;
         data[TEST_TOKEN_2022_ACCOUNT_TYPE_OFFSET] = 1;
@@ -1557,10 +1555,7 @@ mod tests {
 
     #[test]
     fn token_2022_metadata_only_mint_is_supported() -> Result<(), String> {
-        let account = rpc_account(
-            TOKEN_2022_PROGRAM_ID,
-            &metadata_only_token_2022_mint(6),
-        );
+        let account = rpc_account(TOKEN_2022_PROGRAM_ID, &metadata_only_token_2022_mint(6));
 
         let (owner, data) = decode_supported_mint_account(&account, "test mint")?;
 
