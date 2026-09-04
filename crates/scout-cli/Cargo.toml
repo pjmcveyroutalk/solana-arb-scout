@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 base64 = "=0.22.1"
 bs58 = "=0.5.1"
+ethnum = "=1.5.2"
 futures-util = "0.3"
 hyper-rustls = { version = "=0.27.7", default-features = false, features = ["http1", "tls12", "webpki-tokio"] }
 idna_adapter = "=1.1.0"
