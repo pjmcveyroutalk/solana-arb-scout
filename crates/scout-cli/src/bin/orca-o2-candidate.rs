@@ -531,8 +531,7 @@ mod tests {
             let emissions = 1_000u128 + reward_index as u128;
             let growth = 2_000u128 + reward_index as u128;
 
-            data[emissions_offset..emissions_offset + 16]
-                .copy_from_slice(&emissions.to_le_bytes());
+            data[emissions_offset..emissions_offset + 16].copy_from_slice(&emissions.to_le_bytes());
             data[growth_offset..growth_offset + 16].copy_from_slice(&growth.to_le_bytes());
         }
 
