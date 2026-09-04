@@ -3,7 +3,7 @@ use crate::raydium::{self, RaydiumHydrationSnapshot};
 use crate::route::{RouteLeg, TwoLegRouteCandidate};
 use scout_core::{
     AdapterCapabilities, AuxiliaryStateKind, CapabilityState, ContentionFootprintState,
-    LiquidityModel, Venue,
+    LiquidityModel, NormalizedPoolState, PoolTradingState, QuoteReserveState, Venue,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +117,81 @@ pub enum VenueQuoteContext<'a> {
         pool_id: String,
         snapshot: &'a PumpSwapHydrationSnapshot,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteReadiness {
+    venue: Venue,
+    pool_id: String,
+    token_a_mint: String,
+    token_b_mint: String,
+    source_slot: u64,
+    capabilities: AdapterCapabilities,
+}
+
+impl QuoteReadiness {
+    pub(crate) fn validate_for_pool(&self, pool: &NormalizedPoolState) -> Result<(), String> {
+        if pool.trading_state != PoolTradingState::Tradable {
+            return Err(format!(
+                "pool {} is not tradable: state={}",
+                pool.pool_id,
+                pool.trading_state.label()
+            ));
+        }
+
+        if self.venue != pool.venue {
+            return Err(format!(
+                "quote readiness venue mismatch: readiness={} pool={}",
+                self.venue.label(),
+                pool.venue.label()
+            ));
+        }
+
+        if self.pool_id != pool.pool_id {
+            return Err(format!(
+                "quote readiness pool mismatch: readiness={} pool={}",
+                self.pool_id, pool.pool_id
+            ));
+        }
+
+        if self.token_a_mint != pool.token_a.mint || self.token_b_mint != pool.token_b.mint {
+            return Err(format!(
+                "quote readiness token pair mismatch for pool {}",
+                pool.pool_id
+            ));
+        }
+
+        if self.source_slot < pool.source_slot {
+            return Err(format!(
+                "stale quote readiness: pool={} pool_slot={} readiness_slot={}",
+                pool.pool_id, pool.source_slot, self.source_slot
+            ));
+        }
+
+        if self.capabilities.exact_input_quote != CapabilityState::Supported {
+            return Err(format!(
+                "quote readiness for pool {} does not prove exact-input support",
+                pool.pool_id
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_test(
+        pool: &NormalizedPoolState,
+        capabilities: AdapterCapabilities,
+    ) -> Self {
+        Self {
+            venue: pool.venue,
+            pool_id: pool.pool_id.clone(),
+            token_a_mint: pool.token_a.mint.clone(),
+            token_b_mint: pool.token_b.mint.clone(),
+            source_slot: pool.source_slot,
+            capabilities,
+        }
+    }
 }
 
 trait ExactInputQuoteAdapter {
@@ -337,6 +412,99 @@ fn ensure_exact_input_quote_supported(adapter: &dyn ExactInputQuoteAdapter) -> R
     }
 }
 
+pub fn quote_readiness_for_pool(
+    pool: &NormalizedPoolState,
+    context: &VenueQuoteContext<'_>,
+) -> Result<QuoteReadiness, String> {
+    with_quote_adapter(context, |adapter| {
+        if pool.trading_state != PoolTradingState::Tradable {
+            return Err(format!(
+                "pool {} is not tradable: state={}",
+                pool.pool_id,
+                pool.trading_state.label()
+            ));
+        }
+
+        if pool.venue != adapter.venue() {
+            return Err(format!(
+                "pool/context venue mismatch: pool={} context={}",
+                pool.venue.label(),
+                adapter.venue().label()
+            ));
+        }
+
+        if pool.pool_id != adapter.pool_id() {
+            return Err(format!(
+                "pool/context pool mismatch: pool={} context={}",
+                pool.pool_id,
+                adapter.pool_id()
+            ));
+        }
+
+        if adapter.source_slot() < pool.source_slot {
+            return Err(format!(
+                "stale quote context: pool_slot={} quote_slot={}",
+                pool.source_slot,
+                adapter.source_slot()
+            ));
+        }
+
+        if !adapter.contains_pair(&pool.token_a.mint, &pool.token_b.mint) {
+            return Err(format!(
+                "quote context does not contain normalized pool pair {}/{}",
+                pool.token_a.mint, pool.token_b.mint
+            ));
+        }
+
+        ensure_exact_input_quote_supported(adapter)?;
+
+        let capabilities = adapter.capabilities();
+
+        match capabilities.liquidity_model {
+            LiquidityModel::Cpmm => match &pool.quote_reserves {
+                QuoteReserveState::Available {
+                    token_a_raw,
+                    token_b_raw,
+                    source_slot,
+                } if *token_a_raw > 0
+                    && *token_b_raw > 0
+                    && *source_slot >= pool.source_slot => {}
+                QuoteReserveState::Available { .. } => {
+                    return Err(format!(
+                        "pool {} does not have positive fresh CPMM quote reserves",
+                        pool.pool_id
+                    ));
+                }
+                QuoteReserveState::Unavailable => {
+                    return Err(format!(
+                        "pool {} does not have CPMM quote reserves",
+                        pool.pool_id
+                    ));
+                }
+            },
+            LiquidityModel::Clmm | LiquidityModel::Dlmm => {
+                return Err(format!(
+                    "{} {} quote readiness is not enabled in D0 production",
+                    adapter.venue().label(),
+                    capabilities.liquidity_model.label()
+                ));
+            }
+        }
+
+        let readiness = QuoteReadiness {
+            venue: pool.venue,
+            pool_id: pool.pool_id.clone(),
+            token_a_mint: pool.token_a.mint.clone(),
+            token_b_mint: pool.token_b.mint.clone(),
+            source_slot: adapter.source_slot(),
+            capabilities,
+        };
+
+        readiness.validate_for_pool(pool)?;
+        Ok(readiness)
+    })
+}
+
 #[cfg(test)]
 pub fn one_whole_anchor_input_raw(
     route: &TwoLegRouteCandidate,
@@ -453,7 +621,7 @@ mod tests {
     use crate::pumpswap::{PumpSwapFeeConfig, PumpSwapFeeTier, PumpSwapFees, PumpSwapPoolState};
     use crate::raydium::{RaydiumAmmConfig, RaydiumCpmmPoolState};
     use crate::route::{generate_two_leg_routes, WRAPPED_SOL_MINT};
-    use scout_core::{NormalizedPoolState, NormalizedToken, PoolTradingState, QuoteReserveState};
+    use scout_core::NormalizedToken;
 
     const TEST_MINT: &str = "ApZuxdpzMrbEYTGEzeY9afh5pj9d6qPRJCTgQYiipbKg";
     const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -726,6 +894,83 @@ mod tests {
         assert_eq!(
             pump_capabilities,
             PumpSwapQuoteAdapter::adapter_capabilities()
+        );
+    }
+
+    #[test]
+    fn cpmm_quote_readiness_binds_live_context_and_positive_reserves() -> Result<(), String> {
+        let pool = normalized_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        let ray = raydium_snapshot();
+        let context = VenueQuoteContext::Raydium {
+            pool_id: "raydium-pool".to_owned(),
+            snapshot: &ray,
+        };
+
+        let readiness = quote_readiness_for_pool(&pool, &context)?;
+
+        assert_eq!(readiness.venue, Venue::RaydiumCpmm);
+        assert_eq!(readiness.pool_id, "raydium-pool");
+        assert_eq!(readiness.token_a_mint, WRAPPED_SOL_MINT);
+        assert_eq!(readiness.token_b_mint, TEST_MINT);
+        assert_eq!(readiness.source_slot, 101);
+        assert_eq!(readiness.capabilities.liquidity_model, LiquidityModel::Cpmm);
+
+        let mut zero_reserve_pool = pool;
+        zero_reserve_pool.quote_reserves = QuoteReserveState::Available {
+            token_a_raw: 0,
+            token_b_raw: 20_000_000_000,
+            source_slot: 100,
+        };
+
+        let result = quote_readiness_for_pool(&zero_reserve_pool, &context);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("positive fresh CPMM quote reserves")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_clmm_readiness_does_not_require_cpmm_reserves() {
+        let mut pool = normalized_pool(
+            Venue::Orca,
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        pool.quote_reserves = QuoteReserveState::Unavailable;
+
+        let readiness = QuoteReadiness::synthetic_for_test(
+            &pool,
+            AdapterCapabilities {
+                liquidity_model: LiquidityModel::Clmm,
+                exact_input_quote: CapabilityState::Supported,
+                spl_token: CapabilityState::Supported,
+                token_2022: CapabilityState::RequiresHydration,
+                transfer_fee: CapabilityState::RequiresHydration,
+                auxiliary_state: AuxiliaryStateKind::Ticks,
+                contention_footprint: ContentionFootprintState::Incomplete,
+            },
+        );
+
+        assert!(readiness.validate_for_pool(&pool).is_ok());
+        assert_eq!(readiness.capabilities.liquidity_model, LiquidityModel::Clmm);
+        assert_eq!(
+            readiness.capabilities.auxiliary_state,
+            AuxiliaryStateKind::Ticks
         );
     }
 
