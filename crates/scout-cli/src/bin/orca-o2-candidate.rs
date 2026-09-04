@@ -808,8 +808,7 @@ mod tests {
         let whirlpool = Pubkey::new_unique().to_string();
         let data = sample_oracle_account(&whirlpool, 900)?;
 
-        let oracle =
-            decode_oracle_facade(&data, orca::ORCA_WHIRLPOOL_PROGRAM_ID, &whirlpool)?;
+        let oracle = decode_oracle_facade(&data, orca::ORCA_WHIRLPOOL_PROGRAM_ID, &whirlpool)?;
 
         assert_eq!(oracle.trade_enable_timestamp, 900);
         assert_eq!(oracle.adaptive_fee_constants.filter_period, 30);
@@ -824,29 +823,17 @@ mod tests {
             88_000
         );
         assert_eq!(oracle.adaptive_fee_constants.tick_group_size, 64);
-        assert_eq!(
-            oracle.adaptive_fee_constants.major_swap_threshold_ticks,
-            32
-        );
+        assert_eq!(oracle.adaptive_fee_constants.major_swap_threshold_ticks, 32);
         assert_eq!(
             oracle
                 .adaptive_fee_variables
                 .last_reference_update_timestamp,
             777
         );
-        assert_eq!(
-            oracle.adaptive_fee_variables.last_major_swap_timestamp,
-            778
-        );
+        assert_eq!(oracle.adaptive_fee_variables.last_major_swap_timestamp, 778);
         assert_eq!(oracle.adaptive_fee_variables.volatility_reference, 123);
-        assert_eq!(
-            oracle.adaptive_fee_variables.tick_group_index_reference,
-            -7
-        );
-        assert_eq!(
-            oracle.adaptive_fee_variables.volatility_accumulator,
-            456
-        );
+        assert_eq!(oracle.adaptive_fee_variables.tick_group_index_reference, -7);
+        assert_eq!(oracle.adaptive_fee_variables.volatility_accumulator, 456);
 
         Ok(())
     }
