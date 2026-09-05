@@ -2,8 +2,13 @@
 
 #[path = "../orca.rs"]
 mod orca;
+#[path = "../orca_o2_quote_inputs.rs"]
+mod orca_o2_quote_inputs;
 
 use orca::OrcaWhirlpoolState;
+use orca_o2_quote_inputs::{
+    decode_clock_sysvar, transfer_fee_for_mint, OrcaQuoteClock,
+};
 use orca_whirlpools_core::{
     get_tick_array_start_tick_index, swap_quote_by_input_token, AdaptiveFeeConstantsFacade,
     AdaptiveFeeVariablesFacade, ExactInSwapQuote, OracleFacade, TickArrayFacade, TickArrays,
@@ -64,6 +69,24 @@ const DYNAMIC_TICK_ARRAY_MIN_LEN: usize =
     DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET + (TICK_ARRAY_SIZE * DYNAMIC_TICK_UNINITIALIZED_LEN);
 const DYNAMIC_TICK_ARRAY_MAX_LEN: usize =
     DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET + (TICK_ARRAY_SIZE * DYNAMIC_TICK_INITIALIZED_LEN);
+
+pub struct OrcaQuoteAccount<'a> {
+    pub pubkey: &'a str,
+    pub owner: &'a str,
+    pub data: &'a [u8],
+}
+
+pub struct OrcaQuoteSnapshotInputs<'a> {
+    pub clock: OrcaQuoteAccount<'a>,
+    pub mint_a: OrcaQuoteAccount<'a>,
+    pub mint_b: OrcaQuoteAccount<'a>,
+}
+
+pub struct OrcaResolvedQuoteInputs {
+    pub clock: OrcaQuoteClock,
+    pub transfer_fee_a: Option<TransferFee>,
+    pub transfer_fee_b: Option<TransferFee>,
+}
 
 fn main() -> Result<(), String> {
     println!("Orca O2 quote-readiness candidate");
@@ -723,6 +746,75 @@ pub fn zeroed_tick_array(start_tick_index: i32) -> TickArrayFacade {
     }
 }
 
+pub fn resolve_quote_snapshot_inputs(
+    pool: &OrcaWhirlpoolState,
+    snapshot: OrcaQuoteSnapshotInputs<'_>,
+) -> Result<OrcaResolvedQuoteInputs, String> {
+    if snapshot.mint_a.pubkey != pool.token_mint_a {
+        return Err(format!(
+            "Orca quote mint A identity mismatch: expected {}, got {}",
+            pool.token_mint_a, snapshot.mint_a.pubkey
+        ));
+    }
+
+    if snapshot.mint_b.pubkey != pool.token_mint_b {
+        return Err(format!(
+            "Orca quote mint B identity mismatch: expected {}, got {}",
+            pool.token_mint_b, snapshot.mint_b.pubkey
+        ));
+    }
+
+    let clock = decode_clock_sysvar(
+        snapshot.clock.pubkey,
+        snapshot.clock.owner,
+        snapshot.clock.data,
+    )?;
+
+    let transfer_fee_a = transfer_fee_for_mint(
+        snapshot.mint_a.owner,
+        snapshot.mint_a.data,
+        clock.epoch,
+        "Orca mint A",
+    )?;
+
+    let transfer_fee_b = transfer_fee_for_mint(
+        snapshot.mint_b.owner,
+        snapshot.mint_b.data,
+        clock.epoch,
+        "Orca mint B",
+    )?;
+
+    Ok(OrcaResolvedQuoteInputs {
+        clock,
+        transfer_fee_a,
+        transfer_fee_b,
+    })
+}
+
+pub fn quote_exact_input_from_snapshot(
+    pool: &OrcaWhirlpoolState,
+    whirlpool: WhirlpoolFacade,
+    input_mint: &str,
+    amount_in_raw: u64,
+    tick_arrays: [TickArrayFacade; 5],
+    oracle: Option<OracleFacade>,
+    snapshot: OrcaQuoteSnapshotInputs<'_>,
+) -> Result<ExactInSwapQuote, String> {
+    let resolved = resolve_quote_snapshot_inputs(pool, snapshot)?;
+
+    quote_exact_input(
+        pool,
+        whirlpool,
+        input_mint,
+        amount_in_raw,
+        tick_arrays,
+        resolved.clock.unix_timestamp,
+        oracle,
+        resolved.transfer_fee_a,
+        resolved.transfer_fee_b,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn quote_exact_input(
     pool: &OrcaWhirlpoolState,
@@ -839,6 +931,10 @@ fn read_array<const N: usize>(data: &[u8], offset: usize, label: &str) -> Result
 mod tests {
     use super::*;
 
+    const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const CLOCK_SYSVAR_ID: &str = "SysvarC1ock11111111111111111111111111111111";
+    const SYSVAR_OWNER_ID: &str = "Sysvar1111111111111111111111111111111111111";
+
     fn sample_pool() -> OrcaWhirlpoolState {
         OrcaWhirlpoolState {
             whirlpools_config: Pubkey::new_unique().to_string(),
@@ -897,6 +993,22 @@ mod tests {
             data[growth_offset..growth_offset + 16].copy_from_slice(&growth.to_le_bytes());
         }
 
+        data
+    }
+
+    fn sample_clock_account(slot: u64, epoch: u64, unix_timestamp: i64) -> Vec<u8> {
+        let mut data = vec![0u8; 40];
+
+        data[0..8].copy_from_slice(&slot.to_le_bytes());
+        data[16..24].copy_from_slice(&epoch.to_le_bytes());
+        data[32..40].copy_from_slice(&unix_timestamp.to_le_bytes());
+
+        data
+    }
+
+    fn sample_legacy_mint_account() -> Vec<u8> {
+        let mut data = vec![0u8; 82];
+        data[45] = 1;
         data
     }
 
@@ -1328,6 +1440,77 @@ mod tests {
     }
 
     #[test]
+    fn quote_snapshot_resolves_same_clock_and_both_mints() -> Result<(), String> {
+        let pool = sample_pool();
+        let clock_data = sample_clock_account(123_456, 700, 1_725_000_000);
+        let mint_a_data = sample_legacy_mint_account();
+        let mint_b_data = sample_legacy_mint_account();
+
+        let snapshot = OrcaQuoteSnapshotInputs {
+            clock: OrcaQuoteAccount {
+                pubkey: CLOCK_SYSVAR_ID,
+                owner: SYSVAR_OWNER_ID,
+                data: &clock_data,
+            },
+            mint_a: OrcaQuoteAccount {
+                pubkey: &pool.token_mint_a,
+                owner: SPL_TOKEN_PROGRAM_ID,
+                data: &mint_a_data,
+            },
+            mint_b: OrcaQuoteAccount {
+                pubkey: &pool.token_mint_b,
+                owner: SPL_TOKEN_PROGRAM_ID,
+                data: &mint_b_data,
+            },
+        };
+
+        let resolved = resolve_quote_snapshot_inputs(&pool, snapshot)?;
+
+        assert_eq!(resolved.clock.slot, 123_456);
+        assert_eq!(resolved.clock.epoch, 700);
+        assert_eq!(resolved.clock.unix_timestamp, 1_725_000_000);
+        assert!(resolved.transfer_fee_a.is_none());
+        assert!(resolved.transfer_fee_b.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn quote_snapshot_rejects_mint_identity_mismatch() -> Result<(), String> {
+        let pool = sample_pool();
+        let clock_data = sample_clock_account(123_456, 700, 1_725_000_000);
+        let mint_a_data = sample_legacy_mint_account();
+        let mint_b_data = sample_legacy_mint_account();
+        let wrong_mint_a = Pubkey::new_unique().to_string();
+
+        let snapshot = OrcaQuoteSnapshotInputs {
+            clock: OrcaQuoteAccount {
+                pubkey: CLOCK_SYSVAR_ID,
+                owner: SYSVAR_OWNER_ID,
+                data: &clock_data,
+            },
+            mint_a: OrcaQuoteAccount {
+                pubkey: &wrong_mint_a,
+                owner: SPL_TOKEN_PROGRAM_ID,
+                data: &mint_a_data,
+            },
+            mint_b: OrcaQuoteAccount {
+                pubkey: &pool.token_mint_b,
+                owner: SPL_TOKEN_PROGRAM_ID,
+                data: &mint_b_data,
+            },
+        };
+
+        match resolve_quote_snapshot_inputs(&pool, snapshot) {
+            Ok(_) => Err("Orca quote snapshot accepted wrong mint A identity".to_owned()),
+            Err(error) => {
+                assert!(error.contains("mint A identity mismatch"));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
     fn adaptive_pool_requires_oracle_before_quote() -> Result<(), String> {
         let mut pool = sample_pool();
         pool.fee_tier_index_seed = 32;
@@ -1404,6 +1587,72 @@ mod tests {
             Ok(_) => Err("adaptive pool quoted before trade enable timestamp".to_owned()),
             Err(error) => {
                 assert!(error.contains("trading is not enabled yet"));
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_quote_uses_same_snapshot_clock_timestamp_for_adaptive_gate() -> Result<(), String> {
+        let mut pool = sample_pool();
+        pool.fee_tier_index_seed = 32;
+
+        let whirlpool_data = sample_whirlpool_account(&pool);
+        let whirlpool = decode_whirlpool_facade(&whirlpool_data)?;
+
+        let oracle_whirlpool = Pubkey::new_unique().to_string();
+        let oracle_data = sample_oracle_account(&oracle_whirlpool, 2_000)?;
+        let oracle = decode_oracle_facade(
+            &oracle_data,
+            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            &oracle_whirlpool,
+        )?;
+
+        let arrays = [
+            zeroed_tick_array(0),
+            zeroed_tick_array(5_632),
+            zeroed_tick_array(11_264),
+            zeroed_tick_array(-5_632),
+            zeroed_tick_array(-11_264),
+        ];
+
+        let clock_data = sample_clock_account(123_456, 700, 1_000);
+        let mint_a_data = sample_legacy_mint_account();
+        let mint_b_data = sample_legacy_mint_account();
+
+        let snapshot = OrcaQuoteSnapshotInputs {
+            clock: OrcaQuoteAccount {
+                pubkey: CLOCK_SYSVAR_ID,
+                owner: SYSVAR_OWNER_ID,
+                data: &clock_data,
+            },
+            mint_a: OrcaQuoteAccount {
+                pubkey: &pool.token_mint_a,
+                owner: SPL_TOKEN_PROGRAM_ID,
+                data: &mint_a_data,
+            },
+            mint_b: OrcaQuoteAccount {
+                pubkey: &pool.token_mint_b,
+                owner: SPL_TOKEN_PROGRAM_ID,
+                data: &mint_b_data,
+            },
+        };
+
+        let input_mint = pool.token_mint_a.clone();
+
+        match quote_exact_input_from_snapshot(
+            &pool,
+            whirlpool,
+            &input_mint,
+            1_000,
+            arrays,
+            Some(oracle),
+            snapshot,
+        ) {
+            Ok(_) => Err("snapshot quote ignored same-snapshot Clock timestamp".to_owned()),
+            Err(error) => {
+                assert!(error.contains("trading is not enabled yet"));
+                assert!(error.contains("quote_timestamp=1000"));
                 Ok(())
             }
         }
