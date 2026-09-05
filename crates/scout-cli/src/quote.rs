@@ -1012,11 +1012,7 @@ where
     })
 }
 
-fn quote_leg<C>(
-    leg: &RouteLeg,
-    amount_in_raw: u64,
-    context: &C,
-) -> Result<VenueLegQuote, String>
+fn quote_leg<C>(leg: &RouteLeg, amount_in_raw: u64, context: &C) -> Result<VenueLegQuote, String>
 where
     C: ExactInputQuoteAdapter + ?Sized,
 {
@@ -1428,7 +1424,10 @@ mod tests {
         let snapshot = orca_snapshot()?;
 
         assert_eq!(snapshot.capabilities(), orca_clmm_capabilities());
-        assert_eq!(snapshot.capabilities().liquidity_model, LiquidityModel::Clmm);
+        assert_eq!(
+            snapshot.capabilities().liquidity_model,
+            LiquidityModel::Clmm
+        );
         assert_eq!(
             snapshot.capabilities().auxiliary_state,
             AuxiliaryStateKind::Ticks
