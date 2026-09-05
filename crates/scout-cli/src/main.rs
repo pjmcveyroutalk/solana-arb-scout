@@ -3,23 +3,27 @@ mod discovery;
 pub mod economics;
 mod forensics;
 mod forensics_rpc;
+mod orca;
+mod orca_live;
+mod orca_o2;
+mod orca_o2_quote_inputs;
+mod orca_runtime;
 mod pumpswap;
 mod quote;
 mod raydium;
 mod recorder;
 mod registry;
 mod route;
+mod runtime_quote;
 mod sizing;
 
 use discovery::{parse_raydium_pair_lookup_response, raydium_pair_lookup_requests};
 use futures_util::{SinkExt, StreamExt};
-use quote::{
-    quote_readiness_for_pool, quote_two_leg_exact_input, QuoteReadiness, VenueQuoteContext,
-};
+use quote::{quote_readiness_for_pool, VenueQuoteContext};
 use registry::ActiveMintRegistry;
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
 use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
-use scout_core::NormalizedPoolState;
+use scout_core::{NormalizedPoolState, Venue};
 use serde_json::{json, Value};
 use sizing::{
     parse_pyth_usd_price, pyth_usd_price_request, usd_dollars_to_anchor_raw, PythUsdFeed,
@@ -160,6 +164,34 @@ async fn main() -> Result<(), String> {
     let (mut pumpswap_states, mut pumpswap_quote_contexts) =
         observe_pumpswap(&rpc_client, &mut reader).await?;
 
+    writer
+        .send(Message::Text(orca::program_subscribe_request().to_string()))
+        .await
+        .map_err(|error| format!("could not subscribe to Orca Whirlpool: {error}"))?;
+
+    wait_for_subscription_confirmation(&mut reader, 18, "Orca Whirlpool").await?;
+
+    let orca_prepared =
+        orca_runtime::observe_and_prepare(&rpc_client, SOLANA_RPC_URL, &mut reader).await?;
+
+    let (
+        discovered_orca_raydium_states,
+        discovered_orca_raydium_contexts,
+        discovered_orca_pumpswap_states,
+        discovered_orca_pumpswap_contexts,
+    ) = discover_orca_cross_venue_counterpart(&rpc_client, &orca_prepared).await?;
+
+    merge_normalized_states(&mut raydium_states, discovered_orca_raydium_states);
+    merge_quote_contexts(
+        &mut raydium_quote_contexts,
+        discovered_orca_raydium_contexts,
+    );
+    merge_normalized_states(&mut pumpswap_states, discovered_orca_pumpswap_states);
+    merge_quote_contexts(
+        &mut pumpswap_quote_contexts,
+        discovered_orca_pumpswap_contexts,
+    );
+
     let initial_routes = {
         let mut registry = ActiveMintRegistry::new();
 
@@ -167,11 +199,17 @@ async fn main() -> Result<(), String> {
             .iter()
             .cloned()
             .chain(pumpswap_states.iter().cloned())
+            .chain(
+                orca_prepared
+                    .values()
+                    .map(|prepared| prepared.normalized.clone()),
+            )
         {
-            let readiness = quote_readiness_from_contexts(
+            let readiness = runtime_quote::readiness_for_pool(
                 &state,
                 &raydium_quote_contexts,
                 &pumpswap_quote_contexts,
+                &orca_prepared,
             );
 
             registry.upsert(state, readiness)?;
@@ -220,6 +258,7 @@ async fn main() -> Result<(), String> {
         pumpswap_states,
         &raydium_quote_contexts,
         &pumpswap_quote_contexts,
+        &orca_prepared,
         &usd_prices,
     )
     .await
@@ -409,6 +448,205 @@ where
     println!("READ-ONLY PUMPSWAP OBSERVATION PASS");
 
     Ok((states, quote_contexts))
+}
+
+async fn discover_orca_cross_venue_counterpart(
+    rpc_client: &Client,
+    orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
+) -> Result<
+    (
+        Vec<NormalizedPoolState>,
+        BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+        Vec<NormalizedPoolState>,
+        BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    ),
+    String,
+> {
+    if orca_prepared.is_empty() {
+        return Ok((Vec::new(), BTreeMap::new(), Vec::new(), BTreeMap::new()));
+    }
+
+    println!("\nOrca production exact-pair counterpart discovery");
+
+    let mut pair_count = 0usize;
+
+    for prepared in orca_prepared.values() {
+        pair_count += 1;
+
+        if pair_count > MAX_TARGETED_ROUTE_LOOKUPS {
+            break;
+        }
+
+        let anchor_mint = prepared.anchor_mint.as_str();
+        let intermediate_mint = prepared.intermediate_mint.as_str();
+
+        println!(
+            "orca_counterpart_probe_start: orca_pool={} anchor={} intermediate={}",
+            prepared.normalized.pool_id, anchor_mint, intermediate_mint
+        );
+
+        for request in raydium_pair_lookup_requests(anchor_mint, intermediate_mint) {
+            let label = format!(
+                "Orca production Raydium exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
+            );
+
+            let payload = match fetch_program_accounts(rpc_client, &request, &label).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!(
+                        "orca_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
+
+            let observations = match parse_raydium_pair_lookup_response(&payload) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    println!(
+                        "orca_raydium_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
+
+            for observation in observations {
+                if !raydium_observation_matches_pair(&observation, anchor_mint, intermediate_mint) {
+                    continue;
+                }
+
+                let (normalized, snapshot) =
+                    match hydrate_raydium_observation(rpc_client, &observation).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            println!(
+                                "orca_raydium_counterpart_rejected: pool={} reason={error}",
+                                observation.pubkey
+                            );
+                            continue;
+                        }
+                    };
+
+                let context = VenueQuoteContext::Raydium {
+                    pool_id: normalized.pool_id.clone(),
+                    snapshot: &snapshot,
+                };
+
+                if let Err(error) = quote_readiness_for_pool(&normalized, &context) {
+                    println!(
+                        "orca_raydium_counterpart_rejected: pool={} reason={error}",
+                        normalized.pool_id
+                    );
+                    continue;
+                }
+
+                println!(
+                    concat!(
+                        "orca_cross_venue_counterpart: anchor={} intermediate={} ",
+                        "orca_pool={} counterpart_venue={} counterpart_pool={}"
+                    ),
+                    anchor_mint,
+                    intermediate_mint,
+                    prepared.normalized.pool_id,
+                    normalized.venue.label(),
+                    normalized.pool_id
+                );
+                println!("READ-ONLY ORCA-RAYDIUM PRODUCTION DISCOVERY PASS");
+
+                let mut contexts = BTreeMap::new();
+                contexts.insert(normalized.pool_id.clone(), snapshot);
+
+                return Ok((vec![normalized], contexts, Vec::new(), BTreeMap::new()));
+            }
+        }
+
+        for request in pumpswap::pair_lookup_requests(anchor_mint, intermediate_mint) {
+            let label = format!(
+                "Orca production PumpSwap exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint}"
+            );
+
+            let payload = match fetch_program_accounts(rpc_client, &request, &label).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    println!(
+                        "orca_pumpswap_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
+
+            let observations = match pumpswap::parse_pair_lookup_response(&payload) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    println!(
+                        "orca_pumpswap_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
+                        anchor_mint, intermediate_mint
+                    );
+                    continue;
+                }
+            };
+
+            for observation in observations {
+                if !pumpswap_observation_matches_pair(&observation, anchor_mint, intermediate_mint)
+                {
+                    continue;
+                }
+
+                let (normalized, snapshot) =
+                    match hydrate_pumpswap_observation(rpc_client, &observation).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            println!(
+                                "orca_pumpswap_counterpart_rejected: pool={} reason={error}",
+                                observation.pubkey
+                            );
+                            continue;
+                        }
+                    };
+
+                let context = VenueQuoteContext::PumpSwap {
+                    pool_id: normalized.pool_id.clone(),
+                    snapshot: &snapshot,
+                };
+
+                if let Err(error) = quote_readiness_for_pool(&normalized, &context) {
+                    println!(
+                        "orca_pumpswap_counterpart_rejected: pool={} reason={error}",
+                        normalized.pool_id
+                    );
+                    continue;
+                }
+
+                println!(
+                    concat!(
+                        "orca_cross_venue_counterpart: anchor={} intermediate={} ",
+                        "orca_pool={} counterpart_venue={} counterpart_pool={}"
+                    ),
+                    anchor_mint,
+                    intermediate_mint,
+                    prepared.normalized.pool_id,
+                    normalized.venue.label(),
+                    normalized.pool_id
+                );
+                println!("READ-ONLY ORCA-PUMPSWAP PRODUCTION DISCOVERY PASS");
+
+                let mut contexts = BTreeMap::new();
+                contexts.insert(normalized.pool_id.clone(), snapshot);
+
+                return Ok((Vec::new(), BTreeMap::new(), vec![normalized], contexts));
+            }
+        }
+    }
+
+    println!(
+        "orca_cross_venue_counterpart_unavailable: bounded_pair_count={}",
+        pair_count.min(MAX_TARGETED_ROUTE_LOOKUPS)
+    );
+
+    Ok((Vec::new(), BTreeMap::new(), Vec::new(), BTreeMap::new()))
 }
 
 async fn discover_deterministic_cross_venue_overlap(
@@ -1068,69 +1306,6 @@ fn pumpswap_observation_matches_pair(
         || (quote_mint == anchor_mint && base_mint == intermediate_mint)
 }
 
-fn quote_readiness_from_contexts(
-    pool: &NormalizedPoolState,
-    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
-    pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
-) -> Option<QuoteReadiness> {
-    let result = match pool.venue {
-        scout_core::Venue::RaydiumCpmm => {
-            let Some(snapshot) = raydium_quote_contexts.get(&pool.pool_id) else {
-                println!(
-                    "quote_readiness_unavailable: venue={} pool={} reason=missing quote context",
-                    pool.venue.label(),
-                    pool.pool_id
-                );
-                return None;
-            };
-
-            let context = VenueQuoteContext::Raydium {
-                pool_id: pool.pool_id.clone(),
-                snapshot,
-            };
-
-            quote_readiness_for_pool(pool, &context)
-        }
-        scout_core::Venue::PumpSwap => {
-            let Some(snapshot) = pumpswap_quote_contexts.get(&pool.pool_id) else {
-                println!(
-                    "quote_readiness_unavailable: venue={} pool={} reason=missing quote context",
-                    pool.venue.label(),
-                    pool.pool_id
-                );
-                return None;
-            };
-
-            let context = VenueQuoteContext::PumpSwap {
-                pool_id: pool.pool_id.clone(),
-                snapshot,
-            };
-
-            quote_readiness_for_pool(pool, &context)
-        }
-        other => {
-            println!(
-                "quote_readiness_unavailable: venue={} pool={} reason=unsupported venue",
-                other.label(),
-                pool.pool_id
-            );
-            return None;
-        }
-    };
-
-    match result {
-        Ok(readiness) => Some(readiness),
-        Err(error) => {
-            println!(
-                "quote_readiness_unavailable: venue={} pool={} reason={error}",
-                pool.venue.label(),
-                pool.pool_id
-            );
-            None
-        }
-    }
-}
-
 async fn wait_for_r13_window_maturity(
     rpc_client: &Client,
     plan: &forensics::ForensicsPlan,
@@ -1220,15 +1395,24 @@ async fn validate_registry_routes_and_sizes(
     pumpswap_states: Vec<NormalizedPoolState>,
     raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
     usd_prices: &PythUsdPrices,
 ) -> Result<(), String> {
     println!("\nRegistry: Active Mint");
 
     let mut registry = ActiveMintRegistry::new();
 
-    for state in raydium_states.into_iter().chain(pumpswap_states) {
-        let readiness =
-            quote_readiness_from_contexts(&state, raydium_quote_contexts, pumpswap_quote_contexts);
+    for state in raydium_states.into_iter().chain(pumpswap_states).chain(
+        orca_prepared
+            .values()
+            .map(|prepared| prepared.normalized.clone()),
+    ) {
+        let readiness = runtime_quote::readiness_for_pool(
+            &state,
+            raydium_quote_contexts,
+            pumpswap_quote_contexts,
+            orca_prepared,
+        );
 
         registry.upsert(state, readiness)?;
     }
@@ -1266,6 +1450,19 @@ async fn validate_registry_routes_and_sizes(
         );
     }
 
+    let production_orca_route_count = route_candidates
+        .iter()
+        .filter(|route| {
+            route.leg_1().venue() == Venue::Orca || route.leg_2().venue() == Venue::Orca
+        })
+        .count();
+
+    println!("production_orca_route_candidate_count={production_orca_route_count}");
+
+    if production_orca_route_count > 0 {
+        println!("READ-ONLY PRODUCTION ORCA ROUTE ADMISSION PASS");
+    }
+
     println!("READ-ONLY TWO-LEG ROUTE ENGINE PASS");
     println!("READ-ONLY RUNG 9 ROUTE CANDIDATE PASS");
 
@@ -1287,17 +1484,18 @@ async fn validate_registry_routes_and_sizes(
 
     let mut successful_routes = 0usize;
     let mut successful_grid_quotes = 0usize;
+    let mut successful_orca_routes = 0usize;
     let mut rung11c_quote_records = Vec::<Rung11QuoteRecord>::new();
 
     for (route_index, route_candidate) in route_candidates.iter().enumerate() {
         let candidate_found_at_unix_ms = route_candidates_found_at_unix_ms;
 
-        let leg_1_context = match quote_context_for_leg(
+        let anchor_decimals = match runtime_quote::normalized_mint_decimals_for_leg(
             route_candidate.leg_1(),
-            raydium_quote_contexts,
-            pumpswap_quote_contexts,
+            route_candidate.anchor_mint(),
+            &eligible_pools,
         ) {
-            Ok(context) => context,
+            Ok(decimals) => decimals,
             Err(error) => {
                 println!(
                     "rung10_route_rejected: route=[{}] reason={error}",
@@ -1311,43 +1509,6 @@ async fn validate_registry_routes_and_sizes(
                 continue;
             }
         };
-
-        let leg_2_context = match quote_context_for_leg(
-            route_candidate.leg_2(),
-            raydium_quote_contexts,
-            pumpswap_quote_contexts,
-        ) {
-            Ok(context) => context,
-            Err(error) => {
-                println!(
-                    "rung10_route_rejected: route=[{}] reason={error}",
-                    route_candidate.summary()
-                );
-                shadow_recorder.record_route_rejection(
-                    route_candidate,
-                    candidate_found_at_unix_ms,
-                    &error,
-                )?;
-                continue;
-            }
-        };
-
-        let anchor_decimals =
-            match context_mint_decimals(&leg_1_context, route_candidate.anchor_mint()) {
-                Ok(decimals) => decimals,
-                Err(error) => {
-                    println!(
-                        "rung10_route_rejected: route=[{}] reason={error}",
-                        route_candidate.summary()
-                    );
-                    shadow_recorder.record_route_rejection(
-                        route_candidate,
-                        candidate_found_at_unix_ms,
-                        &error,
-                    )?;
-                    continue;
-                }
-            };
 
         let mut route_grid_quotes = 0usize;
 
@@ -1383,11 +1544,12 @@ async fn validate_registry_routes_and_sizes(
                 }
             };
 
-            match quote_two_leg_exact_input(
+            match runtime_quote::quote_route_exact_input(
                 route_candidate,
                 amount_in_raw,
-                &leg_1_context,
-                &leg_2_context,
+                raydium_quote_contexts,
+                pumpswap_quote_contexts,
+                orca_prepared,
             ) {
                 Ok(route_quote) => {
                     let quote_complete_at_unix_ms = unix_time_ms_now()?;
@@ -1433,6 +1595,16 @@ async fn validate_registry_routes_and_sizes(
         if route_grid_quotes == USD_SIZE_GRID.len() {
             successful_routes += 1;
             println!("rung10_complete_grid_route: {}", route_candidate.summary());
+
+            if route_candidate.leg_1().venue() == Venue::Orca
+                || route_candidate.leg_2().venue() == Venue::Orca
+            {
+                successful_orca_routes += 1;
+                println!(
+                    "production_orca_complete_grid_route: {}",
+                    route_candidate.summary()
+                );
+            }
         }
     }
 
@@ -1445,6 +1617,12 @@ async fn validate_registry_routes_and_sizes(
 
     println!("rung10_complete_grid_route_count={successful_routes}");
     println!("rung10_successful_grid_quote_count={successful_grid_quotes}");
+    println!("production_orca_complete_grid_route_count={successful_orca_routes}");
+
+    if successful_orca_routes > 0 {
+        println!("READ-ONLY PRODUCTION ORCA CROSS-VENUE QUOTE PASS");
+    }
+
     println!("READ-ONLY RUNG 10 SIZE + QUOTE ENGINE PASS");
 
     println!("\nRung 11C read-only cost observation");
@@ -1464,52 +1642,13 @@ async fn validate_registry_routes_and_sizes(
             continue;
         };
 
-        let leg_1_context = match quote_context_for_leg(
-            route_candidate.leg_1(),
-            raydium_quote_contexts,
-            pumpswap_quote_contexts,
-        ) {
-            Ok(context) => context,
-            Err(error) => {
-                println!(
-                    "rung11c_priority_scope_unknown: route=[{}] reason={error}",
-                    route_candidate.summary()
-                );
-                route_priority_observations.insert(
-                    route_index,
-                    costs::PriorityObservationState::Unavailable(error),
-                );
-                continue;
-            }
-        };
-
-        let leg_2_context = match quote_context_for_leg(
-            route_candidate.leg_2(),
-            raydium_quote_contexts,
-            pumpswap_quote_contexts,
-        ) {
-            Ok(context) => context,
-            Err(error) => {
-                println!(
-                    "rung11c_priority_scope_unknown: route=[{}] reason={error}",
-                    route_candidate.summary()
-                );
-                route_priority_observations.insert(
-                    route_index,
-                    costs::PriorityObservationState::Unavailable(error),
-                );
-                continue;
-            }
-        };
-
         rung11c_route_scope_attempts += 1;
 
         let priority_observation = route_priority_observation(
             rpc_client,
             route_candidate.leg_1(),
-            &leg_1_context,
             route_candidate.leg_2(),
-            &leg_2_context,
+            raydium_quote_contexts,
             &mut priority_cache,
         )
         .await;
@@ -1528,41 +1667,41 @@ async fn validate_registry_routes_and_sizes(
             continue;
         };
 
-        let priority_observation = if let Some(observation) =
-            route_priority_observations.get(&record.route_index)
-        {
-            observation
-        } else {
-            let reason = "missing priority observation state";
-            println!(
-                "rung11c_cost_model_rejected: route=[{}] reason={reason}",
-                route_candidate.summary()
-            );
-            let missing_priority = costs::PriorityObservationState::Unavailable(reason.to_owned());
-            let economics_complete_at_unix_ms = unix_time_ms_now()?;
-            shadow_recorder.record_economics_evaluation(
-                route_candidate,
-                record.dollars,
-                record.anchor_decimals,
-                &record.route_quote,
-                None,
-                Some(reason),
-                None,
-                None,
-                &missing_priority,
-                &jito_observation,
-                recorder::CandidateTiming {
-                    candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
-                    quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
-                    economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
-                    hypothetical_ready_at_unix_ms: None,
-                },
-                &usd_prices.sol,
-                usd_prices.usdc.as_ref(),
-                usd_prices.usdt.as_ref(),
-            )?;
-            continue;
-        };
+        let priority_observation =
+            if let Some(observation) = route_priority_observations.get(&record.route_index) {
+                observation
+            } else {
+                let reason = "missing priority observation state";
+                println!(
+                    "rung11c_cost_model_rejected: route=[{}] reason={reason}",
+                    route_candidate.summary()
+                );
+                let missing_priority =
+                    costs::PriorityObservationState::Unavailable(reason.to_owned());
+                let economics_complete_at_unix_ms = unix_time_ms_now()?;
+                shadow_recorder.record_economics_evaluation(
+                    route_candidate,
+                    record.dollars,
+                    record.anchor_decimals,
+                    &record.route_quote,
+                    None,
+                    Some(reason),
+                    None,
+                    None,
+                    &missing_priority,
+                    &jito_observation,
+                    recorder::CandidateTiming {
+                        candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
+                        quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
+                        economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
+                        hypothetical_ready_at_unix_ms: None,
+                    },
+                    &usd_prices.sol,
+                    usd_prices.usdc.as_ref(),
+                    usd_prices.usdt.as_ref(),
+                )?;
+                continue;
+            };
 
         let cost_model = match costs::economics_cost_model_with_usd_prices(
             route_candidate.anchor_mint(),
@@ -1862,63 +2001,6 @@ async fn validate_registry_routes_and_sizes(
     Ok(())
 }
 
-fn quote_context_for_leg<'a>(
-    leg: &RouteLeg,
-    raydium_quote_contexts: &'a BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
-    pumpswap_quote_contexts: &'a BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
-) -> Result<VenueQuoteContext<'a>, String> {
-    match leg.venue() {
-        scout_core::Venue::RaydiumCpmm => raydium_quote_contexts
-            .get(leg.pool_id())
-            .map(|snapshot| VenueQuoteContext::Raydium {
-                pool_id: leg.pool_id().to_owned(),
-                snapshot,
-            })
-            .ok_or_else(|| {
-                format!(
-                    "missing Raydium quote context for route pool {}",
-                    leg.pool_id()
-                )
-            }),
-        scout_core::Venue::PumpSwap => pumpswap_quote_contexts
-            .get(leg.pool_id())
-            .map(|snapshot| VenueQuoteContext::PumpSwap {
-                pool_id: leg.pool_id().to_owned(),
-                snapshot,
-            })
-            .ok_or_else(|| {
-                format!(
-                    "missing PumpSwap quote context for route pool {}",
-                    leg.pool_id()
-                )
-            }),
-        other => Err(format!("unsupported Rung 10 quote venue {}", other.label())),
-    }
-}
-
-fn context_mint_decimals(context: &VenueQuoteContext<'_>, mint: &str) -> Result<u8, String> {
-    match context {
-        VenueQuoteContext::Raydium { snapshot, .. } => {
-            if snapshot.pool_state.token_0_mint == mint {
-                Ok(snapshot.pool_state.mint_0_decimals)
-            } else if snapshot.pool_state.token_1_mint == mint {
-                Ok(snapshot.pool_state.mint_1_decimals)
-            } else {
-                Err(format!("mint {mint} is not in Raydium quote context"))
-            }
-        }
-        VenueQuoteContext::PumpSwap { snapshot, .. } => {
-            if snapshot.pool_state.base_mint == mint {
-                Ok(snapshot.base_decimals)
-            } else if snapshot.pool_state.quote_mint == mint {
-                Ok(snapshot.quote_decimals)
-            } else {
-                Err(format!("mint {mint} is not in PumpSwap quote context"))
-            }
-        }
-    }
-}
-
 async fn observe_jito_tip_floor(rpc_client: &Client) -> costs::JitoObservationState {
     let started_at = Instant::now();
     let response = match rpc_client.get(costs::JITO_TIP_FLOOR_URL).send().await {
@@ -1970,18 +2052,70 @@ async fn observe_jito_tip_floor(rpc_client: &Client) -> costs::JitoObservationSt
 async fn route_priority_observation(
     rpc_client: &Client,
     leg_1: &RouteLeg,
-    leg_1_context: &VenueQuoteContext<'_>,
     leg_2: &RouteLeg,
-    leg_2_context: &VenueQuoteContext<'_>,
+    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
     cache: &mut BTreeMap<Vec<String>, costs::PriorityObservationState>,
 ) -> costs::PriorityObservationState {
-    let leg_1_raydium = match leg_1_context {
-        VenueQuoteContext::Raydium { snapshot, .. } => Some(*snapshot),
-        VenueQuoteContext::PumpSwap { .. } => None,
+    if leg_1.venue() == Venue::Orca || leg_2.venue() == Venue::Orca {
+        let reason = format!(
+            concat!(
+                "Orca priority contention footprint remains Unknown/fail-closed: ",
+                "leg1_venue={} leg1_pool={} leg2_venue={} leg2_pool={}"
+            ),
+            leg_1.venue().label(),
+            leg_1.pool_id(),
+            leg_2.venue().label(),
+            leg_2.pool_id()
+        );
+
+        println!(
+            "rung11c_priority_scope_unknown: leg1_pool={} leg2_pool={} reason={}",
+            leg_1.pool_id(),
+            leg_2.pool_id(),
+            reason
+        );
+
+        return costs::PriorityObservationState::Unavailable(reason);
+    }
+
+    let leg_1_raydium = match leg_1.venue() {
+        Venue::RaydiumCpmm => match raydium_quote_contexts.get(leg_1.pool_id()) {
+            Some(snapshot) => Some(snapshot),
+            None => {
+                let reason = format!(
+                    "missing Raydium priority context for route pool {}",
+                    leg_1.pool_id()
+                );
+                println!(
+                    "rung11c_priority_scope_unknown: leg1_pool={} leg2_pool={} reason={reason}",
+                    leg_1.pool_id(),
+                    leg_2.pool_id()
+                );
+                return costs::PriorityObservationState::Unavailable(reason);
+            }
+        },
+        Venue::PumpSwap => None,
+        Venue::Orca => None,
     };
-    let leg_2_raydium = match leg_2_context {
-        VenueQuoteContext::Raydium { snapshot, .. } => Some(*snapshot),
-        VenueQuoteContext::PumpSwap { .. } => None,
+
+    let leg_2_raydium = match leg_2.venue() {
+        Venue::RaydiumCpmm => match raydium_quote_contexts.get(leg_2.pool_id()) {
+            Some(snapshot) => Some(snapshot),
+            None => {
+                let reason = format!(
+                    "missing Raydium priority context for route pool {}",
+                    leg_2.pool_id()
+                );
+                println!(
+                    "rung11c_priority_scope_unknown: leg1_pool={} leg2_pool={} reason={reason}",
+                    leg_1.pool_id(),
+                    leg_2.pool_id()
+                );
+                return costs::PriorityObservationState::Unavailable(reason);
+            }
+        },
+        Venue::PumpSwap => None,
+        Venue::Orca => None,
     };
 
     let footprint = match costs::route_contention_footprint(
@@ -2287,3 +2421,4 @@ mod tests {
         assert_eq!(parse_retry_after_seconds("invalid"), None);
     }
 }
+
