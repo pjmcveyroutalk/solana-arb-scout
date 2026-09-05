@@ -930,8 +930,19 @@ mod tests {
     use super::*;
 
     const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
     const CLOCK_SYSVAR_ID: &str = "SysvarC1ock11111111111111111111111111111111";
     const SYSVAR_OWNER_ID: &str = "Sysvar1111111111111111111111111111111111111";
+
+    const TOKEN_2022_ACCOUNT_TYPE_OFFSET: usize = 165;
+    const TOKEN_2022_MINT_TLV_START: usize = 166;
+    const TOKEN_2022_TRANSFER_FEE_CONFIG_LEN: usize = 108;
+    const TOKEN_2022_TRANSFER_FEE_OLDER_EPOCH_OFFSET: usize = 72;
+    const TOKEN_2022_TRANSFER_FEE_OLDER_MAX_FEE_OFFSET: usize = 80;
+    const TOKEN_2022_TRANSFER_FEE_OLDER_BPS_OFFSET: usize = 88;
+    const TOKEN_2022_TRANSFER_FEE_NEWER_EPOCH_OFFSET: usize = 90;
+    const TOKEN_2022_TRANSFER_FEE_NEWER_MAX_FEE_OFFSET: usize = 98;
+    const TOKEN_2022_TRANSFER_FEE_NEWER_BPS_OFFSET: usize = 106;
 
     fn sample_pool() -> OrcaWhirlpoolState {
         OrcaWhirlpoolState {
@@ -1008,6 +1019,155 @@ mod tests {
         let mut data = vec![0u8; 82];
         data[45] = 1;
         data
+    }
+
+    fn sample_token_2022_mint_with_transfer_fee(
+        older_epoch: u64,
+        older_max_fee: u64,
+        older_bps: u16,
+        newer_epoch: u64,
+        newer_max_fee: u64,
+        newer_bps: u16,
+    ) -> Vec<u8> {
+        let extension_header_len = 4usize;
+        let total_len =
+            TOKEN_2022_MINT_TLV_START + extension_header_len + TOKEN_2022_TRANSFER_FEE_CONFIG_LEN;
+        let mut data = vec![0u8; total_len];
+
+        data[45] = 1;
+        data[TOKEN_2022_ACCOUNT_TYPE_OFFSET] = 1;
+
+        let header_offset = TOKEN_2022_MINT_TLV_START;
+        data[header_offset..header_offset + 2].copy_from_slice(&1u16.to_le_bytes());
+        data[header_offset + 2..header_offset + 4]
+            .copy_from_slice(&(TOKEN_2022_TRANSFER_FEE_CONFIG_LEN as u16).to_le_bytes());
+
+        let value_offset = header_offset + extension_header_len;
+
+        data[value_offset + TOKEN_2022_TRANSFER_FEE_OLDER_EPOCH_OFFSET
+            ..value_offset + TOKEN_2022_TRANSFER_FEE_OLDER_EPOCH_OFFSET + 8]
+            .copy_from_slice(&older_epoch.to_le_bytes());
+        data[value_offset + TOKEN_2022_TRANSFER_FEE_OLDER_MAX_FEE_OFFSET
+            ..value_offset + TOKEN_2022_TRANSFER_FEE_OLDER_MAX_FEE_OFFSET + 8]
+            .copy_from_slice(&older_max_fee.to_le_bytes());
+        data[value_offset + TOKEN_2022_TRANSFER_FEE_OLDER_BPS_OFFSET
+            ..value_offset + TOKEN_2022_TRANSFER_FEE_OLDER_BPS_OFFSET + 2]
+            .copy_from_slice(&older_bps.to_le_bytes());
+
+        data[value_offset + TOKEN_2022_TRANSFER_FEE_NEWER_EPOCH_OFFSET
+            ..value_offset + TOKEN_2022_TRANSFER_FEE_NEWER_EPOCH_OFFSET + 8]
+            .copy_from_slice(&newer_epoch.to_le_bytes());
+        data[value_offset + TOKEN_2022_TRANSFER_FEE_NEWER_MAX_FEE_OFFSET
+            ..value_offset + TOKEN_2022_TRANSFER_FEE_NEWER_MAX_FEE_OFFSET + 8]
+            .copy_from_slice(&newer_max_fee.to_le_bytes());
+        data[value_offset + TOKEN_2022_TRANSFER_FEE_NEWER_BPS_OFFSET
+            ..value_offset + TOKEN_2022_TRANSFER_FEE_NEWER_BPS_OFFSET + 2]
+            .copy_from_slice(&newer_bps.to_le_bytes());
+
+        data
+    }
+
+    fn independent_apply_transfer_fee(
+        amount: u64,
+        transfer_fee: TransferFee,
+    ) -> Result<u64, String> {
+        if transfer_fee.fee_bps > 10_000 {
+            return Err("test transfer fee exceeds 10000 bps".to_owned());
+        }
+
+        if transfer_fee.fee_bps == 0 || amount == 0 {
+            return Ok(amount);
+        }
+
+        let numerator = u128::from(amount)
+            .checked_mul(u128::from(transfer_fee.fee_bps))
+            .ok_or_else(|| "test transfer fee numerator overflow".to_owned())?;
+
+        let rounded_numerator = numerator
+            .checked_add(9_999)
+            .ok_or_else(|| "test transfer fee rounding overflow".to_owned())?;
+
+        let raw_fee_u128 = rounded_numerator / 10_000u128;
+
+        let raw_fee = u64::try_from(raw_fee_u128)
+            .map_err(|_| "test transfer fee does not fit u64".to_owned())?;
+
+        amount
+            .checked_sub(raw_fee.min(transfer_fee.max_fee))
+            .ok_or_else(|| "test transfer fee exceeds amount".to_owned())
+    }
+
+    fn quote_arrays() -> [TickArrayFacade; 5] {
+        [
+            zeroed_tick_array(0),
+            zeroed_tick_array(5_632),
+            zeroed_tick_array(11_264),
+            zeroed_tick_array(-5_632),
+            zeroed_tick_array(-11_264),
+        ]
+    }
+
+    fn quote_fixture(
+        pool: &OrcaWhirlpoolState,
+        input_mint: &str,
+        amount_in_raw: u64,
+        transfer_fee_a: Option<TransferFee>,
+        transfer_fee_b: Option<TransferFee>,
+    ) -> Result<ExactInSwapQuote, String> {
+        let whirlpool_data = sample_whirlpool_account(pool);
+        let whirlpool = decode_whirlpool_facade(&whirlpool_data)?;
+
+        quote_exact_input(
+            pool,
+            whirlpool,
+            input_mint,
+            amount_in_raw,
+            quote_arrays(),
+            1_000,
+            None,
+            transfer_fee_a,
+            transfer_fee_b,
+        )
+    }
+
+    fn snapshot_quote_with_token_2022_a(
+        pool: &OrcaWhirlpoolState,
+        epoch: u64,
+        mint_a_data: &[u8],
+        amount_in_raw: u64,
+    ) -> Result<ExactInSwapQuote, String> {
+        let whirlpool_data = sample_whirlpool_account(pool);
+        let whirlpool = decode_whirlpool_facade(&whirlpool_data)?;
+        let clock_data = sample_clock_account(123_456, epoch, 1_000);
+        let mint_b_data = sample_legacy_mint_account();
+
+        let snapshot = OrcaQuoteSnapshotInputs {
+            clock: OrcaQuoteAccount {
+                pubkey: CLOCK_SYSVAR_ID,
+                owner: SYSVAR_OWNER_ID,
+                data: &clock_data,
+            },
+            mint_a: OrcaQuoteAccount {
+                pubkey: &pool.token_mint_a,
+                owner: TOKEN_2022_PROGRAM_ID,
+                data: mint_a_data,
+            },
+            mint_b: OrcaQuoteAccount {
+                pubkey: &pool.token_mint_b,
+                owner: SPL_TOKEN_PROGRAM_ID,
+                data: &mint_b_data,
+            },
+        };
+
+        quote_exact_input_from_snapshot(
+            pool,
+            whirlpool,
+            &pool.token_mint_a,
+            amount_in_raw,
+            quote_arrays(),
+            None,
+            snapshot,
+        )
     }
 
     fn sample_oracle_account(
@@ -1506,6 +1666,195 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn quote_transfer_fees_map_to_input_and_output_in_both_directions() -> Result<(), String> {
+        let pool = sample_pool();
+        let transfer_fee = TransferFee {
+            fee_bps: 250,
+            max_fee: 1_000_000,
+        };
+        let amount_in = 100_000;
+
+        let amount_after_fee = independent_apply_transfer_fee(amount_in, transfer_fee)?;
+
+        let baseline_a_to_b = quote_fixture(
+            &pool,
+            &pool.token_mint_a,
+            amount_after_fee,
+            None,
+            None,
+        )?;
+        let input_fee_a_to_b = quote_fixture(
+            &pool,
+            &pool.token_mint_a,
+            amount_in,
+            Some(transfer_fee),
+            None,
+        )?;
+
+        assert_eq!(
+            input_fee_a_to_b.token_est_out,
+            baseline_a_to_b.token_est_out
+        );
+        assert_eq!(input_fee_a_to_b.token_in, amount_in);
+
+        let baseline_full_a_to_b =
+            quote_fixture(&pool, &pool.token_mint_a, amount_in, None, None)?;
+        let expected_output_a_to_b =
+            independent_apply_transfer_fee(baseline_full_a_to_b.token_est_out, transfer_fee)?;
+        let output_fee_a_to_b = quote_fixture(
+            &pool,
+            &pool.token_mint_a,
+            amount_in,
+            None,
+            Some(transfer_fee),
+        )?;
+
+        assert_eq!(output_fee_a_to_b.token_est_out, expected_output_a_to_b);
+
+        let baseline_b_to_a = quote_fixture(
+            &pool,
+            &pool.token_mint_b,
+            amount_after_fee,
+            None,
+            None,
+        )?;
+        let input_fee_b_to_a = quote_fixture(
+            &pool,
+            &pool.token_mint_b,
+            amount_in,
+            None,
+            Some(transfer_fee),
+        )?;
+
+        assert_eq!(
+            input_fee_b_to_a.token_est_out,
+            baseline_b_to_a.token_est_out
+        );
+        assert_eq!(input_fee_b_to_a.token_in, amount_in);
+
+        let baseline_full_b_to_a =
+            quote_fixture(&pool, &pool.token_mint_b, amount_in, None, None)?;
+        let expected_output_b_to_a =
+            independent_apply_transfer_fee(baseline_full_b_to_a.token_est_out, transfer_fee)?;
+        let output_fee_b_to_a = quote_fixture(
+            &pool,
+            &pool.token_mint_b,
+            amount_in,
+            Some(transfer_fee),
+            None,
+        )?;
+
+        assert_eq!(output_fee_b_to_a.token_est_out, expected_output_b_to_a);
+
+        Ok(())
+    }
+
+    #[test]
+    fn quote_transfer_fee_rounding_cap_and_both_sides_match_independent_arithmetic(
+    ) -> Result<(), String> {
+        let pool = sample_pool();
+
+        let input_fee = TransferFee {
+            fee_bps: 1,
+            max_fee: u64::MAX,
+        };
+        let output_fee = TransferFee {
+            fee_bps: 1_000,
+            max_fee: 7,
+        };
+
+        let amount_in = 10_001;
+        let amount_after_input_fee = independent_apply_transfer_fee(amount_in, input_fee)?;
+
+        assert_eq!(amount_after_input_fee, 9_999);
+        assert_eq!(
+            independent_apply_transfer_fee(100_000, output_fee)?,
+            99_993
+        );
+
+        let baseline = quote_fixture(
+            &pool,
+            &pool.token_mint_a,
+            amount_after_input_fee,
+            None,
+            None,
+        )?;
+
+        let expected_output =
+            independent_apply_transfer_fee(baseline.token_est_out, output_fee)?;
+
+        let both_fee_quote = quote_fixture(
+            &pool,
+            &pool.token_mint_a,
+            amount_in,
+            Some(input_fee),
+            Some(output_fee),
+        )?;
+
+        assert_eq!(both_fee_quote.token_in, amount_in);
+        assert_eq!(both_fee_quote.token_est_out, expected_output);
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_quote_switches_transfer_fee_exactly_at_activation_epoch() -> Result<(), String> {
+        let pool = sample_pool();
+        let amount_in = 100_000;
+
+        let older_fee = TransferFee {
+            fee_bps: 100,
+            max_fee: 1_000_000,
+        };
+        let newer_fee = TransferFee {
+            fee_bps: 500,
+            max_fee: 1_000_000,
+        };
+
+        let mint_a_data = sample_token_2022_mint_with_transfer_fee(
+            1,
+            older_fee.max_fee,
+            older_fee.fee_bps,
+            100,
+            newer_fee.max_fee,
+            newer_fee.fee_bps,
+        );
+
+        let before_activation =
+            snapshot_quote_with_token_2022_a(&pool, 99, &mint_a_data, amount_in)?;
+        let at_activation =
+            snapshot_quote_with_token_2022_a(&pool, 100, &mint_a_data, amount_in)?;
+
+        let older_amount_after_fee = independent_apply_transfer_fee(amount_in, older_fee)?;
+        let newer_amount_after_fee = independent_apply_transfer_fee(amount_in, newer_fee)?;
+
+        let expected_before = quote_fixture(
+            &pool,
+            &pool.token_mint_a,
+            older_amount_after_fee,
+            None,
+            None,
+        )?;
+
+        let expected_at = quote_fixture(
+            &pool,
+            &pool.token_mint_a,
+            newer_amount_after_fee,
+            None,
+            None,
+        )?;
+
+        assert_eq!(
+            before_activation.token_est_out,
+            expected_before.token_est_out
+        );
+        assert_eq!(at_activation.token_est_out, expected_at.token_est_out);
+        assert!(at_activation.token_est_out < before_activation.token_est_out);
+
+        Ok(())
     }
 
     #[test]
