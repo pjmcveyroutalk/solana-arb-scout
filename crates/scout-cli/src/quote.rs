@@ -294,10 +294,7 @@ impl OrcaQuoteReadinessEvidence {
     }
 }
 
-fn validate_orca_exact_input_quote(
-    label: &str,
-    quote: &ExactInSwapQuote,
-) -> Result<(), String> {
+fn validate_orca_exact_input_quote(label: &str, quote: &ExactInSwapQuote) -> Result<(), String> {
     if quote.token_in == 0 {
         return Err(format!("Orca {label} quote has zero token input"));
     }
@@ -1425,8 +1422,7 @@ mod tests {
     }
 
     #[test]
-    fn orca_core_quote_mapping_preserves_partial_consumption_and_fee_evidence()
-        -> Result<(), String>
+    fn orca_core_quote_mapping_preserves_partial_consumption_and_fee_evidence() -> Result<(), String>
     {
         let native = ExactInSwapQuote {
             token_in: 900_000,
