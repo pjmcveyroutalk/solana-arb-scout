@@ -2226,7 +2226,11 @@ mod tests {
         })
     }
 
-    fn resolved_instruction(program_id: &str, account_keys: Vec<&str>, data: Vec<u8>) -> ResolvedInstruction {
+    fn resolved_instruction(
+        program_id: &str,
+        account_keys: Vec<&str>,
+        data: Vec<u8>,
+    ) -> ResolvedInstruction {
         ResolvedInstruction {
             coordinate: InstructionCoordinate {
                 outer_index: 0,
