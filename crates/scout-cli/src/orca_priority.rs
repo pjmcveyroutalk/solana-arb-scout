@@ -30,22 +30,18 @@ pub async fn observe_route(
     orca_prepared: &BTreeMap<String, PreparedOrca>,
     cache: &mut BTreeMap<Vec<String>, PriorityObservationState>,
 ) -> PriorityObservationState {
-    let (accounts, provenance) = match route_scope(
-        leg_1,
-        leg_2,
-        raydium_quote_contexts,
-        orca_prepared,
-    ) {
-        Ok(scope) => scope,
-        Err(error) => {
-            println!(
-                "rung11c_priority_scope_unknown: leg1_pool={} leg2_pool={} reason={error}",
-                leg_1.pool_id(),
-                leg_2.pool_id()
-            );
-            return PriorityObservationState::Unavailable(error);
-        }
-    };
+    let (accounts, provenance) =
+        match route_scope(leg_1, leg_2, raydium_quote_contexts, orca_prepared) {
+            Ok(scope) => scope,
+            Err(error) => {
+                println!(
+                    "rung11c_priority_scope_unknown: leg1_pool={} leg2_pool={} reason={error}",
+                    leg_1.pool_id(),
+                    leg_2.pool_id()
+                );
+                return PriorityObservationState::Unavailable(error);
+            }
+        };
 
     println!(
         "rung11c_priority_scope: account_count={} accounts=[{}] provenance={}",
@@ -72,9 +68,7 @@ pub async fn observe_route(
                     PriorityObservationState::Available(observation)
                 }
                 Ok(None) => {
-                    println!(
-                        "rung11c_priority_selection_unknown: no positive localized samples"
-                    );
+                    println!("rung11c_priority_selection_unknown: no positive localized samples");
                     PriorityObservationState::Available(observation)
                 }
                 Err(error) => {
@@ -139,7 +133,10 @@ fn venue_scope(
                 )
             })?;
             let footprint = costs::raydium_contention_footprint(leg.pool_id(), snapshot)?;
-            Ok((footprint.accounts().to_vec(), footprint.provenance().to_owned()))
+            Ok((
+                footprint.accounts().to_vec(),
+                footprint.provenance().to_owned(),
+            ))
         }
         Venue::Orca => {
             let prepared = orca_prepared.get(leg.pool_id()).ok_or_else(|| {
