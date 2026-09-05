@@ -6,9 +6,7 @@ mod orca;
 mod orca_o2_quote_inputs;
 
 use orca::OrcaWhirlpoolState;
-use orca_o2_quote_inputs::{
-    decode_clock_sysvar, transfer_fee_for_mint, OrcaQuoteClock,
-};
+use orca_o2_quote_inputs::{decode_clock_sysvar, transfer_fee_for_mint, OrcaQuoteClock};
 use orca_whirlpools_core::{
     get_tick_array_start_tick_index, swap_quote_by_input_token, AdaptiveFeeConstantsFacade,
     AdaptiveFeeVariablesFacade, ExactInSwapQuote, OracleFacade, TickArrayFacade, TickArrays,
