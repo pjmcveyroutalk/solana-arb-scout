@@ -1,0 +1,62 @@
+name: Format Orca Route Once
+
+on:
+  push:
+    paths:
+      - ".github/workflows/format-orca-route.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    name: Exact Rust 1.80 Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install exact Rust 1.80 rustfmt
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.80.0 --profile minimal --component rustfmt
+          rustup run 1.80.0 rustfmt --version
+
+      - name: Format workspace mechanically
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup run 1.80.0 cargo fmt --all
+
+          changed_rs="$(git diff --name-only -- '*.rs')"
+
+          if [ "$changed_rs" != "crates/scout-cli/src/bin/orca-route-live.rs" ]; then
+            echo "Unexpected Rust files changed:"
+            printf '%s\n' "$changed_rs"
+            exit 1
+          fi
+
+          rustup run 1.80.0 cargo fmt --all -- --check
+
+      - name: Remove one-time formatter
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/format-orca-route.yml
+
+      - name: Commit exact formatted source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "Scout Rust 1.80 Formatter"
+          git config user.email "actions@github.com"
+
+          git add crates/scout-cli/src/bin/orca-route-live.rs
+          git commit -m "Format Orca route proof with Rust 1.80"
+          git push origin HEAD:main
