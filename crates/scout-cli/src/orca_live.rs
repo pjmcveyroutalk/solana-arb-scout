@@ -40,6 +40,7 @@ pub struct PreparedOrca {
     pub quote_snapshot: OrcaQuoteSnapshot,
     pub anchor_mint: String,
     pub intermediate_mint: String,
+    pub priority_contention_accounts: [String; 9],
 }
 
 pub fn anchor_pair(pool: &orca::OrcaWhirlpoolState) -> Option<(&str, &str)> {
@@ -204,6 +205,19 @@ pub async fn prepare_orca(
         resolved.transfer_fee_b,
     )?;
 
+    let priority_contention_accounts =
+        build_priority_contention_accounts(observation, &snapshot_pool, &plan)?;
+
+    println!(
+        concat!(
+            "orca_priority_contention_ready: pool={} account_count={} accounts=[{}] ",
+            "provenance=Orca SwapV2 deterministic protocol writable subset"
+        ),
+        observation.pubkey,
+        priority_contention_accounts.len(),
+        priority_contention_accounts.join(",")
+    );
+
     println!(
         concat!(
             "orca_o2_ready: pool={} trigger_slot={} snapshot_slot={} ",
@@ -218,7 +232,26 @@ pub async fn prepare_orca(
         quote_snapshot,
         anchor_mint: anchor_mint.to_owned(),
         intermediate_mint: intermediate_mint.to_owned(),
+        priority_contention_accounts,
     })
+}
+
+fn build_priority_contention_accounts(
+    observation: &orca::OrcaWhirlpoolAccountObservation,
+    snapshot_pool: &orca::OrcaWhirlpoolState,
+    plan: &OrcaSnapshotPlan,
+) -> Result<[String; 9], String> {
+    Ok([
+        observation.pubkey.clone(),
+        snapshot_pool.token_vault_a.clone(),
+        snapshot_pool.token_vault_b.clone(),
+        plan.pubkeys[TICK_ARRAY_START_INDEX].clone(),
+        plan.pubkeys[TICK_ARRAY_START_INDEX + 1].clone(),
+        plan.pubkeys[TICK_ARRAY_START_INDEX + 2].clone(),
+        plan.pubkeys[TICK_ARRAY_START_INDEX + 3].clone(),
+        plan.pubkeys[TICK_ARRAY_START_INDEX + 4].clone(),
+        orca_o2::oracle_pda(&observation.pubkey)?,
+    ])
 }
 
 fn build_orca_snapshot_plan(
