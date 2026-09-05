@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly TOOLCHAIN="1.80.0"
-
 if ! command -v rustup >/dev/null 2>&1; then
   echo "rustup is required to run Scout's Rust preflight." >&2
   exit 1
 fi
 
-rustup toolchain install "${TOOLCHAIN}" \
-  --profile minimal \
-  --component rustfmt \
-  --component clippy
+rustup show active-toolchain
 
-cargo_180() {
-  rustup run "${TOOLCHAIN}" cargo "$@"
-}
+echo "Scout Rust preflight toolchain:"
+rustc --version
 
-echo "Resolving Rust ${TOOLCHAIN} dependencies..."
-cargo_180 generate-lockfile
-cargo_180 update -p tinyvec --precise 1.12.0
+echo "Scout rustfmt:"
+rustfmt --version
 
-echo "Checking Rust ${TOOLCHAIN} formatting..."
-cargo_180 fmt --all -- --check
+echo "Scout Clippy:"
+cargo clippy --version
+
+echo "Resolving repository-pinned Rust dependencies..."
+cargo generate-lockfile
+cargo update -p tinyvec --precise 1.12.0
+
+echo "Checking repository-pinned Rust formatting..."
+cargo fmt --all -- --check
 
 echo "Running Clippy..."
-cargo_180 clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 echo "Running workspace tests..."
-cargo_180 test --locked --workspace --all-targets
+cargo test --locked --workspace --all-targets
 
 echo "Running read-only capability tripwire..."
 if grep -RniE \
@@ -40,4 +40,4 @@ then
   exit 1
 fi
 
-echo "Scout Rust ${TOOLCHAIN} preflight passed."
+echo "Scout repository-pinned Rust preflight passed."
