@@ -1,7 +1,10 @@
 use crate::pumpswap::{self, PumpSwapHydrationSnapshot};
 use crate::raydium::{self, RaydiumHydrationSnapshot};
 use crate::route::{RouteLeg, TwoLegRouteCandidate};
-use orca_whirlpools_core::ExactInSwapQuote;
+use orca_whirlpools_core::{
+    swap_quote_by_input_token, ExactInSwapQuote, OracleFacade, TickArrayFacade, TickArrays,
+    TransferFee, WhirlpoolFacade,
+};
 use scout_core::{
     AdapterCapabilities, AuxiliaryStateKind, CapabilityState, ContentionFootprintState,
     LiquidityModel, NormalizedPoolState, PoolTradingState, QuoteReserveState, Venue,
@@ -19,6 +22,11 @@ pub enum VenueFeeComponents {
         lp_fee_raw: u64,
         protocol_fee_raw: u64,
         creator_fee_raw: u64,
+    },
+    Orca {
+        trade_fee_raw: u64,
+        trade_fee_rate_min: u32,
+        trade_fee_rate_max: u32,
     },
 }
 
@@ -41,6 +49,14 @@ impl VenueFeeComponents {
             } => format!(
                 "lp_fee_raw={lp_fee_raw} protocol_fee_raw={protocol_fee_raw} \
                  creator_fee_raw={creator_fee_raw}"
+            ),
+            Self::Orca {
+                trade_fee_raw,
+                trade_fee_rate_min,
+                trade_fee_rate_max,
+            } => format!(
+                "trade_fee_raw={trade_fee_raw} trade_fee_rate_min={trade_fee_rate_min} \
+                 trade_fee_rate_max={trade_fee_rate_max}"
             ),
         }
     }
@@ -109,6 +125,7 @@ impl TwoLegRouteQuote {
     }
 }
 
+#[allow(dead_code)]
 pub enum VenueQuoteContext<'a> {
     Raydium {
         pool_id: String,
@@ -117,6 +134,9 @@ pub enum VenueQuoteContext<'a> {
     PumpSwap {
         pool_id: String,
         snapshot: &'a PumpSwapHydrationSnapshot,
+    },
+    Orca {
+        snapshot: &'a OrcaQuoteSnapshot,
     },
 }
 
@@ -232,8 +252,8 @@ impl OrcaQuoteReadinessEvidence {
             return Err("Orca O2 readiness evidence requires a nonzero source slot".to_owned());
         }
 
-        validate_orca_o2_quote("A-to-B", &quote_a_to_b)?;
-        validate_orca_o2_quote("B-to-A", &quote_b_to_a)?;
+        validate_orca_exact_input_quote("O2 A-to-B readiness", &quote_a_to_b)?;
+        validate_orca_exact_input_quote("O2 B-to-A readiness", &quote_b_to_a)?;
 
         Ok(Self {
             pool_id: pool_id.to_owned(),
@@ -267,49 +287,42 @@ impl OrcaQuoteReadinessEvidence {
             ));
         }
 
-        validate_orca_o2_quote("A-to-B", &self.quote_a_to_b)?;
-        validate_orca_o2_quote("B-to-A", &self.quote_b_to_a)?;
+        validate_orca_exact_input_quote("O2 A-to-B readiness", &self.quote_a_to_b)?;
+        validate_orca_exact_input_quote("O2 B-to-A readiness", &self.quote_b_to_a)?;
 
         Ok(())
     }
 }
 
-#[allow(dead_code)]
-fn validate_orca_o2_quote(label: &str, quote: &ExactInSwapQuote) -> Result<(), String> {
+fn validate_orca_exact_input_quote(
+    label: &str,
+    quote: &ExactInSwapQuote,
+) -> Result<(), String> {
     if quote.token_in == 0 {
-        return Err(format!(
-            "Orca O2 {label} readiness quote has zero token input"
-        ));
+        return Err(format!("Orca {label} quote has zero token input"));
     }
 
     if quote.token_est_out == 0 {
-        return Err(format!(
-            "Orca O2 {label} readiness quote has zero estimated output"
-        ));
+        return Err(format!("Orca {label} quote has zero estimated output"));
     }
 
     if quote.token_min_out > quote.token_est_out {
         return Err(format!(
-            "Orca O2 {label} readiness quote minimum output exceeds estimated output"
+            "Orca {label} quote minimum output exceeds estimated output"
         ));
     }
 
     if quote.trade_fee > quote.token_in {
-        return Err(format!(
-            "Orca O2 {label} readiness quote trade fee exceeds token input"
-        ));
+        return Err(format!("Orca {label} quote trade fee exceeds token input"));
     }
 
     if quote.trade_fee_rate_min > quote.trade_fee_rate_max {
-        return Err(format!(
-            "Orca O2 {label} readiness quote fee-rate bounds are inverted"
-        ));
+        return Err(format!("Orca {label} quote fee-rate bounds are inverted"));
     }
 
     Ok(())
 }
 
-#[allow(dead_code)]
 fn orca_clmm_capabilities() -> AdapterCapabilities {
     AdapterCapabilities {
         liquidity_model: LiquidityModel::Clmm,
@@ -322,7 +335,6 @@ fn orca_clmm_capabilities() -> AdapterCapabilities {
     }
 }
 
-#[allow(dead_code)]
 pub fn orca_quote_readiness_for_pool(
     pool: &NormalizedPoolState,
     evidence: &OrcaQuoteReadinessEvidence,
@@ -362,6 +374,105 @@ pub fn orca_quote_readiness_for_pool(
 
     readiness.validate_for_pool(pool)?;
     Ok(readiness)
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrcaQuoteSnapshot {
+    pool_id: String,
+    token_a_mint: String,
+    token_b_mint: String,
+    token_a_decimals: u8,
+    token_b_decimals: u8,
+    source_slot: u64,
+    whirlpool: WhirlpoolFacade,
+    tick_arrays: [TickArrayFacade; 5],
+    timestamp: u64,
+    oracle: Option<OracleFacade>,
+    transfer_fee_a: Option<TransferFee>,
+    transfer_fee_b: Option<TransferFee>,
+}
+
+#[allow(dead_code)]
+impl OrcaQuoteSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_o2_hydration(
+        pool: &NormalizedPoolState,
+        evidence: &OrcaQuoteReadinessEvidence,
+        source_slot: u64,
+        token_a_decimals: u8,
+        token_b_decimals: u8,
+        whirlpool: WhirlpoolFacade,
+        tick_arrays: [TickArrayFacade; 5],
+        timestamp: u64,
+        oracle: Option<OracleFacade>,
+        transfer_fee_a: Option<TransferFee>,
+        transfer_fee_b: Option<TransferFee>,
+    ) -> Result<Self, String> {
+        let readiness = orca_quote_readiness_for_pool(pool, evidence)?;
+
+        if source_slot != readiness.source_slot {
+            return Err(format!(
+                "Orca quote snapshot slot mismatch: readiness={} snapshot={source_slot}",
+                readiness.source_slot
+            ));
+        }
+
+        if token_a_decimals != pool.token_a.decimals {
+            return Err(format!(
+                "Orca quote snapshot token A decimals mismatch: pool={} snapshot={token_a_decimals}",
+                pool.token_a.decimals
+            ));
+        }
+
+        if token_b_decimals != pool.token_b.decimals {
+            return Err(format!(
+                "Orca quote snapshot token B decimals mismatch: pool={} snapshot={token_b_decimals}",
+                pool.token_b.decimals
+            ));
+        }
+
+        if whirlpool.tick_spacing == 0 {
+            return Err("Orca quote snapshot tick spacing must be greater than zero".to_owned());
+        }
+
+        match (whirlpool.is_initialized_with_adaptive_fee(), oracle) {
+            (true, None) => {
+                return Err("adaptive-fee Orca Whirlpool requires Oracle state".to_owned());
+            }
+            (false, Some(_)) => {
+                return Err("non-adaptive Orca Whirlpool must not receive Oracle state".to_owned());
+            }
+            _ => {}
+        }
+
+        if let Some(oracle_state) = oracle {
+            if oracle_state.trade_enable_timestamp > timestamp {
+                return Err(format!(
+                    concat!(
+                        "adaptive-fee Orca Whirlpool trading is not enabled yet: ",
+                        "trade_enable_timestamp={} quote_timestamp={}"
+                    ),
+                    oracle_state.trade_enable_timestamp, timestamp
+                ));
+            }
+        }
+
+        Ok(Self {
+            pool_id: readiness.pool_id,
+            token_a_mint: readiness.token_a_mint,
+            token_b_mint: readiness.token_b_mint,
+            token_a_decimals,
+            token_b_decimals,
+            source_slot,
+            whirlpool,
+            tick_arrays,
+            timestamp,
+            oracle,
+            transfer_fee_a,
+            transfer_fee_b,
+        })
+    }
 }
 
 trait ExactInputQuoteAdapter {
@@ -552,6 +663,149 @@ impl ExactInputQuoteAdapter for PumpSwapQuoteAdapter<'_> {
     }
 }
 
+struct OrcaQuoteAdapter<'a> {
+    snapshot: &'a OrcaQuoteSnapshot,
+}
+
+impl<'a> OrcaQuoteAdapter<'a> {
+    fn new(snapshot: &'a OrcaQuoteSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    fn adapter_capabilities() -> AdapterCapabilities {
+        orca_clmm_capabilities()
+    }
+}
+
+impl ExactInputQuoteAdapter for OrcaQuoteAdapter<'_> {
+    fn venue(&self) -> Venue {
+        Venue::Orca
+    }
+
+    fn pool_id(&self) -> &str {
+        self.snapshot.pool_id.as_str()
+    }
+
+    fn source_slot(&self) -> u64 {
+        self.snapshot.source_slot
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        Self::adapter_capabilities()
+    }
+
+    fn contains_pair(&self, input_mint: &str, output_mint: &str) -> bool {
+        let mint_a = self.snapshot.token_a_mint.as_str();
+        let mint_b = self.snapshot.token_b_mint.as_str();
+
+        (mint_a == input_mint && mint_b == output_mint)
+            || (mint_b == input_mint && mint_a == output_mint)
+    }
+
+    #[cfg(test)]
+    fn mint_decimals(&self, mint: &str) -> Result<u8, String> {
+        if mint == self.snapshot.token_a_mint {
+            Ok(self.snapshot.token_a_decimals)
+        } else if mint == self.snapshot.token_b_mint {
+            Ok(self.snapshot.token_b_decimals)
+        } else {
+            Err(format!("mint {mint} is not in Orca quote context"))
+        }
+    }
+
+    fn quote_exact_input(
+        &self,
+        input_mint: &str,
+        amount_in_raw: u64,
+    ) -> Result<VenueLegQuote, String> {
+        if amount_in_raw == 0 {
+            return Err("Orca exact-input quote amount must be greater than zero".to_owned());
+        }
+
+        let specified_token_a = if input_mint == self.snapshot.token_a_mint {
+            true
+        } else if input_mint == self.snapshot.token_b_mint {
+            false
+        } else {
+            return Err(format!(
+                "input mint {input_mint} is not part of the Orca Whirlpool"
+            ));
+        };
+
+        let quote = swap_quote_by_input_token(
+            amount_in_raw,
+            specified_token_a,
+            0,
+            self.snapshot.whirlpool,
+            self.snapshot.oracle,
+            TickArrays::Five(
+                self.snapshot.tick_arrays[0],
+                self.snapshot.tick_arrays[1],
+                self.snapshot.tick_arrays[2],
+                self.snapshot.tick_arrays[3],
+                self.snapshot.tick_arrays[4],
+            ),
+            self.snapshot.timestamp,
+            self.snapshot.transfer_fee_a,
+            self.snapshot.transfer_fee_b,
+        )
+        .map_err(|error| {
+            format!(
+                concat!(
+                    "Orca authoritative exact-input quote failed: pool={} ",
+                    "input_mint={} amount_in_raw={} error={error:?}"
+                ),
+                self.snapshot.pool_id, input_mint, amount_in_raw
+            )
+        })?;
+
+        orca_leg_quote_from_core(
+            self.snapshot.pool_id.as_str(),
+            self.snapshot.source_slot,
+            amount_in_raw,
+            quote,
+        )
+    }
+}
+
+fn orca_leg_quote_from_core(
+    pool_id: &str,
+    source_slot: u64,
+    amount_in_requested_raw: u64,
+    quote: ExactInSwapQuote,
+) -> Result<VenueLegQuote, String> {
+    validate_orca_exact_input_quote("universal-dispatch exact-input", &quote)?;
+
+    if quote.token_in > amount_in_requested_raw {
+        return Err(format!(
+            concat!(
+                "Orca authoritative quote consumed more input than requested: ",
+                "pool={} requested={} consumed={}"
+            ),
+            pool_id, amount_in_requested_raw, quote.token_in
+        ));
+    }
+
+    let amount_in_unspent_raw = amount_in_requested_raw
+        .checked_sub(quote.token_in)
+        .ok_or_else(|| "Orca universal quote input subtraction underflow".to_owned())?;
+
+    Ok(VenueLegQuote {
+        venue: Venue::Orca,
+        pool_id: pool_id.to_owned(),
+        amount_in_requested_raw,
+        amount_in_consumed_raw: quote.token_in,
+        amount_in_unspent_raw,
+        amount_out_raw: quote.token_est_out,
+        fees: VenueFeeComponents::Orca {
+            trade_fee_raw: quote.trade_fee,
+            trade_fee_rate_min: quote.trade_fee_rate_min,
+            trade_fee_rate_max: quote.trade_fee_rate_max,
+        },
+        quote_source_slot: source_slot,
+    })
+}
+
 fn with_quote_adapter<T>(
     context: &VenueQuoteContext<'_>,
     operation: impl FnOnce(&dyn ExactInputQuoteAdapter) -> T,
@@ -563,6 +817,10 @@ fn with_quote_adapter<T>(
         }
         VenueQuoteContext::PumpSwap { pool_id, snapshot } => {
             let adapter = PumpSwapQuoteAdapter::new(pool_id.as_str(), snapshot);
+            operation(&adapter)
+        }
+        VenueQuoteContext::Orca { snapshot } => {
+            let adapter = OrcaQuoteAdapter::new(snapshot);
             operation(&adapter)
         }
     }
@@ -790,6 +1048,7 @@ mod tests {
     use crate::pumpswap::{PumpSwapFeeConfig, PumpSwapFeeTier, PumpSwapFees, PumpSwapPoolState};
     use crate::raydium::{RaydiumAmmConfig, RaydiumCpmmPoolState};
     use crate::route::{generate_two_leg_routes, WRAPPED_SOL_MINT};
+    use orca_whirlpools_core::{TickFacade, TICK_ARRAY_SIZE};
     use scout_core::NormalizedToken;
 
     const TEST_MINT: &str = "ApZuxdpzMrbEYTGEzeY9afh5pj9d6qPRJCTgQYiipbKg";
@@ -940,6 +1199,74 @@ mod tests {
         }
     }
 
+    fn orca_pool() -> NormalizedPoolState {
+        let mut pool = normalized_pool(
+            Venue::Orca,
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        pool.quote_reserves = QuoteReserveState::Unavailable;
+        pool
+    }
+
+    fn orca_evidence() -> Result<OrcaQuoteReadinessEvidence, String> {
+        OrcaQuoteReadinessEvidence::from_o2_quotes(
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            101,
+            orca_exact_input_quote(1_000_000, 12_108_498),
+            orca_exact_input_quote(1_000_000, 82_091),
+        )
+    }
+
+    fn orca_tick_array(start_tick_index: i32) -> TickArrayFacade {
+        TickArrayFacade {
+            start_tick_index,
+            ticks: [TickFacade::default(); TICK_ARRAY_SIZE],
+        }
+    }
+
+    fn orca_tick_arrays() -> [TickArrayFacade; 5] {
+        [
+            orca_tick_array(0),
+            orca_tick_array(5_632),
+            orca_tick_array(11_264),
+            orca_tick_array(-5_632),
+            orca_tick_array(-11_264),
+        ]
+    }
+
+    fn orca_whirlpool() -> WhirlpoolFacade {
+        let mut whirlpool = WhirlpoolFacade::default();
+        whirlpool.tick_spacing = 64;
+        whirlpool.fee_tier_index_seed = 64u16.to_le_bytes();
+        whirlpool
+    }
+
+    fn orca_snapshot() -> Result<OrcaQuoteSnapshot, String> {
+        let pool = orca_pool();
+        let evidence = orca_evidence()?;
+
+        OrcaQuoteSnapshot::from_o2_hydration(
+            &pool,
+            &evidence,
+            101,
+            9,
+            6,
+            orca_whirlpool(),
+            orca_tick_arrays(),
+            1_700_000_000,
+            None,
+            None,
+            None,
+        )
+    }
+
     fn route_candidates() -> Vec<TwoLegRouteCandidate> {
         generate_two_leg_routes(&[
             normalized_pool(
@@ -1076,6 +1403,107 @@ mod tests {
             pump_capabilities,
             PumpSwapQuoteAdapter::adapter_capabilities()
         );
+    }
+
+    #[test]
+    fn universal_dispatch_exposes_orca_clmm_capabilities() -> Result<(), String> {
+        let snapshot = orca_snapshot()?;
+        let context = VenueQuoteContext::Orca {
+            snapshot: &snapshot,
+        };
+
+        let capabilities = with_quote_adapter(&context, |adapter| adapter.capabilities());
+
+        assert_eq!(capabilities, orca_clmm_capabilities());
+        assert_eq!(capabilities.liquidity_model, LiquidityModel::Clmm);
+        assert_eq!(capabilities.auxiliary_state, AuxiliaryStateKind::Ticks);
+        assert_eq!(
+            capabilities.contention_footprint,
+            ContentionFootprintState::Incomplete
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn orca_core_quote_mapping_preserves_partial_consumption_and_fee_evidence()
+        -> Result<(), String>
+    {
+        let native = ExactInSwapQuote {
+            token_in: 900_000,
+            token_est_out: 12_108_498,
+            token_min_out: 12_108_498,
+            trade_fee: 2_700,
+            trade_fee_rate_min: 3_000,
+            trade_fee_rate_max: 3_000,
+        };
+
+        let adapted = orca_leg_quote_from_core("orca-pool", 101, 1_000_000, native)?;
+
+        assert_eq!(
+            adapted,
+            VenueLegQuote {
+                venue: Venue::Orca,
+                pool_id: "orca-pool".to_owned(),
+                amount_in_requested_raw: 1_000_000,
+                amount_in_consumed_raw: 900_000,
+                amount_in_unspent_raw: 100_000,
+                amount_out_raw: 12_108_498,
+                fees: VenueFeeComponents::Orca {
+                    trade_fee_raw: 2_700,
+                    trade_fee_rate_min: 3_000,
+                    trade_fee_rate_max: 3_000,
+                },
+                quote_source_slot: 101,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn orca_core_quote_mapping_rejects_overconsumption() {
+        let native = ExactInSwapQuote {
+            token_in: 1_000_001,
+            token_est_out: 12_108_498,
+            token_min_out: 12_108_498,
+            trade_fee: 3_000,
+            trade_fee_rate_min: 3_000,
+            trade_fee_rate_max: 3_000,
+        };
+
+        let result = orca_leg_quote_from_core("orca-pool", 101, 1_000_000, native);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("consumed more input than requested")
+        ));
+    }
+
+    #[test]
+    fn orca_snapshot_rejects_adaptive_pool_without_oracle() -> Result<(), String> {
+        let pool = orca_pool();
+        let evidence = orca_evidence()?;
+        let mut whirlpool = orca_whirlpool();
+        whirlpool.fee_tier_index_seed = 65u16.to_le_bytes();
+
+        let result = OrcaQuoteSnapshot::from_o2_hydration(
+            &pool,
+            &evidence,
+            101,
+            9,
+            6,
+            whirlpool,
+            orca_tick_arrays(),
+            1_700_000_000,
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("requires Oracle state")
+        ));
+        Ok(())
     }
 
     #[test]
