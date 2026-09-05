@@ -2096,6 +2096,7 @@ async fn route_priority_observation(
         },
         Venue::PumpSwap => None,
         Venue::Orca => None,
+        Venue::Meteora => None,
     };
 
     let leg_2_raydium = match leg_2.venue() {
@@ -2116,6 +2117,7 @@ async fn route_priority_observation(
         },
         Venue::PumpSwap => None,
         Venue::Orca => None,
+        Venue::Meteora => None,
     };
 
     let footprint = match costs::route_contention_footprint(
@@ -2421,3 +2423,4 @@ mod tests {
         assert_eq!(parse_retry_after_seconds("invalid"), None);
     }
 }
+
