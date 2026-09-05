@@ -18,8 +18,8 @@ mod sizing;
 use discovery::{parse_raydium_pair_lookup_response, raydium_pair_lookup_requests};
 use futures_util::{SinkExt, StreamExt};
 use quote::{
-    quote_readiness_for_pool, quote_two_leg_exact_input, ExactInputQuoteAdapter,
-    OrcaQuoteSnapshot, QuoteReadiness, VenueQuoteContext,
+    quote_readiness_for_pool, quote_two_leg_exact_input, ExactInputQuoteAdapter, OrcaQuoteSnapshot,
+    QuoteReadiness, VenueQuoteContext,
 };
 use registry::ActiveMintRegistry;
 use reqwest::{header::RETRY_AFTER, Client, StatusCode};
@@ -667,11 +667,7 @@ async fn discover_orca_cross_venue_counterpart(
             };
 
             for observation in observations {
-                if !raydium_observation_matches_pair(
-                    &observation,
-                    anchor_mint,
-                    intermediate_mint,
-                ) {
+                if !raydium_observation_matches_pair(&observation, anchor_mint, intermediate_mint) {
                     continue;
                 }
 
@@ -748,11 +744,8 @@ async fn discover_orca_cross_venue_counterpart(
             };
 
             for observation in observations {
-                if !pumpswap_observation_matches_pair(
-                    &observation,
-                    anchor_mint,
-                    intermediate_mint,
-                ) {
+                if !pumpswap_observation_matches_pair(&observation, anchor_mint, intermediate_mint)
+                {
                     continue;
                 }
 
@@ -1641,15 +1634,11 @@ async fn validate_registry_routes_and_sizes(
 
     let mut registry = ActiveMintRegistry::new();
 
-    for state in raydium_states
-        .into_iter()
-        .chain(pumpswap_states)
-        .chain(
-            orca_prepared
-                .values()
-                .map(|prepared| prepared.normalized.clone()),
-        )
-    {
+    for state in raydium_states.into_iter().chain(pumpswap_states).chain(
+        orca_prepared
+            .values()
+            .map(|prepared| prepared.normalized.clone()),
+    ) {
         let readiness = quote_readiness_from_contexts(
             &state,
             raydium_quote_contexts,
@@ -2159,10 +2148,7 @@ async fn validate_registry_routes_and_sizes(
     }
 
     let shadow_output = shadow_recorder.finish()?;
-    println!(
-        "rung12_shadow_output_complete: {}",
-        shadow_output.display()
-    );
+    println!("rung12_shadow_output_complete: {}", shadow_output.display());
     recorder::validate_jsonl_replay(&shadow_output)?;
     println!("READ-ONLY RUNG 12 SHADOW RECORDER PASS");
 
@@ -2485,317 +2471,4 @@ async fn route_priority_observation(
     }
 
     let leg_1_raydium = match leg_1_context {
-        RuntimeQuoteContext::Cpmm(VenueQuoteContext::Raydium { snapshot, .. }) => Some(*snapshot),
-        RuntimeQuoteContext::Cpmm(VenueQuoteContext::PumpSwap { .. }) => None,
-        RuntimeQuoteContext::Orca(_) => None,
-    };
-
-    let leg_2_raydium = match leg_2_context {
-        RuntimeQuoteContext::Cpmm(VenueQuoteContext::Raydium { snapshot, .. }) => Some(*snapshot),
-        RuntimeQuoteContext::Cpmm(VenueQuoteContext::PumpSwap { .. }) => None,
-        RuntimeQuoteContext::Orca(_) => None,
-    };
-
-    let footprint = match costs::route_contention_footprint(
-        costs::VenueContentionInput {
-            venue: leg_1.venue(),
-            pool_id: leg_1.pool_id(),
-            raydium_snapshot: leg_1_raydium,
-        },
-        costs::VenueContentionInput {
-            venue: leg_2.venue(),
-            pool_id: leg_2.pool_id(),
-            raydium_snapshot: leg_2_raydium,
-        },
-    ) {
-        Ok(footprint) => footprint,
-        Err(error) => {
-            println!(
-                concat!(
-                    "rung11c_priority_scope_unknown: leg1_pool={} leg2_pool={} ",
-                    "reason={}"
-                ),
-                leg_1.pool_id(),
-                leg_2.pool_id(),
-                error
-            );
-            return costs::PriorityObservationState::Unavailable(error);
-        }
-    };
-
-    println!("rung11c_priority_scope: {}", footprint.summary());
-
-    let cache_key = footprint.accounts().to_vec();
-    if let Some(cached) = cache.get(&cache_key) {
-        println!(
-            "rung11c_priority_observation_cache_hit: account_count={}",
-            cache_key.len()
-        );
-        return cached.clone();
-    }
-
-    let observation = fetch_localized_priority_observation(rpc_client, &footprint).await;
-    cache.insert(cache_key, observation.clone());
-    observation
-}
-
-async fn fetch_localized_priority_observation(
-    rpc_client: &Client,
-    footprint: &costs::DeterministicVenueContentionFootprint,
-) -> costs::PriorityObservationState {
-    let request = costs::localized_priority_fee_request(footprint);
-    let started_at = Instant::now();
-
-    println!(
-        concat!(
-            "rpc_request_start: label=Rung11C localized priority ",
-            "method=getRecentPrioritizationFees account_count={}"
-        ),
-        footprint.accounts().len()
-    );
-
-    let response = match rpc_client.post(SOLANA_RPC_URL).json(&request).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            let reason = format!(
-                "localized priority RPC request failed after {} ms: {error}",
-                started_at.elapsed().as_millis()
-            );
-            println!("rung11c_priority_observation_unavailable: {reason}");
-            return costs::PriorityObservationState::Unavailable(reason);
-        }
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        let reason = format!(
-            "localized priority RPC returned HTTP status {status} after {} ms",
-            started_at.elapsed().as_millis()
-        );
-        println!("rung11c_priority_observation_unavailable: {reason}");
-        return costs::PriorityObservationState::Unavailable(reason);
-    }
-
-    let payload = match response.json::<Value>().await {
-        Ok(payload) => payload,
-        Err(error) => {
-            let reason = format!(
-                "localized priority RPC returned invalid JSON after {} ms: {error}",
-                started_at.elapsed().as_millis()
-            );
-            println!("rung11c_priority_observation_unavailable: {reason}");
-            return costs::PriorityObservationState::Unavailable(reason);
-        }
-    };
-
-    match costs::parse_localized_priority_fee_response(&payload, footprint) {
-        Ok(observation) => {
-            println!("rung11c_priority_observation: {}", observation.summary());
-
-            match costs::select_priority_fee(&observation) {
-                Ok(Some(selection)) => {
-                    println!("rung11c_priority_selection: {}", selection.summary());
-                }
-                Ok(None) => {
-                    println!("rung11c_priority_selection_unknown: no positive localized samples");
-                }
-                Err(error) => {
-                    println!("rung11c_priority_selection_rejected: {error}");
-                    return costs::PriorityObservationState::Unavailable(error);
-                }
-            }
-
-            costs::PriorityObservationState::Available(observation)
-        }
-        Err(error) => {
-            println!("rung11c_priority_observation_unavailable: {error}");
-            costs::PriorityObservationState::Unavailable(error)
-        }
-    }
-}
-
-async fn fetch_hydration<const N: usize>(
-    rpc_client: &Client,
-    request_id: u64,
-    account_pubkeys: [String; N],
-    min_context_slot: u64,
-    venue: &str,
-) -> Result<Value, String> {
-    let account_pubkeys = account_pubkeys.to_vec();
-
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "getMultipleAccounts",
-        "params": [
-            account_pubkeys,
-            {
-                "commitment": "processed",
-                "encoding": "base64",
-                "minContextSlot": min_context_slot
-            }
-        ]
-    });
-
-    let started_at = Instant::now();
-
-    println!(
-        "rpc_request_start: label={} hydration id={} method=getMultipleAccounts account_count={}",
-        venue, request_id, N
-    );
-
-    let response = rpc_client
-        .post(SOLANA_RPC_URL)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|error| {
-            format!(
-                "{venue} hydration RPC request failed after {} ms: {error}",
-                started_at.elapsed().as_millis()
-            )
-        })?;
-
-    let status = response.status();
-
-    if !status.is_success() {
-        return Err(format!(
-            "{venue} hydration RPC returned HTTP status {status} after {} ms",
-            started_at.elapsed().as_millis()
-        ));
-    }
-
-    let payload = response.json::<Value>().await.map_err(|error| {
-        format!(
-            "{venue} hydration RPC returned invalid JSON after {} ms: {error}",
-            started_at.elapsed().as_millis()
-        )
-    })?;
-
-    println!(
-        concat!(
-            "rpc_request_finish: label={} hydration id={} status={} ",
-            "elapsed_ms={} rpc_error={}"
-        ),
-        venue,
-        request_id,
-        status,
-        started_at.elapsed().as_millis(),
-        payload.get("error").is_some()
-    );
-
-    Ok(payload)
-}
-
-fn unix_time_ms_now() -> Result<u64, String> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock before Unix epoch: {error}"))?;
-
-    u64::try_from(duration.as_millis())
-        .map_err(|_| "Unix timestamp milliseconds exceeded u64".to_owned())
-}
-
-fn unix_time_seconds_now() -> Result<i64, String> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("system clock before Unix epoch: {error}"))?;
-
-    i64::try_from(duration.as_secs()).map_err(|_| "Unix timestamp seconds exceeded i64".to_owned())
-}
-
-async fn wait_for_subscription_confirmation<S>(
-    reader: &mut S,
-    request_id: u64,
-    label: &str,
-) -> Result<(), String>
-where
-    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    loop {
-        let payload = next_json_message(reader).await?;
-
-        if payload.get("id").and_then(Value::as_u64) != Some(request_id) {
-            continue;
-        }
-
-        if let Some(error) = payload.get("error") {
-            return Err(format!("{label} subscription rejected: {error}"));
-        }
-
-        let subscription_id = payload
-            .get("result")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("{label} subscription response missing id"))?;
-
-        println!("{label}_subscription_id={subscription_id}");
-        return Ok(());
-    }
-}
-
-async fn next_json_message<S>(reader: &mut S) -> Result<Value, String>
-where
-    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    loop {
-        let next_message = timeout(OBSERVATION_TIMEOUT, reader.next())
-            .await
-            .map_err(|_| "timed out waiting for Solana data".to_owned())?
-            .ok_or_else(|| "Solana WebSocket stream closed".to_owned())?
-            .map_err(|error| format!("WebSocket receive error: {error}"))?;
-
-        if !next_message.is_text() {
-            continue;
-        }
-
-        let text = next_message
-            .into_text()
-            .map_err(|error| format!("invalid text frame: {error}"))?;
-
-        return serde_json::from_str(&text).map_err(|error| format!("invalid JSON: {error}"));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn complete_search_without_incomplete_probes_reports_no_overlap() {
-        let completeness = DiscoveryCompleteness::default();
-
-        assert_eq!(
-            completeness.terminal_error(),
-            "Rung 9 bounded bidirectional exact-pair discovery complete with no live Raydium-PumpSwap same-pair overlap"
-        );
-    }
-
-    #[test]
-    fn incomplete_search_preserves_count_and_first_cause() {
-        let mut completeness = DiscoveryCompleteness::default();
-
-        completeness.record_incomplete("first transport failure".to_owned());
-        completeness.record_incomplete("later parsing failure".to_owned());
-
-        assert_eq!(completeness.incomplete_probe_count, 2);
-        assert_eq!(
-            completeness.first_cause.as_deref(),
-            Some("first transport failure")
-        );
-        assert_eq!(
-            completeness.terminal_error(),
-            "Rung 9 deterministic discovery incomplete: incomplete_probe_count=2 first_cause=first transport failure"
-        );
-    }
-
-    #[test]
-    fn retry_after_accepts_integer_seconds_only() {
-        assert_eq!(parse_retry_after_seconds("3"), Some(3));
-        assert_eq!(parse_retry_after_seconds(" 7 "), Some(7));
-        assert_eq!(
-            parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"),
-            None
-        );
-        assert_eq!(parse_retry_after_seconds("invalid"), None);
-    }
-}
+        RuntimeQuoteContext::
