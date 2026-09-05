@@ -149,6 +149,8 @@ fn observe_mint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quote::{orca_quote_readiness_for_pool, OrcaQuoteReadinessEvidence};
+    use orca_whirlpools_core::ExactInSwapQuote;
     use scout_core::{
         AdapterCapabilities, AuxiliaryStateKind, CapabilityState, ContentionFootprintState,
         LiquidityModel, NormalizedToken, PoolTradingState, QuoteReserveState,
@@ -222,6 +224,17 @@ mod tests {
 
     fn readiness(pool: &NormalizedPoolState) -> QuoteReadiness {
         QuoteReadiness::synthetic_for_test(pool, cpmm_capabilities())
+    }
+
+    fn orca_exact_input_quote(token_in: u64, token_est_out: u64) -> ExactInSwapQuote {
+        ExactInSwapQuote {
+            token_in,
+            token_est_out,
+            token_min_out: token_est_out,
+            trade_fee: token_in / 1_000,
+            trade_fee_rate_min: 3_000,
+            trade_fee_rate_max: 3_000,
+        }
     }
 
     #[test]
@@ -533,32 +546,42 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_clmm_ticks_readiness_is_eligible_without_cpmm_reserves() -> Result<(), String> {
+    fn orca_o2_readiness_admits_clmm_pool_and_activates_shared_mint() -> Result<(), String> {
         let mut registry = ActiveMintRegistry::new();
 
-        let mut pool = sample_pool(Venue::Orca, "orca-pool", 20, PoolTradingState::Tradable);
-        pool.quote_reserves = QuoteReserveState::Unavailable;
-
-        let readiness = QuoteReadiness::synthetic_for_test(
-            &pool,
-            AdapterCapabilities {
-                liquidity_model: LiquidityModel::Clmm,
-                exact_input_quote: CapabilityState::Supported,
-                spl_token: CapabilityState::Supported,
-                token_2022: CapabilityState::RequiresHydration,
-                transfer_fee: CapabilityState::RequiresHydration,
-                auxiliary_state: AuxiliaryStateKind::Ticks,
-                contention_footprint: ContentionFootprintState::Incomplete,
-            },
+        let raydium = sample_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            20,
+            PoolTradingState::Tradable,
         );
 
-        registry.upsert(pool, Some(readiness))?;
+        let mut orca = sample_pool(Venue::Orca, "orca-pool", 21, PoolTradingState::Tradable);
+        orca.quote_reserves = QuoteReserveState::Unavailable;
+
+        let evidence = OrcaQuoteReadinessEvidence::from_o2_quotes(
+            "orca-pool",
+            SHARED_MINT,
+            OTHER_MINT,
+            21,
+            orca_exact_input_quote(1_000_000, 12_108_498),
+            orca_exact_input_quote(1_000_000, 82_091),
+        )?;
+        let orca_readiness = orca_quote_readiness_for_pool(&orca, &evidence)?;
+
+        registry.upsert(raydium.clone(), Some(readiness(&raydium)))?;
+        registry.upsert(orca, Some(orca_readiness))?;
 
         let eligible = registry.current_eligible_pools();
+        assert_eq!(eligible.len(), 2);
+        assert!(eligible.iter().any(|pool| {
+            pool.venue == Venue::Orca
+                && pool.pool_id == "orca-pool"
+                && pool.quote_reserves == QuoteReserveState::Unavailable
+        }));
 
-        assert_eq!(eligible.len(), 1);
-        assert_eq!(eligible[0].venue, Venue::Orca);
-        assert_eq!(eligible[0].pool_id, "orca-pool");
+        let active = registry.active_mints();
+        assert!(active.iter().any(|mint| mint.mint == SHARED_MINT));
 
         Ok(())
     }
