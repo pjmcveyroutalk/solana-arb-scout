@@ -1667,41 +1667,41 @@ async fn validate_registry_routes_and_sizes(
             continue;
         };
 
-        let priority_observation =
-            if let Some(observation) = route_priority_observations.get(&record.route_index) {
-                observation
-            } else {
-                let reason = "missing priority observation state";
-                println!(
-                    "rung11c_cost_model_rejected: route=[{}] reason={reason}",
-                    route_candidate.summary()
-                );
-                let missing_priority =
-                    costs::PriorityObservationState::Unavailable(reason.to_owned());
-                let economics_complete_at_unix_ms = unix_time_ms_now()?;
-                shadow_recorder.record_economics_evaluation(
-                    route_candidate,
-                    record.dollars,
-                    record.anchor_decimals,
-                    &record.route_quote,
-                    None,
-                    Some(reason),
-                    None,
-                    None,
-                    &missing_priority,
-                    &jito_observation,
-                    recorder::CandidateTiming {
-                        candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
-                        quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
-                        economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
-                        hypothetical_ready_at_unix_ms: None,
-                    },
-                    &usd_prices.sol,
-                    usd_prices.usdc.as_ref(),
-                    usd_prices.usdt.as_ref(),
-                )?;
-                continue;
-            };
+        let priority_observation = if let Some(observation) =
+            route_priority_observations.get(&record.route_index)
+        {
+            observation
+        } else {
+            let reason = "missing priority observation state";
+            println!(
+                "rung11c_cost_model_rejected: route=[{}] reason={reason}",
+                route_candidate.summary()
+            );
+            let missing_priority = costs::PriorityObservationState::Unavailable(reason.to_owned());
+            let economics_complete_at_unix_ms = unix_time_ms_now()?;
+            shadow_recorder.record_economics_evaluation(
+                route_candidate,
+                record.dollars,
+                record.anchor_decimals,
+                &record.route_quote,
+                None,
+                Some(reason),
+                None,
+                None,
+                &missing_priority,
+                &jito_observation,
+                recorder::CandidateTiming {
+                    candidate_found_at_unix_ms: record.candidate_found_at_unix_ms,
+                    quote_complete_at_unix_ms: Some(record.quote_complete_at_unix_ms),
+                    economics_complete_at_unix_ms: Some(economics_complete_at_unix_ms),
+                    hypothetical_ready_at_unix_ms: None,
+                },
+                &usd_prices.sol,
+                usd_prices.usdc.as_ref(),
+                usd_prices.usdt.as_ref(),
+            )?;
+            continue;
+        };
 
         let cost_model = match costs::economics_cost_model_with_usd_prices(
             route_candidate.anchor_mint(),
