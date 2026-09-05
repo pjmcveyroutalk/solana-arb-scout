@@ -1262,10 +1262,11 @@ mod tests {
     }
 
     fn orca_whirlpool() -> WhirlpoolFacade {
-        let mut whirlpool = WhirlpoolFacade::default();
-        whirlpool.tick_spacing = 64;
-        whirlpool.fee_tier_index_seed = 64u16.to_le_bytes();
-        whirlpool
+        WhirlpoolFacade {
+            tick_spacing: 64,
+            fee_tier_index_seed: 64u16.to_le_bytes(),
+            ..Default::default()
+        }
     }
 
     fn orca_snapshot() -> Result<OrcaQuoteSnapshot, String> {
@@ -1500,8 +1501,10 @@ mod tests {
     fn orca_snapshot_rejects_adaptive_pool_without_oracle() -> Result<(), String> {
         let pool = orca_pool();
         let evidence = orca_evidence()?;
-        let mut whirlpool = orca_whirlpool();
-        whirlpool.fee_tier_index_seed = 65u16.to_le_bytes();
+        let whirlpool = WhirlpoolFacade {
+            fee_tier_index_seed: 65u16.to_le_bytes(),
+            ..orca_whirlpool()
+        };
 
         let result = OrcaQuoteSnapshot::from_o2_hydration(
             &pool,
