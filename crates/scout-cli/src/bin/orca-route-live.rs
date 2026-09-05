@@ -28,7 +28,7 @@ use quote::{
 };
 use registry::ActiveMintRegistry;
 use reqwest::Client;
-use route::{generate_two_leg_routes, USDC_MINT, WRAPPED_SOL_MINT};
+use route::generate_two_leg_routes;
 use scout_core::{NormalizedPoolState, Venue};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -599,11 +599,11 @@ mod tests {
 
     #[test]
     fn anchor_pair_prefers_wrapped_sol() {
-        let pool = sample_orca_pool(USDC_MINT, WRAPPED_SOL_MINT);
+        let pool = sample_orca_pool(route::USDC_MINT, route::WRAPPED_SOL_MINT);
 
         assert_eq!(
             orca_live::anchor_pair(&pool),
-            Some((WRAPPED_SOL_MINT, USDC_MINT))
+            Some((route::WRAPPED_SOL_MINT, route::USDC_MINT))
         );
     }
 
