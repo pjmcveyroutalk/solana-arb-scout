@@ -1097,6 +1097,56 @@ mod tests {
             .ok_or_else(|| "test transfer fee exceeds amount".to_owned())
     }
 
+    fn independent_include_transfer_fee(
+        amount: u64,
+        transfer_fee: TransferFee,
+    ) -> Result<u64, String> {
+        if transfer_fee.fee_bps > 10_000 {
+            return Err("test transfer fee exceeds 10000 bps".to_owned());
+        }
+
+        if transfer_fee.fee_bps == 0 || amount == 0 {
+            return Ok(amount);
+        }
+
+        let fee_bps = u128::from(transfer_fee.fee_bps);
+        let denominator = 10_000u128
+            .checked_sub(fee_bps)
+            .ok_or_else(|| "test transfer fee denominator underflow".to_owned())?;
+
+        if denominator == 0 {
+            return amount
+                .checked_add(transfer_fee.max_fee)
+                .ok_or_else(|| "test capped transfer fee gross amount overflow".to_owned());
+        }
+
+        let numerator = u128::from(amount)
+            .checked_mul(10_000u128)
+            .ok_or_else(|| "test transfer fee gross numerator overflow".to_owned())?;
+
+        let rounded_numerator = numerator
+            .checked_add(
+                denominator
+                    .checked_sub(1)
+                    .ok_or_else(|| "test transfer fee gross rounding underflow".to_owned())?,
+            )
+            .ok_or_else(|| "test transfer fee gross rounding overflow".to_owned())?;
+
+        let uncapped_gross = rounded_numerator / denominator;
+        let uncapped_fee = uncapped_gross
+            .checked_sub(u128::from(amount))
+            .ok_or_else(|| "test transfer fee gross amount underflow".to_owned())?;
+
+        if uncapped_fee <= u128::from(transfer_fee.max_fee) {
+            return u64::try_from(uncapped_gross)
+                .map_err(|_| "test transfer fee gross amount does not fit u64".to_owned());
+        }
+
+        amount
+            .checked_add(transfer_fee.max_fee)
+            .ok_or_else(|| "test capped transfer fee gross amount overflow".to_owned())
+    }
+
     fn quote_arrays() -> [TickArrayFacade; 5] {
         [
             zeroed_tick_array(0),
@@ -1693,7 +1743,10 @@ mod tests {
             input_fee_a_to_b.token_est_out,
             baseline_a_to_b.token_est_out
         );
-        assert_eq!(input_fee_a_to_b.token_in, amount_in);
+        assert_eq!(
+            input_fee_a_to_b.token_in,
+            independent_include_transfer_fee(baseline_a_to_b.token_in, transfer_fee)?
+        );
 
         let baseline_full_a_to_b = quote_fixture(&pool, &pool.token_mint_a, amount_in, None, None)?;
         let expected_output_a_to_b =
@@ -1722,7 +1775,10 @@ mod tests {
             input_fee_b_to_a.token_est_out,
             baseline_b_to_a.token_est_out
         );
-        assert_eq!(input_fee_b_to_a.token_in, amount_in);
+        assert_eq!(
+            input_fee_b_to_a.token_in,
+            independent_include_transfer_fee(baseline_b_to_a.token_in, transfer_fee)?
+        );
 
         let baseline_full_b_to_a = quote_fixture(&pool, &pool.token_mint_b, amount_in, None, None)?;
         let expected_output_b_to_a =
@@ -1778,7 +1834,10 @@ mod tests {
             Some(output_fee),
         )?;
 
-        assert_eq!(both_fee_quote.token_in, amount_in);
+        let expected_token_in = independent_include_transfer_fee(baseline.token_in, input_fee)?;
+
+        assert_eq!(expected_token_in, 10_000);
+        assert_eq!(both_fee_quote.token_in, expected_token_in);
         assert_eq!(both_fee_quote.token_est_out, expected_output);
 
         Ok(())
