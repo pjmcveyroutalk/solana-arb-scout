@@ -7,6 +7,7 @@ mod orca;
 mod orca_live;
 mod orca_o2;
 mod orca_o2_quote_inputs;
+mod orca_priority;
 mod orca_runtime;
 mod pumpswap;
 mod quote;
@@ -1649,6 +1650,7 @@ async fn validate_registry_routes_and_sizes(
             route_candidate.leg_1(),
             route_candidate.leg_2(),
             raydium_quote_contexts,
+            orca_prepared,
             &mut priority_cache,
         )
         .await;
@@ -2054,28 +2056,20 @@ async fn route_priority_observation(
     leg_1: &RouteLeg,
     leg_2: &RouteLeg,
     raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
     cache: &mut BTreeMap<Vec<String>, costs::PriorityObservationState>,
 ) -> costs::PriorityObservationState {
     if leg_1.venue() == Venue::Orca || leg_2.venue() == Venue::Orca {
-        let reason = format!(
-            concat!(
-                "Orca priority contention footprint remains Unknown/fail-closed: ",
-                "leg1_venue={} leg1_pool={} leg2_venue={} leg2_pool={}"
-            ),
-            leg_1.venue().label(),
-            leg_1.pool_id(),
-            leg_2.venue().label(),
-            leg_2.pool_id()
-        );
-
-        println!(
-            "rung11c_priority_scope_unknown: leg1_pool={} leg2_pool={} reason={}",
-            leg_1.pool_id(),
-            leg_2.pool_id(),
-            reason
-        );
-
-        return costs::PriorityObservationState::Unavailable(reason);
+        return orca_priority::observe_route(
+            rpc_client,
+            SOLANA_RPC_URL,
+            leg_1,
+            leg_2,
+            raydium_quote_contexts,
+            orca_prepared,
+            cache,
+        )
+        .await;
     }
 
     let leg_1_raydium = match leg_1.venue() {
