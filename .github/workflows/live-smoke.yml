@@ -54,7 +54,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          timeout 300s rustup run 1.80.0 cargo run --locked -p scout-cli --bin scout-cli
+          log_file="$(mktemp)"
+          set +e
+          timeout 300s rustup run 1.80.0 cargo run --locked -p scout-cli --bin scout-cli 2>&1 | tee "$log_file"
+          scout_status="${PIPESTATUS[0]}"
+          set -e
+
+          if [[ "$scout_status" -eq 0 ]]; then
+            exit 0
+          fi
+
+          no_overlap_message="Rung 9 bounded bidirectional exact-pair discovery complete with no live Raydium-PumpSwap same-pair overlap"
+          if [[ "$scout_status" -eq 1 ]] && grep -Fq "$no_overlap_message" "$log_file"; then
+            echo "READ-ONLY LIVE MARKET NO-OVERLAP PASS"
+            echo "Bounded Rung 9 discovery completed successfully; no same-pair Raydium-PumpSwap overlap existed in this live sample."
+            exit 0
+          fi
+
+          echo "Scout live smoke failed with exit status $scout_status."
+          exit "$scout_status"
 
       - name: Upload Rung 12 shadow evidence
         if: always()
@@ -189,3 +207,4 @@ jobs:
         run: |
           set -euo pipefail
           timeout 240s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-priority-live
+          
