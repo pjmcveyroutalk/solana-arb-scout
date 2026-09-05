@@ -12,10 +12,10 @@ permissions:
   contents: read
 
 jobs:
-  live-read-only:
-    name: Live Solana Read-Only Test
+  preflight:
+    name: Canonical Rust 1.80 Preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 7
 
     steps:
       - name: Checkout
@@ -27,23 +27,34 @@ jobs:
           set -euo pipefail
           bash scripts/preflight-rust.sh
 
-      - name: Run live Solana stream
+  scout-live:
+    name: Scout Existing Live Smoke
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.80
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.80.0 --profile minimal
+
+      - name: Resolve Rust 1.80 dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup run 1.80.0 cargo generate-lockfile
+          rustup run 1.80.0 cargo update -p tinyvec --precise 1.12.0
+
+      - name: Run existing Scout live smoke
         shell: bash
         run: |
           set -euo pipefail
           timeout 300s rustup run 1.80.0 cargo run --locked -p scout-cli --bin scout-cli
-
-      - name: Run Orca O1 live pool-state observation
-        shell: bash
-        run: |
-          set -euo pipefail
-          timeout 150s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-o1-live
-
-      - name: Run Orca O2 live deterministic parity
-        shell: bash
-        run: |
-          set -euo pipefail
-          timeout 150s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-o2-live
 
       - name: Upload Rung 12 shadow evidence
         if: always()
@@ -62,3 +73,61 @@ jobs:
           path: artifacts/r13-forensics/*.jsonl
           if-no-files-found: warn
           retention-days: 14
+
+  orca-o1-live:
+    name: Orca O1 Live Observation
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.80
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.80.0 --profile minimal
+
+      - name: Resolve Rust 1.80 dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup run 1.80.0 cargo generate-lockfile
+          rustup run 1.80.0 cargo update -p tinyvec --precise 1.12.0
+
+      - name: Run Orca O1 live pool-state observation
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 150s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-o1-live
+
+  orca-o2-live:
+    name: Orca O2 Live Deterministic Parity
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.80
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.80.0 --profile minimal
+
+      - name: Resolve Rust 1.80 dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup run 1.80.0 cargo generate-lockfile
+          rustup run 1.80.0 cargo update -p tinyvec --precise 1.12.0
+
+      - name: Run Orca O2 live deterministic parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 150s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-o2-live
