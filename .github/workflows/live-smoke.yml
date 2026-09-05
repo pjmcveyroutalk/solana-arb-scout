@@ -160,3 +160,32 @@ jobs:
         run: |
           set -euo pipefail
           timeout 240s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-route-live
+
+  orca-priority-live:
+    name: Orca + Raydium Localized Priority Proof
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.80
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.80.0 --profile minimal
+
+      - name: Resolve Rust 1.80 dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup run 1.80.0 cargo generate-lockfile
+          rustup run 1.80.0 cargo update -p tinyvec --precise 1.12.0
+
+      - name: Run Orca + Raydium localized priority proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 240s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-priority-live
