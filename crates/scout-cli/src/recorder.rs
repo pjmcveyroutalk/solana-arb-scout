@@ -1265,11 +1265,9 @@ fn venue_fee_value(venue: Venue, fees: &VenueFeeComponents) -> Result<Value, Str
             "creator_fee_raw": creator_fee_raw,
         })),
         (actual_venue, actual_fees) => Err(format!(
-            concat!(
-                "R12 fee serializer has no verified structured mapping for venue={} ",
-                "components={actual_fees:?}"
-            ),
-            actual_venue.label()
+            "R12 fee serializer has no verified structured mapping for venue={} components={:?}",
+            actual_venue.label(),
+            actual_fees
         )),
     }
 }
