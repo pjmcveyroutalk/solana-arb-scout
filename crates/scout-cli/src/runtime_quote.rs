@@ -183,4 +183,3 @@ fn log_missing(pool: &NormalizedPoolState, reason: &str) {
         pool.pool_id
     );
 }
-
