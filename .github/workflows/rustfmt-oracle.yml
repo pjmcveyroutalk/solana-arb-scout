@@ -1,0 +1,45 @@
+name: Scout Rust 1.80 Formatter Oracle
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "scripts/format-rust.sh"
+      - ".github/workflows/rustfmt-oracle.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rustfmt:
+    name: Exact Rust 1.80 Formatting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run exact Rust 1.80 formatter
+        run: bash scripts/format-rust.sh
+
+      - name: Capture formatter patch
+        run: |
+          git diff --binary > rustfmt.patch
+          git status --short
+
+      - name: Upload canonical formatted Rust source
+        uses: actions/upload-artifact@v4
+        with:
+          name: scout-rust-1.80-formatted-source
+          path: |
+            crates/**/*.rs
+            rustfmt.patch
+          if-no-files-found: error
+          retention-days: 7
