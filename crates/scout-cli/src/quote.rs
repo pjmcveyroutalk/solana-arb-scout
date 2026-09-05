@@ -125,7 +125,6 @@ impl TwoLegRouteQuote {
     }
 }
 
-#[allow(dead_code)]
 pub enum VenueQuoteContext<'a> {
     Raydium {
         pool_id: String,
@@ -134,9 +133,6 @@ pub enum VenueQuoteContext<'a> {
     PumpSwap {
         pool_id: String,
         snapshot: &'a PumpSwapHydrationSnapshot,
-    },
-    Orca {
-        snapshot: &'a OrcaQuoteSnapshot,
     },
 }
 
@@ -472,7 +468,7 @@ impl OrcaQuoteSnapshot {
     }
 }
 
-trait ExactInputQuoteAdapter {
+pub trait ExactInputQuoteAdapter {
     fn venue(&self) -> Venue;
 
     fn pool_id(&self) -> &str;
@@ -660,40 +656,68 @@ impl ExactInputQuoteAdapter for PumpSwapQuoteAdapter<'_> {
     }
 }
 
-struct OrcaQuoteAdapter<'a> {
-    snapshot: &'a OrcaQuoteSnapshot,
-}
-
-impl<'a> OrcaQuoteAdapter<'a> {
-    fn new(snapshot: &'a OrcaQuoteSnapshot) -> Self {
-        Self { snapshot }
+impl ExactInputQuoteAdapter for VenueQuoteContext<'_> {
+    fn venue(&self) -> Venue {
+        with_quote_adapter(self, |adapter| adapter.venue())
     }
 
-    fn adapter_capabilities() -> AdapterCapabilities {
-        orca_clmm_capabilities()
+    fn pool_id(&self) -> &str {
+        match self {
+            Self::Raydium { pool_id, .. } | Self::PumpSwap { pool_id, .. } => pool_id.as_str(),
+        }
+    }
+
+    fn source_slot(&self) -> u64 {
+        with_quote_adapter(self, |adapter| adapter.source_slot())
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        with_quote_adapter(self, |adapter| adapter.capabilities())
+    }
+
+    fn contains_pair(&self, input_mint: &str, output_mint: &str) -> bool {
+        with_quote_adapter(self, |adapter| {
+            adapter.contains_pair(input_mint, output_mint)
+        })
+    }
+
+    #[cfg(test)]
+    fn mint_decimals(&self, mint: &str) -> Result<u8, String> {
+        with_quote_adapter(self, |adapter| adapter.mint_decimals(mint))
+    }
+
+    fn quote_exact_input(
+        &self,
+        input_mint: &str,
+        amount_in_raw: u64,
+    ) -> Result<VenueLegQuote, String> {
+        with_quote_adapter(self, |adapter| {
+            adapter.quote_exact_input(input_mint, amount_in_raw)
+        })
     }
 }
 
-impl ExactInputQuoteAdapter for OrcaQuoteAdapter<'_> {
+#[allow(dead_code)]
+impl ExactInputQuoteAdapter for OrcaQuoteSnapshot {
     fn venue(&self) -> Venue {
         Venue::Orca
     }
 
     fn pool_id(&self) -> &str {
-        self.snapshot.pool_id.as_str()
+        self.pool_id.as_str()
     }
 
     fn source_slot(&self) -> u64 {
-        self.snapshot.source_slot
+        self.source_slot
     }
 
     fn capabilities(&self) -> AdapterCapabilities {
-        Self::adapter_capabilities()
+        orca_clmm_capabilities()
     }
 
     fn contains_pair(&self, input_mint: &str, output_mint: &str) -> bool {
-        let mint_a = self.snapshot.token_a_mint.as_str();
-        let mint_b = self.snapshot.token_b_mint.as_str();
+        let mint_a = self.token_a_mint.as_str();
+        let mint_b = self.token_b_mint.as_str();
 
         (mint_a == input_mint && mint_b == output_mint)
             || (mint_b == input_mint && mint_a == output_mint)
@@ -701,10 +725,10 @@ impl ExactInputQuoteAdapter for OrcaQuoteAdapter<'_> {
 
     #[cfg(test)]
     fn mint_decimals(&self, mint: &str) -> Result<u8, String> {
-        if mint == self.snapshot.token_a_mint {
-            Ok(self.snapshot.token_a_decimals)
-        } else if mint == self.snapshot.token_b_mint {
-            Ok(self.snapshot.token_b_decimals)
+        if mint == self.token_a_mint {
+            Ok(self.token_a_decimals)
+        } else if mint == self.token_b_mint {
+            Ok(self.token_b_decimals)
         } else {
             Err(format!("mint {mint} is not in Orca quote context"))
         }
@@ -719,9 +743,9 @@ impl ExactInputQuoteAdapter for OrcaQuoteAdapter<'_> {
             return Err("Orca exact-input quote amount must be greater than zero".to_owned());
         }
 
-        let specified_token_a = if input_mint == self.snapshot.token_a_mint {
+        let specified_token_a = if input_mint == self.token_a_mint {
             true
-        } else if input_mint == self.snapshot.token_b_mint {
+        } else if input_mint == self.token_b_mint {
             false
         } else {
             return Err(format!(
@@ -733,32 +757,32 @@ impl ExactInputQuoteAdapter for OrcaQuoteAdapter<'_> {
             amount_in_raw,
             specified_token_a,
             0,
-            self.snapshot.whirlpool,
-            self.snapshot.oracle,
+            self.whirlpool,
+            self.oracle,
             TickArrays::Five(
-                self.snapshot.tick_arrays[0],
-                self.snapshot.tick_arrays[1],
-                self.snapshot.tick_arrays[2],
-                self.snapshot.tick_arrays[3],
-                self.snapshot.tick_arrays[4],
+                self.tick_arrays[0],
+                self.tick_arrays[1],
+                self.tick_arrays[2],
+                self.tick_arrays[3],
+                self.tick_arrays[4],
             ),
-            self.snapshot.timestamp,
-            self.snapshot.transfer_fee_a,
-            self.snapshot.transfer_fee_b,
+            self.timestamp,
+            self.transfer_fee_a,
+            self.transfer_fee_b,
         )
         .map_err(|error| {
             format!(
                 concat!(
                     "Orca authoritative exact-input quote failed: pool={} ",
-                    "input_mint={} amount_in_raw={} error={error:?}"
+                    "input_mint={} amount_in_raw={} error={:?}"
                 ),
-                self.snapshot.pool_id, input_mint, amount_in_raw
+                self.pool_id, input_mint, amount_in_raw, error
             )
         })?;
 
         orca_leg_quote_from_core(
-            self.snapshot.pool_id.as_str(),
-            self.snapshot.source_slot,
+            self.pool_id.as_str(),
+            self.source_slot,
             amount_in_raw,
             quote,
         )
@@ -814,10 +838,6 @@ fn with_quote_adapter<T>(
         }
         VenueQuoteContext::PumpSwap { pool_id, snapshot } => {
             let adapter = PumpSwapQuoteAdapter::new(pool_id.as_str(), snapshot);
-            operation(&adapter)
-        }
-        VenueQuoteContext::Orca { snapshot } => {
-            let adapter = OrcaQuoteAdapter::new(snapshot);
             operation(&adapter)
         }
     }
@@ -930,24 +950,31 @@ pub fn quote_readiness_for_pool(
 }
 
 #[cfg(test)]
-pub fn one_whole_anchor_input_raw(
+pub fn one_whole_anchor_input_raw<C>(
     route: &TwoLegRouteCandidate,
-    leg_1_context: &VenueQuoteContext<'_>,
-) -> Result<u64, String> {
+    leg_1_context: &C,
+) -> Result<u64, String>
+where
+    C: ExactInputQuoteAdapter + ?Sized,
+{
     validate_context(route.leg_1(), leg_1_context)?;
-    let decimals = context_mint_decimals(leg_1_context, route.anchor_mint())?;
+    let decimals = leg_1_context.mint_decimals(route.anchor_mint())?;
 
     10u64
         .checked_pow(u32::from(decimals))
         .ok_or_else(|| format!("anchor decimals {decimals} exceed u64 whole-token sizing"))
 }
 
-pub fn quote_two_leg_exact_input(
+pub fn quote_two_leg_exact_input<C1, C2>(
     route: &TwoLegRouteCandidate,
     amount_in_raw: u64,
-    leg_1_context: &VenueQuoteContext<'_>,
-    leg_2_context: &VenueQuoteContext<'_>,
-) -> Result<TwoLegRouteQuote, String> {
+    leg_1_context: &C1,
+    leg_2_context: &C2,
+) -> Result<TwoLegRouteQuote, String>
+where
+    C1: ExactInputQuoteAdapter + ?Sized,
+    C2: ExactInputQuoteAdapter + ?Sized,
+{
     if amount_in_raw == 0 {
         return Err("route quote input must be greater than zero".to_owned());
     }
@@ -985,58 +1012,55 @@ pub fn quote_two_leg_exact_input(
     })
 }
 
-fn quote_leg(
+fn quote_leg<C>(
     leg: &RouteLeg,
     amount_in_raw: u64,
-    context: &VenueQuoteContext<'_>,
-) -> Result<VenueLegQuote, String> {
-    with_quote_adapter(context, |adapter| {
-        ensure_exact_input_quote_supported(adapter)?;
-        adapter.quote_exact_input(leg.input_mint(), amount_in_raw)
-    })
+    context: &C,
+) -> Result<VenueLegQuote, String>
+where
+    C: ExactInputQuoteAdapter + ?Sized,
+{
+    ensure_exact_input_quote_supported(context)?;
+    context.quote_exact_input(leg.input_mint(), amount_in_raw)
 }
 
-fn validate_context(leg: &RouteLeg, context: &VenueQuoteContext<'_>) -> Result<(), String> {
-    with_quote_adapter(context, |adapter| {
-        if leg.venue() != adapter.venue() {
-            return Err(format!(
-                "route/context venue mismatch: route={} context={}",
-                leg.venue().label(),
-                adapter.venue().label()
-            ));
-        }
+fn validate_context<C>(leg: &RouteLeg, context: &C) -> Result<(), String>
+where
+    C: ExactInputQuoteAdapter + ?Sized,
+{
+    if leg.venue() != context.venue() {
+        return Err(format!(
+            "route/context venue mismatch: route={} context={}",
+            leg.venue().label(),
+            context.venue().label()
+        ));
+    }
 
-        if leg.pool_id() != adapter.pool_id() {
-            return Err(format!(
-                "route/context pool mismatch: route={} context={}",
-                leg.pool_id(),
-                adapter.pool_id()
-            ));
-        }
+    if leg.pool_id() != context.pool_id() {
+        return Err(format!(
+            "route/context pool mismatch: route={} context={}",
+            leg.pool_id(),
+            context.pool_id()
+        ));
+    }
 
-        let context_slot = adapter.source_slot();
-        if context_slot < leg.source_slot() {
-            return Err(format!(
-                "stale quote context: route_slot={} quote_slot={context_slot}",
-                leg.source_slot()
-            ));
-        }
+    let context_slot = context.source_slot();
+    if context_slot < leg.source_slot() {
+        return Err(format!(
+            "stale quote context: route_slot={} quote_slot={context_slot}",
+            leg.source_slot()
+        ));
+    }
 
-        if !adapter.contains_pair(leg.input_mint(), leg.output_mint()) {
-            return Err(format!(
-                "quote context does not contain route pair {}/{}",
-                leg.input_mint(),
-                leg.output_mint()
-            ));
-        }
+    if !context.contains_pair(leg.input_mint(), leg.output_mint()) {
+        return Err(format!(
+            "quote context does not contain route pair {}/{}",
+            leg.input_mint(),
+            leg.output_mint()
+        ));
+    }
 
-        Ok(())
-    })
-}
-
-#[cfg(test)]
-fn context_mint_decimals(context: &VenueQuoteContext<'_>, mint: &str) -> Result<u8, String> {
-    with_quote_adapter(context, |adapter| adapter.mint_decimals(mint))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1376,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn universal_dispatch_exposes_both_adapter_capability_contracts() {
+    fn universal_dispatch_exposes_existing_adapter_capability_contracts() {
         let ray = raydium_snapshot();
         let pump = pumpswap_snapshot();
 
@@ -1389,15 +1413,12 @@ mod tests {
             snapshot: &pump,
         };
 
-        let ray_capabilities = with_quote_adapter(&ray_context, |adapter| adapter.capabilities());
-        let pump_capabilities = with_quote_adapter(&pump_context, |adapter| adapter.capabilities());
-
         assert_eq!(
-            ray_capabilities,
+            ray_context.capabilities(),
             RaydiumCpmmQuoteAdapter::adapter_capabilities()
         );
         assert_eq!(
-            pump_capabilities,
+            pump_context.capabilities(),
             PumpSwapQuoteAdapter::adapter_capabilities()
         );
     }
@@ -1405,17 +1426,15 @@ mod tests {
     #[test]
     fn universal_dispatch_exposes_orca_clmm_capabilities() -> Result<(), String> {
         let snapshot = orca_snapshot()?;
-        let context = VenueQuoteContext::Orca {
-            snapshot: &snapshot,
-        };
 
-        let capabilities = with_quote_adapter(&context, |adapter| adapter.capabilities());
-
-        assert_eq!(capabilities, orca_clmm_capabilities());
-        assert_eq!(capabilities.liquidity_model, LiquidityModel::Clmm);
-        assert_eq!(capabilities.auxiliary_state, AuxiliaryStateKind::Ticks);
+        assert_eq!(snapshot.capabilities(), orca_clmm_capabilities());
+        assert_eq!(snapshot.capabilities().liquidity_model, LiquidityModel::Clmm);
         assert_eq!(
-            capabilities.contention_footprint,
+            snapshot.capabilities().auxiliary_state,
+            AuxiliaryStateKind::Ticks
+        );
+        assert_eq!(
+            snapshot.capabilities().contention_footprint,
             ContentionFootprintState::Incomplete
         );
         Ok(())
@@ -1452,6 +1471,7 @@ mod tests {
                 quote_source_slot: 101,
             }
         );
+
         Ok(())
     }
 
@@ -1499,6 +1519,7 @@ mod tests {
             result,
             Err(error) if error.contains("requires Oracle state")
         ));
+
         Ok(())
     }
 
@@ -1527,6 +1548,7 @@ mod tests {
         assert_eq!(readiness.token_b_mint, TEST_MINT);
         assert_eq!(readiness.source_slot, 101);
         assert_eq!(readiness.capabilities.liquidity_model, LiquidityModel::Cpmm);
+
         Ok(())
     }
 
@@ -1553,6 +1575,7 @@ mod tests {
         assert_eq!(readiness.pool_id, "pumpswap-pool");
         assert_eq!(readiness.source_slot, 102);
         assert_eq!(readiness.capabilities.liquidity_model, LiquidityModel::Cpmm);
+
         Ok(())
     }
 
@@ -1890,6 +1913,7 @@ mod tests {
         };
 
         assert_eq!(one_whole_anchor_input_raw(route, &context)?, 1_000_000_000);
+
         Ok(())
     }
 
@@ -1929,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn universal_route_dispatch_quotes_both_venue_directions() -> Result<(), String> {
+    fn universal_route_dispatch_quotes_both_existing_venue_directions() -> Result<(), String> {
         let routes = route_candidates();
         let pump = pumpswap_snapshot();
         let ray = raydium_snapshot();
@@ -1992,6 +2016,7 @@ mod tests {
 
         assert!(raydium_first_seen);
         assert!(pumpswap_first_seen);
+
         Ok(())
     }
 
@@ -2014,6 +2039,7 @@ mod tests {
             result,
             Err(error) if error.contains("stale quote context")
         ));
+
         Ok(())
     }
 
@@ -2032,6 +2058,7 @@ mod tests {
 
         let result = one_whole_anchor_input_raw(route, &context);
         assert!(matches!(result, Err(error) if error.contains("pool mismatch")));
+
         Ok(())
     }
 }
