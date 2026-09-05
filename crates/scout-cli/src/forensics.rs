@@ -1,12 +1,12 @@
 use crate::forensics_rpc::{
     AddressHistory, HistoryAcquisition, HistoryRequest, TransactionAcquisition, TransactionEvidence,
 };
-use crate::{orca, pumpswap, raydium};
+use crate::{pumpswap, raydium};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, create_dir_all, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ pub const MAX_FORWARD_SLOTS: u64 = 32;
 pub const MAX_RECORDS_PER_RUN: u64 = 512;
 
 const MATURITY_POLICY_ID: &str = "r13-confirmed-slot-maturity-v1";
+const ORCA_WHIRLPOOL_PROGRAM_ID: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 
 const RAYDIUM_SWAP_BASE_INPUT: [u8; 8] = [143, 190, 90, 218, 196, 30, 51, 222];
 const RAYDIUM_SWAP_BASE_OUTPUT: [u8; 8] = [55, 217, 98, 86, 163, 74, 180, 173];
@@ -1338,7 +1339,7 @@ fn venue_program_id(venue: &str) -> Result<&'static str, String> {
     match venue {
         "raydium_cpmm" => Ok(raydium::RAYDIUM_CPMM_PROGRAM_ID),
         "pumpswap" => Ok(pumpswap::PUMPSWAP_PROGRAM_ID),
-        "orca" => Ok(orca::ORCA_WHIRLPOOL_PROGRAM_ID),
+        "orca" => Ok(ORCA_WHIRLPOOL_PROGRAM_ID),
         other => Err(format!("R13 unsupported route venue {other}")),
     }
 }
@@ -2507,7 +2508,7 @@ mod tests {
         ];
 
         let a_to_b_instruction = resolved_instruction(
-            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            ORCA_WHIRLPOOL_PROGRAM_ID,
             accounts.clone(),
             orca_swap_data(ORCA_SWAP_V2, true),
         );
@@ -2520,7 +2521,7 @@ mod tests {
         assert!(a_to_b.mints_verified_by_instruction);
 
         let b_to_a_instruction = resolved_instruction(
-            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            ORCA_WHIRLPOOL_PROGRAM_ID,
             accounts,
             orca_swap_data(ORCA_SWAP_V2, false),
         );
@@ -2538,7 +2539,7 @@ mod tests {
     #[test]
     fn orca_legacy_swap_requires_and_accepts_token_balance_mint_proof() -> Result<(), String> {
         let instruction = resolved_instruction(
-            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            ORCA_WHIRLPOOL_PROGRAM_ID,
             vec![
                 "token-program",
                 "authority",
@@ -2630,7 +2631,7 @@ mod tests {
         let route_leg = leg("orca", "orca-pool", "mint-a", "mint-b", 100);
 
         let wrong_pool = resolved_instruction(
-            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            ORCA_WHIRLPOOL_PROGRAM_ID,
             accounts.clone(),
             orca_swap_data(ORCA_SWAP_V2, true),
         );
@@ -2644,7 +2645,7 @@ mod tests {
         valid_accounts[4] = "orca-pool";
 
         let malformed = resolved_instruction(
-            orca::ORCA_WHIRLPOOL_PROGRAM_ID,
+            ORCA_WHIRLPOOL_PROGRAM_ID,
             valid_accounts,
             malformed_data,
         );
