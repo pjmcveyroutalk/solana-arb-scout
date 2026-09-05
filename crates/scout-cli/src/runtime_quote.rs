@@ -65,6 +65,10 @@ pub fn readiness_for_pool(
                 }
             };
         }
+        Venue::Meteora => {
+            log_missing(pool, "Meteora runtime quote path is not enabled");
+            return None;
+        }
     };
 
     match result {
@@ -173,6 +177,10 @@ fn with_leg_adapter<T>(
             })?;
             operation(&prepared.quote_snapshot)
         }
+        Venue::Meteora => Err(format!(
+            "Meteora runtime quote path is not enabled for route pool {}",
+            leg.pool_id()
+        )),
     }
 }
 
@@ -183,3 +191,4 @@ fn log_missing(pool: &NormalizedPoolState, reason: &str) {
         pool.pool_id
     );
 }
+
