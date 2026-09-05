@@ -2,9 +2,7 @@
 
 use crate::orca;
 use crate::orca::OrcaWhirlpoolState;
-use crate::orca_o2_quote_inputs::{
-    decode_clock_sysvar, transfer_fee_for_mint, OrcaQuoteClock,
-};
+use crate::orca_o2_quote_inputs::{decode_clock_sysvar, transfer_fee_for_mint, OrcaQuoteClock};
 use orca_whirlpools_core::{
     get_tick_array_start_tick_index, swap_quote_by_input_token, AdaptiveFeeConstantsFacade,
     AdaptiveFeeVariablesFacade, ExactInSwapQuote, OracleFacade, TickArrayFacade, TickArrays,
@@ -55,8 +53,7 @@ const ORACLE_VOLATILITY_REFERENCE_OFFSET: usize = 98;
 const ORACLE_TICK_GROUP_INDEX_REFERENCE_OFFSET: usize = 102;
 const ORACLE_VOLATILITY_ACCUMULATOR_OFFSET: usize = 106;
 
-const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] =
-    [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0x07, 0x42, 0xbb];
+const FIXED_TICK_ARRAY_DISCRIMINATOR: [u8; 8] = [0x45, 0x61, 0xbd, 0xbe, 0x6e, 0x07, 0x42, 0xbb];
 const TICK_SERIALIZED_LEN: usize = 113;
 const FIXED_TICK_ARRAY_LEN: usize = 8 + 4 + (TICK_ARRAY_SIZE * TICK_SERIALIZED_LEN) + 32;
 
@@ -67,8 +64,7 @@ const DYNAMIC_TICK_ARRAY_BITMAP_OFFSET: usize = 44;
 const DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET: usize = 60;
 const DYNAMIC_TICK_UNINITIALIZED_LEN: usize = 1;
 const DYNAMIC_TICK_INITIALIZED_LEN: usize = 113;
-const DYNAMIC_TICK_DATA_LEN: usize =
-    DYNAMIC_TICK_INITIALIZED_LEN - DYNAMIC_TICK_UNINITIALIZED_LEN;
+const DYNAMIC_TICK_DATA_LEN: usize = DYNAMIC_TICK_INITIALIZED_LEN - DYNAMIC_TICK_UNINITIALIZED_LEN;
 const DYNAMIC_TICK_ARRAY_MIN_LEN: usize =
     DYNAMIC_TICK_ARRAY_TICK_DATA_OFFSET + (TICK_ARRAY_SIZE * DYNAMIC_TICK_UNINITIALIZED_LEN);
 const DYNAMIC_TICK_ARRAY_MAX_LEN: usize =
@@ -179,9 +175,7 @@ pub fn verify_stable_pool_identity(
     Ok(())
 }
 
-pub fn bounded_tick_array_start_indexes(
-    pool: &OrcaWhirlpoolState,
-) -> Result<[i32; 5], String> {
+pub fn bounded_tick_array_start_indexes(pool: &OrcaWhirlpoolState) -> Result<[i32; 5], String> {
     if pool.tick_spacing == 0 {
         return Err("Orca tick spacing must be greater than zero".to_owned());
     }
@@ -388,8 +382,7 @@ pub fn decode_oracle_facade(
         ));
     }
 
-    let whirlpool_bytes =
-        read_array::<32>(data, ORACLE_WHIRLPOOL_OFFSET, "Oracle Whirlpool")?;
+    let whirlpool_bytes = read_array::<32>(data, ORACLE_WHIRLPOOL_OFFSET, "Oracle Whirlpool")?;
     let decoded_whirlpool = Pubkey::new_from_array(whirlpool_bytes).to_string();
 
     if decoded_whirlpool != expected_whirlpool {
@@ -612,8 +605,7 @@ pub fn decode_fixed_tick_array(
         };
     }
 
-    let whirlpool_bytes =
-        read_array::<32>(data, offset, "tick-array Whirlpool identity")?;
+    let whirlpool_bytes = read_array::<32>(data, offset, "tick-array Whirlpool identity")?;
     let decoded_whirlpool = Pubkey::new_from_array(whirlpool_bytes).to_string();
 
     if decoded_whirlpool != expected_whirlpool {
@@ -710,9 +702,7 @@ pub fn decode_dynamic_tick_array(
     )?;
 
     if (tick_bitmap >> TICK_ARRAY_SIZE) != 0 {
-        return Err(
-            "Orca dynamic tick-array bitmap has bits outside the 88-tick range".to_owned()
-        );
+        return Err("Orca dynamic tick-array bitmap has bits outside the 88-tick range".to_owned());
     }
 
     let initialized_tick_count = usize::try_from(tick_bitmap.count_ones())
@@ -758,8 +748,7 @@ pub fn decode_dynamic_tick_array(
                 let liquidity_net = read_i128(data, offset, "dynamic tick liquidity_net")?;
                 offset = checked_advance(offset, 16, "dynamic liquidity_net")?;
 
-                let liquidity_gross =
-                    read_u128(data, offset, "dynamic tick liquidity_gross")?;
+                let liquidity_gross = read_u128(data, offset, "dynamic tick liquidity_gross")?;
                 offset = checked_advance(offset, 16, "dynamic liquidity_gross")?;
 
                 let fee_growth_outside_a =
@@ -788,11 +777,7 @@ pub fn decode_dynamic_tick_array(
                     liquidity_gross,
                     fee_growth_outside_a,
                     fee_growth_outside_b,
-                    reward_growths_outside: [
-                        reward_growth_0,
-                        reward_growth_1,
-                        reward_growth_2,
-                    ],
+                    reward_growths_outside: [reward_growth_0, reward_growth_1, reward_growth_2],
                 };
             }
             (false, other) => {
@@ -942,9 +927,7 @@ pub fn quote_exact_input(
             return Err("adaptive-fee Orca Whirlpool requires Oracle state".to_owned());
         }
         (false, Some(_)) => {
-            return Err(
-                "non-adaptive Orca Whirlpool must not receive Oracle state".to_owned()
-            );
+            return Err("non-adaptive Orca Whirlpool must not receive Oracle state".to_owned());
         }
         _ => {}
     }
@@ -1016,11 +999,7 @@ fn read_u128(data: &[u8], offset: usize, label: &str) -> Result<u128, String> {
     Ok(u128::from_le_bytes(read_array::<16>(data, offset, label)?))
 }
 
-fn read_array<const N: usize>(
-    data: &[u8],
-    offset: usize,
-    label: &str,
-) -> Result<[u8; N], String> {
+fn read_array<const N: usize>(data: &[u8], offset: usize, label: &str) -> Result<[u8; N], String> {
     let end = offset
         .checked_add(N)
         .ok_or_else(|| format!("Orca {label} offset overflow"))?;
@@ -1029,6 +1008,5 @@ fn read_array<const N: usize>(
         .get(offset..end)
         .ok_or_else(|| format!("Orca {label} outside account data"))?;
 
-    <[u8; N]>::try_from(bytes)
-        .map_err(|_| format!("Orca {label} had invalid byte length"))
+    <[u8; N]>::try_from(bytes).map_err(|_| format!("Orca {label} had invalid byte length"))
 }
