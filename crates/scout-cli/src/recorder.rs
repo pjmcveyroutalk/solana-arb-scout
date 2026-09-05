@@ -3,7 +3,7 @@ use crate::economics::{EconomicsCostModel, ExpectedNetEconomics, RequiredCost};
 use crate::quote::{TwoLegRouteQuote, VenueFeeComponents, VenueLegQuote};
 use crate::route::TwoLegRouteCandidate;
 use crate::sizing::SolUsdPrice;
-use scout_core::NormalizedPoolState;
+use scout_core::{NormalizedPoolState, Venue};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
@@ -350,7 +350,7 @@ impl ShadowRecorder {
             "usd_size": usd_size,
             "anchor_decimals": anchor_decimals,
             "requested_anchor_input_raw": quote.anchor_input_requested_raw,
-            "quote": route_quote_value(quote),
+            "quote": route_quote_value(quote)?,
             "quote_rejection_reason": Value::Null,
             "gross_delta_raw": gross_delta_raw.to_string(),
             "cost_model": cost_model.map(cost_model_value).unwrap_or(Value::Null),
@@ -1208,56 +1208,69 @@ fn pyth_price_value(price: &SolUsdPrice) -> Value {
     })
 }
 
-fn route_quote_value(quote: &TwoLegRouteQuote) -> Value {
-    json!({
+fn route_quote_value(quote: &TwoLegRouteQuote) -> Result<Value, String> {
+    Ok(json!({
         "anchor_mint": quote.anchor_mint.as_str(),
         "intermediate_mint": quote.intermediate_mint.as_str(),
         "anchor_input_requested_raw": quote.anchor_input_requested_raw,
         "anchor_input_consumed_raw": quote.anchor_input_consumed_raw,
         "anchor_input_unspent_raw": quote.anchor_input_unspent_raw,
         "anchor_output_raw": quote.anchor_output_raw,
-        "leg_1": venue_leg_quote_value(&quote.leg_1),
-        "leg_2": venue_leg_quote_value(&quote.leg_2),
-    })
+        "leg_1": venue_leg_quote_value(&quote.leg_1)?,
+        "leg_2": venue_leg_quote_value(&quote.leg_2)?,
+    }))
 }
 
-fn venue_leg_quote_value(quote: &VenueLegQuote) -> Value {
-    json!({
+fn venue_leg_quote_value(quote: &VenueLegQuote) -> Result<Value, String> {
+    Ok(json!({
         "venue": quote.venue.label(),
         "pool_id": quote.pool_id.as_str(),
         "amount_in_requested_raw": quote.amount_in_requested_raw,
         "amount_in_consumed_raw": quote.amount_in_consumed_raw,
         "amount_in_unspent_raw": quote.amount_in_unspent_raw,
         "amount_out_raw": quote.amount_out_raw,
-        "fees": venue_fee_value(&quote.fees),
+        "fees": venue_fee_value(quote.venue, &quote.fees)?,
         "quote_source_slot": quote.quote_source_slot,
-    })
+    }))
 }
 
-fn venue_fee_value(fees: &VenueFeeComponents) -> Value {
-    match fees {
-        VenueFeeComponents::RaydiumCpmm {
-            trade_fee_raw,
-            protocol_fee_raw,
-            fund_fee_raw,
-            creator_fee_raw,
-        } => json!({
+fn venue_fee_value(venue: Venue, fees: &VenueFeeComponents) -> Result<Value, String> {
+    match (venue, fees) {
+        (
+            Venue::RaydiumCpmm,
+            VenueFeeComponents::RaydiumCpmm {
+                trade_fee_raw,
+                protocol_fee_raw,
+                fund_fee_raw,
+                creator_fee_raw,
+            },
+        ) => Ok(json!({
             "kind": "raydium_cpmm",
             "trade_fee_raw": trade_fee_raw,
             "protocol_fee_raw": protocol_fee_raw,
             "fund_fee_raw": fund_fee_raw,
             "creator_fee_raw": creator_fee_raw,
-        }),
-        VenueFeeComponents::PumpSwap {
-            lp_fee_raw,
-            protocol_fee_raw,
-            creator_fee_raw,
-        } => json!({
+        })),
+        (
+            Venue::PumpSwap,
+            VenueFeeComponents::PumpSwap {
+                lp_fee_raw,
+                protocol_fee_raw,
+                creator_fee_raw,
+            },
+        ) => Ok(json!({
             "kind": "pumpswap",
             "lp_fee_raw": lp_fee_raw,
             "protocol_fee_raw": protocol_fee_raw,
             "creator_fee_raw": creator_fee_raw,
-        }),
+        })),
+        (actual_venue, actual_fees) => Err(format!(
+            concat!(
+                "R12 fee serializer has no verified structured mapping for venue={} ",
+                "components={actual_fees:?}"
+            ),
+            actual_venue.label()
+        )),
     }
 }
 
@@ -1503,6 +1516,22 @@ mod tests {
         assert_eq!(lifecycle.observation_count, 2);
         assert_eq!(lifecycle.lifetime_ms()?, 250);
         Ok(())
+    }
+
+    #[test]
+    fn fee_serializer_rejects_mismatched_venue_components() {
+        let fees = VenueFeeComponents::PumpSwap {
+            lp_fee_raw: 5,
+            protocol_fee_raw: 1,
+            creator_fee_raw: 0,
+        };
+
+        let result = venue_fee_value(Venue::Orca, &fees);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("no verified structured mapping")
+        ));
     }
 
     fn usd_price() -> SolUsdPrice {
