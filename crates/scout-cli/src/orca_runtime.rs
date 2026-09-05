@@ -99,9 +99,7 @@ where
     println!("orca_live_eligible_count={}", prepared_by_pool.len());
 
     if prepared_by_pool.is_empty() {
-        println!(
-            "orca_production_admission_unavailable: no bounded O2-ready Orca pool observed"
-        );
+        println!("orca_production_admission_unavailable: no bounded O2-ready Orca pool observed");
     } else {
         println!("READ-ONLY ORCA PRODUCTION ADMISSION PASS");
     }
@@ -147,3 +145,4 @@ where
         }
     }
 }
+
