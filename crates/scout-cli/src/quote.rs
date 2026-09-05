@@ -195,6 +195,7 @@ impl QuoteReadiness {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrcaQuoteReadinessEvidence {
     pool_id: String,
@@ -205,6 +206,7 @@ pub struct OrcaQuoteReadinessEvidence {
     quote_b_to_a: ExactInSwapQuote,
 }
 
+#[allow(dead_code)]
 impl OrcaQuoteReadinessEvidence {
     pub(crate) fn from_o2_quotes(
         pool_id: &str,
@@ -272,6 +274,7 @@ impl OrcaQuoteReadinessEvidence {
     }
 }
 
+#[allow(dead_code)]
 fn validate_orca_o2_quote(label: &str, quote: &ExactInSwapQuote) -> Result<(), String> {
     if quote.token_in == 0 {
         return Err(format!(
@@ -306,6 +309,7 @@ fn validate_orca_o2_quote(label: &str, quote: &ExactInSwapQuote) -> Result<(), S
     Ok(())
 }
 
+#[allow(dead_code)]
 fn orca_clmm_capabilities() -> AdapterCapabilities {
     AdapterCapabilities {
         liquidity_model: LiquidityModel::Clmm,
@@ -318,6 +322,7 @@ fn orca_clmm_capabilities() -> AdapterCapabilities {
     }
 }
 
+#[allow(dead_code)]
 pub fn orca_quote_readiness_for_pool(
     pool: &NormalizedPoolState,
     evidence: &OrcaQuoteReadinessEvidence,
@@ -1581,7 +1586,10 @@ mod tests {
         };
 
         let result = one_whole_anchor_input_raw(route, &context);
-        assert!(matches!(result, Err(error) if error.contains("stale quote context")));
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("stale quote context")
+        ));
         Ok(())
     }
 
