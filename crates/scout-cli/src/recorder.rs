@@ -1264,6 +1264,19 @@ fn venue_fee_value(venue: Venue, fees: &VenueFeeComponents) -> Result<Value, Str
             "protocol_fee_raw": protocol_fee_raw,
             "creator_fee_raw": creator_fee_raw,
         })),
+        (
+            Venue::Orca,
+            VenueFeeComponents::Orca {
+                trade_fee_raw,
+                trade_fee_rate_min,
+                trade_fee_rate_max,
+            },
+        ) => Ok(json!({
+            "kind": "orca_whirlpool",
+            "trade_fee_raw": trade_fee_raw,
+            "trade_fee_rate_min": trade_fee_rate_min,
+            "trade_fee_rate_max": trade_fee_rate_max,
+        })),
         (actual_venue, actual_fees) => Err(format!(
             "R12 fee serializer has no verified structured mapping for venue={} components={:?}",
             actual_venue.label(),
@@ -1513,6 +1526,24 @@ mod tests {
         assert_eq!(lifecycle.last_seen_at_unix_ms, 1_250);
         assert_eq!(lifecycle.observation_count, 2);
         assert_eq!(lifecycle.lifetime_ms()?, 250);
+        Ok(())
+    }
+
+    #[test]
+    fn fee_serializer_preserves_orca_whirlpool_fee_evidence() -> Result<(), String> {
+        let fees = VenueFeeComponents::Orca {
+            trade_fee_raw: 3_000,
+            trade_fee_rate_min: 3_000,
+            trade_fee_rate_max: 3_000,
+        };
+
+        let value = venue_fee_value(Venue::Orca, &fees)?;
+
+        assert_eq!(value["kind"], "orca_whirlpool");
+        assert_eq!(value["trade_fee_raw"], 3_000);
+        assert_eq!(value["trade_fee_rate_min"], 3_000);
+        assert_eq!(value["trade_fee_rate_max"], 3_000);
+
         Ok(())
     }
 
