@@ -721,10 +721,8 @@ mod tests {
         assert!(!plan.adaptive_fee);
 
         for index in 0..5 {
-            let expected = orca_o2::tick_array_pda(
-                &observation.pubkey,
-                plan.tick_array_start_indexes[index],
-            )?;
+            let expected =
+                orca_o2::tick_array_pda(&observation.pubkey, plan.tick_array_start_indexes[index])?;
 
             assert_eq!(plan.pubkeys[3 + index], expected);
         }
@@ -740,10 +738,7 @@ mod tests {
         assert_eq!(plan.pubkeys.len(), 10);
         assert!(plan.adaptive_fee);
         assert_eq!(plan.pubkeys[8], CLOCK_SYSVAR_ID);
-        assert_eq!(
-            plan.pubkeys[9],
-            orca_o2::oracle_pda(&observation.pubkey)?
-        );
+        assert_eq!(plan.pubkeys[9], orca_o2::oracle_pda(&observation.pubkey)?);
 
         Ok(())
     }
@@ -762,12 +757,16 @@ mod tests {
         );
 
         assert_eq!(
-            request.pointer("/params/1/commitment").and_then(Value::as_str),
+            request
+                .pointer("/params/1/commitment")
+                .and_then(Value::as_str),
             Some("processed")
         );
 
         assert_eq!(
-            request.pointer("/params/1/encoding").and_then(Value::as_str),
+            request
+                .pointer("/params/1/encoding")
+                .and_then(Value::as_str),
             Some("base64")
         );
 
