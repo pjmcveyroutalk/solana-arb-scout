@@ -54,6 +54,12 @@ where
 
         anchor_candidates += 1;
 
+        let hydration_targets = orca::hydration_account_pubkeys(&observation);
+        println!(
+            "orca_base_hydration_targets: pool={} mint_a={} mint_b={}",
+            hydration_targets[0], hydration_targets[1], hydration_targets[2]
+        );
+
         if observation.pool_state.is_adaptive_fee() {
             println!(
                 concat!(
