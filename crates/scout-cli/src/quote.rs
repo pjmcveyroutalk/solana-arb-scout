@@ -1,6 +1,7 @@
 use crate::pumpswap::{self, PumpSwapHydrationSnapshot};
 use crate::raydium::{self, RaydiumHydrationSnapshot};
 use crate::route::{RouteLeg, TwoLegRouteCandidate};
+use orca_whirlpools_core::ExactInSwapQuote;
 use scout_core::{
     AdapterCapabilities, AuxiliaryStateKind, CapabilityState, ContentionFootprintState,
     LiquidityModel, NormalizedPoolState, PoolTradingState, QuoteReserveState, Venue,
@@ -192,6 +193,170 @@ impl QuoteReadiness {
             capabilities,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrcaQuoteReadinessEvidence {
+    pool_id: String,
+    token_a_mint: String,
+    token_b_mint: String,
+    source_slot: u64,
+    quote_a_to_b: ExactInSwapQuote,
+    quote_b_to_a: ExactInSwapQuote,
+}
+
+impl OrcaQuoteReadinessEvidence {
+    pub(crate) fn from_o2_quotes(
+        pool_id: &str,
+        token_a_mint: &str,
+        token_b_mint: &str,
+        source_slot: u64,
+        quote_a_to_b: ExactInSwapQuote,
+        quote_b_to_a: ExactInSwapQuote,
+    ) -> Result<Self, String> {
+        if pool_id.is_empty() {
+            return Err("Orca O2 readiness evidence requires a pool id".to_owned());
+        }
+
+        if token_a_mint.is_empty() || token_b_mint.is_empty() {
+            return Err("Orca O2 readiness evidence requires both token mints".to_owned());
+        }
+
+        if token_a_mint == token_b_mint {
+            return Err("Orca O2 readiness evidence requires distinct token mints".to_owned());
+        }
+
+        if source_slot == 0 {
+            return Err("Orca O2 readiness evidence requires a nonzero source slot".to_owned());
+        }
+
+        validate_orca_o2_quote("A-to-B", &quote_a_to_b)?;
+        validate_orca_o2_quote("B-to-A", &quote_b_to_a)?;
+
+        Ok(Self {
+            pool_id: pool_id.to_owned(),
+            token_a_mint: token_a_mint.to_owned(),
+            token_b_mint: token_b_mint.to_owned(),
+            source_slot,
+            quote_a_to_b,
+            quote_b_to_a,
+        })
+    }
+
+    fn validate_for_pool(&self, pool: &NormalizedPoolState) -> Result<(), String> {
+        if self.pool_id != pool.pool_id {
+            return Err(format!(
+                "Orca O2 readiness pool mismatch: evidence={} pool={}",
+                self.pool_id, pool.pool_id
+            ));
+        }
+
+        if self.token_a_mint != pool.token_a.mint || self.token_b_mint != pool.token_b.mint {
+            return Err(format!(
+                "Orca O2 readiness token pair mismatch for pool {}",
+                pool.pool_id
+            ));
+        }
+
+        if self.source_slot < pool.source_slot {
+            return Err(format!(
+                "stale Orca O2 readiness evidence: pool={} pool_slot={} evidence_slot={}",
+                pool.pool_id, pool.source_slot, self.source_slot
+            ));
+        }
+
+        validate_orca_o2_quote("A-to-B", &self.quote_a_to_b)?;
+        validate_orca_o2_quote("B-to-A", &self.quote_b_to_a)?;
+
+        Ok(())
+    }
+}
+
+fn validate_orca_o2_quote(label: &str, quote: &ExactInSwapQuote) -> Result<(), String> {
+    if quote.token_in == 0 {
+        return Err(format!(
+            "Orca O2 {label} readiness quote has zero token input"
+        ));
+    }
+
+    if quote.token_est_out == 0 {
+        return Err(format!(
+            "Orca O2 {label} readiness quote has zero estimated output"
+        ));
+    }
+
+    if quote.token_min_out > quote.token_est_out {
+        return Err(format!(
+            "Orca O2 {label} readiness quote minimum output exceeds estimated output"
+        ));
+    }
+
+    if quote.trade_fee > quote.token_in {
+        return Err(format!(
+            "Orca O2 {label} readiness quote trade fee exceeds token input"
+        ));
+    }
+
+    if quote.trade_fee_rate_min > quote.trade_fee_rate_max {
+        return Err(format!(
+            "Orca O2 {label} readiness quote fee-rate bounds are inverted"
+        ));
+    }
+
+    Ok(())
+}
+
+fn orca_clmm_capabilities() -> AdapterCapabilities {
+    AdapterCapabilities {
+        liquidity_model: LiquidityModel::Clmm,
+        exact_input_quote: CapabilityState::Supported,
+        spl_token: CapabilityState::Supported,
+        token_2022: CapabilityState::RequiresHydration,
+        transfer_fee: CapabilityState::RequiresHydration,
+        auxiliary_state: AuxiliaryStateKind::Ticks,
+        contention_footprint: ContentionFootprintState::Incomplete,
+    }
+}
+
+pub fn orca_quote_readiness_for_pool(
+    pool: &NormalizedPoolState,
+    evidence: &OrcaQuoteReadinessEvidence,
+) -> Result<QuoteReadiness, String> {
+    if pool.venue != Venue::Orca {
+        return Err(format!(
+            "Orca quote readiness requires venue=orca, got {}",
+            pool.venue.label()
+        ));
+    }
+
+    if pool.trading_state != PoolTradingState::Tradable {
+        return Err(format!(
+            "pool {} is not tradable: state={}",
+            pool.pool_id,
+            pool.trading_state.label()
+        ));
+    }
+
+    if let QuoteReserveState::Available { .. } = &pool.quote_reserves {
+        return Err(format!(
+            "Orca CLMM pool {} must not fabricate CPMM quote reserves",
+            pool.pool_id
+        ));
+    }
+
+    evidence.validate_for_pool(pool)?;
+
+    let readiness = QuoteReadiness {
+        venue: Venue::Orca,
+        pool_id: pool.pool_id.clone(),
+        token_a_mint: pool.token_a.mint.clone(),
+        token_b_mint: pool.token_b.mint.clone(),
+        source_slot: evidence.source_slot,
+        capabilities: orca_clmm_capabilities(),
+    };
+
+    readiness.validate_for_pool(pool)?;
+    Ok(readiness)
 }
 
 trait ExactInputQuoteAdapter {
@@ -759,6 +924,17 @@ mod tests {
         }
     }
 
+    fn orca_exact_input_quote(token_in: u64, token_est_out: u64) -> ExactInSwapQuote {
+        ExactInSwapQuote {
+            token_in,
+            token_est_out,
+            token_min_out: token_est_out,
+            trade_fee: token_in / 1_000,
+            trade_fee_rate_min: 3_000,
+            trade_fee_rate_max: 3_000,
+        }
+    }
+
     fn route_candidates() -> Vec<TwoLegRouteCandidate> {
         generate_two_leg_routes(&[
             normalized_pool(
@@ -1150,6 +1326,125 @@ mod tests {
             readiness.capabilities.auxiliary_state,
             AuxiliaryStateKind::Ticks
         );
+    }
+
+    #[test]
+    fn orca_quote_readiness_binds_bidirectional_o2_evidence() -> Result<(), String> {
+        let mut pool = normalized_pool(
+            Venue::Orca,
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+        pool.quote_reserves = QuoteReserveState::Unavailable;
+
+        let evidence = OrcaQuoteReadinessEvidence::from_o2_quotes(
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            101,
+            orca_exact_input_quote(1_000_000, 12_108_498),
+            orca_exact_input_quote(1_000_000, 82_091),
+        )?;
+
+        let readiness = orca_quote_readiness_for_pool(&pool, &evidence)?;
+
+        assert_eq!(readiness.venue, Venue::Orca);
+        assert_eq!(readiness.pool_id, "orca-pool");
+        assert_eq!(readiness.token_a_mint, WRAPPED_SOL_MINT);
+        assert_eq!(readiness.token_b_mint, TEST_MINT);
+        assert_eq!(readiness.source_slot, 101);
+        assert_eq!(readiness.capabilities, orca_clmm_capabilities());
+        assert_eq!(readiness.capabilities.liquidity_model, LiquidityModel::Clmm);
+        assert_eq!(
+            readiness.capabilities.auxiliary_state,
+            AuxiliaryStateKind::Ticks
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn orca_quote_readiness_rejects_fabricated_cpmm_reserves() -> Result<(), String> {
+        let pool = normalized_pool(
+            Venue::Orca,
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            100,
+        );
+
+        let evidence = OrcaQuoteReadinessEvidence::from_o2_quotes(
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            101,
+            orca_exact_input_quote(1_000_000, 12_108_498),
+            orca_exact_input_quote(1_000_000, 82_091),
+        )?;
+
+        let result = orca_quote_readiness_for_pool(&pool, &evidence);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("must not fabricate CPMM quote reserves")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn orca_quote_readiness_rejects_stale_evidence() -> Result<(), String> {
+        let mut pool = normalized_pool(
+            Venue::Orca,
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            9,
+            6,
+            102,
+        );
+        pool.quote_reserves = QuoteReserveState::Unavailable;
+
+        let evidence = OrcaQuoteReadinessEvidence::from_o2_quotes(
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            101,
+            orca_exact_input_quote(1_000_000, 12_108_498),
+            orca_exact_input_quote(1_000_000, 82_091),
+        )?;
+
+        let result = orca_quote_readiness_for_pool(&pool, &evidence);
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("stale Orca O2 readiness evidence")
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn orca_o2_readiness_evidence_rejects_invalid_quote_proof() {
+        let result = OrcaQuoteReadinessEvidence::from_o2_quotes(
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_MINT,
+            101,
+            orca_exact_input_quote(1_000_000, 0),
+            orca_exact_input_quote(1_000_000, 82_091),
+        );
+
+        assert!(matches!(
+            result,
+            Err(error) if error.contains("zero estimated output")
+        ));
     }
 
     #[test]
