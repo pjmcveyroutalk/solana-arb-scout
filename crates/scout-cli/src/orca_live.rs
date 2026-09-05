@@ -173,13 +173,11 @@ pub async fn prepare_orca(
         "id": 41
     });
 
-    let base_hydration =
-        orca::parse_hydration_response(observation, &base_hydration_payload)?;
+    let base_hydration = orca::parse_hydration_response(observation, &base_hydration_payload)?;
 
     let now = unix_time_ms_now()?;
 
-    let normalized =
-        orca::hydrate_normalized_observation(observation, &base_hydration, now, now)?;
+    let normalized = orca::hydrate_normalized_observation(observation, &base_hydration, now, now)?;
 
     let evidence = OrcaQuoteReadinessEvidence::from_o2_quotes(
         &observation.pubkey,
@@ -211,11 +209,7 @@ pub async fn prepare_orca(
             "orca_o2_ready: pool={} trigger_slot={} snapshot_slot={} ",
             "anchor={} intermediate={}"
         ),
-        observation.pubkey,
-        observation.slot,
-        snapshot_slot,
-        anchor_mint,
-        intermediate_mint
+        observation.pubkey, observation.slot, snapshot_slot, anchor_mint, intermediate_mint
     );
 
     Ok(PreparedOrca {
@@ -231,9 +225,7 @@ fn build_orca_snapshot_plan(
     observation: &orca::OrcaWhirlpoolAccountObservation,
 ) -> Result<OrcaSnapshotPlan, String> {
     if observation.pool_state.is_adaptive_fee() {
-        return Err(
-            "Orca live preparation currently admits only non-adaptive O2 pools".to_owned(),
-        );
+        return Err("Orca live preparation currently admits only non-adaptive O2 pools".to_owned());
     }
 
     let tick_array_start_indexes =
