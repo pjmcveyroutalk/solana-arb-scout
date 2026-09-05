@@ -162,10 +162,16 @@ async fn try_raydium_priority_route(
     rpc_client: &Client,
     prepared: orca_live::PreparedOrca,
 ) -> Result<bool, String> {
-    for request in raydium_pair_lookup_requests(&prepared.anchor_mint, &prepared.intermediate_mint) {
+    for request in raydium_pair_lookup_requests(&prepared.anchor_mint, &prepared.intermediate_mint)
+    {
         sleep(LOOKUP_PACING).await;
 
-        let payload = post_rpc(rpc_client, &request, "Orca priority Raydium exact-pair lookup").await?;
+        let payload = post_rpc(
+            rpc_client,
+            &request,
+            "Orca priority Raydium exact-pair lookup",
+        )
+        .await?;
         let observations = parse_raydium_pair_lookup_response(&payload)?;
 
         for observation in observations {
