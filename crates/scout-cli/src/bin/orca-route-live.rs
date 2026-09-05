@@ -255,12 +255,9 @@ async fn prepare_orca(
         ));
     }
 
-    let mint_a =
-        decode_required_account_any_owner(accounts, MINT_A_INDEX, "Orca route mint A")?;
-    let mint_b =
-        decode_required_account_any_owner(accounts, MINT_B_INDEX, "Orca route mint B")?;
-    let clock =
-        decode_required_account_any_owner(accounts, CLOCK_INDEX, "Orca route Clock")?;
+    let mint_a = decode_required_account_any_owner(accounts, MINT_A_INDEX, "Orca route mint A")?;
+    let mint_b = decode_required_account_any_owner(accounts, MINT_B_INDEX, "Orca route mint B")?;
+    let clock = decode_required_account_any_owner(accounts, CLOCK_INDEX, "Orca route Clock")?;
 
     let quote_inputs = OrcaQuoteSnapshotInputs {
         clock: OrcaQuoteAccount {
@@ -319,13 +316,11 @@ async fn prepare_orca(
         "id": 41
     });
 
-    let base_hydration =
-        orca::parse_hydration_response(observation, &base_hydration_payload)?;
+    let base_hydration = orca::parse_hydration_response(observation, &base_hydration_payload)?;
 
     let now = unix_time_ms_now()?;
 
-    let normalized =
-        orca::hydrate_normalized_observation(observation, &base_hydration, now, now)?;
+    let normalized = orca::hydrate_normalized_observation(observation, &base_hydration, now, now)?;
 
     let evidence = OrcaQuoteReadinessEvidence::from_o2_quotes(
         &observation.pubkey,
@@ -436,17 +431,11 @@ fn decode_tick_arrays(
     ])
 }
 
-async fn try_raydium_route(
-    rpc_client: &Client,
-    orca: &PreparedOrca,
-) -> Result<bool, String> {
-    for request in
-        raydium_pair_lookup_requests(&orca.anchor_mint, &orca.intermediate_mint)
-    {
+async fn try_raydium_route(rpc_client: &Client, orca: &PreparedOrca) -> Result<bool, String> {
+    for request in raydium_pair_lookup_requests(&orca.anchor_mint, &orca.intermediate_mint) {
         sleep(LOOKUP_PACING).await;
 
-        let payload =
-            post_rpc(rpc_client, &request, "Raydium exact-pair lookup").await?;
+        let payload = post_rpc(rpc_client, &request, "Raydium exact-pair lookup").await?;
 
         let observations = parse_raydium_pair_lookup_response(&payload)?;
 
@@ -477,17 +466,11 @@ async fn try_raydium_route(
     Ok(false)
 }
 
-async fn try_pumpswap_route(
-    rpc_client: &Client,
-    orca: &PreparedOrca,
-) -> Result<bool, String> {
-    for request in
-        pumpswap::pair_lookup_requests(&orca.anchor_mint, &orca.intermediate_mint)
-    {
+async fn try_pumpswap_route(rpc_client: &Client, orca: &PreparedOrca) -> Result<bool, String> {
+    for request in pumpswap::pair_lookup_requests(&orca.anchor_mint, &orca.intermediate_mint) {
         sleep(LOOKUP_PACING).await;
 
-        let payload =
-            post_rpc(rpc_client, &request, "PumpSwap exact-pair lookup").await?;
+        let payload = post_rpc(rpc_client, &request, "PumpSwap exact-pair lookup").await?;
 
         let observations = pumpswap::parse_pair_lookup_response(&payload)?;
 
@@ -526,10 +509,7 @@ fn prove_cross_venue_route(
 ) -> Result<bool, String> {
     let mut registry = ActiveMintRegistry::new();
 
-    registry.upsert(
-        orca.normalized.clone(),
-        Some(orca.readiness.clone()),
-    )?;
+    registry.upsert(orca.normalized.clone(), Some(orca.readiness.clone()))?;
 
     registry.upsert(counterpart.clone(), Some(counterpart_readiness))?;
 
@@ -543,8 +523,7 @@ fn prove_cross_venue_route(
         .into_iter()
         .filter(|route| {
             route.anchor_mint() == orca.anchor_mint.as_str()
-                && route.intermediate_mint()
-                    == orca.intermediate_mint.as_str()
+                && route.intermediate_mint() == orca.intermediate_mint.as_str()
         })
         .collect::<Vec<_>>();
 
@@ -557,8 +536,7 @@ fn prove_cross_venue_route(
         return Ok(false);
     }
 
-    let decimals =
-        anchor_decimals(&orca.normalized, &orca.anchor_mint)?;
+    let decimals = anchor_decimals(&orca.normalized, &orca.anchor_mint)?;
 
     for amount_in_raw in probe_amounts(decimals)? {
         let mut successful = Vec::new();
@@ -579,9 +557,7 @@ fn prove_cross_venue_route(
                     &orca.quote_snapshot,
                 )
             } else {
-                return Err(
-                    "generated route unexpectedly omitted Orca".to_owned()
-                );
+                return Err("generated route unexpectedly omitted Orca".to_owned());
             };
 
             match result {
@@ -607,15 +583,9 @@ fn prove_cross_venue_route(
         );
 
         for (route, quote) in successful {
-            println!(
-                "orca_route_candidate_pass: {}",
-                route.summary()
-            );
+            println!("orca_route_candidate_pass: {}", route.summary());
 
-            println!(
-                "orca_route_quote_pass: {}",
-                quote.summary()
-            );
+            println!("orca_route_quote_pass: {}", quote.summary());
         }
 
         println!(
@@ -634,10 +604,7 @@ fn prove_cross_venue_route(
     Ok(false)
 }
 
-fn anchor_decimals(
-    pool: &NormalizedPoolState,
-    anchor_mint: &str,
-) -> Result<u8, String> {
+fn anchor_decimals(pool: &NormalizedPoolState, anchor_mint: &str) -> Result<u8, String> {
     if pool.token_a.mint == anchor_mint {
         Ok(pool.token_a.decimals)
     } else if pool.token_b.mint == anchor_mint {
@@ -653,9 +620,7 @@ fn anchor_decimals(
 fn probe_amounts(decimals: u8) -> Result<Vec<u64>, String> {
     let whole = 10u64
         .checked_pow(u32::from(decimals))
-        .ok_or_else(|| {
-            format!("anchor decimals {decimals} exceed u64 sizing")
-        })?;
+        .ok_or_else(|| format!("anchor decimals {decimals} exceed u64 sizing"))?;
 
     let mut amounts = Vec::new();
 
@@ -696,25 +661,18 @@ async fn hydrate_raydium(
     )
     .await?;
 
-    let snapshot =
-        raydium::parse_hydration_response(observation, &payload)?;
+    let snapshot = raydium::parse_hydration_response(observation, &payload)?;
 
     let now = unix_time_ms_now()?;
 
-    let normalized = raydium::hydrate_normalized_observation(
-        observation,
-        &snapshot,
-        now,
-        now,
-    )?;
+    let normalized = raydium::hydrate_normalized_observation(observation, &snapshot, now, now)?;
 
     let context = VenueQuoteContext::Raydium {
         pool_id: normalized.pool_id.clone(),
         snapshot: &snapshot,
     };
 
-    let readiness =
-        quote_readiness_for_pool(&normalized, &context)?;
+    let readiness = quote_readiness_for_pool(&normalized, &context)?;
 
     Ok((normalized, snapshot, readiness))
 }
@@ -741,25 +699,18 @@ async fn hydrate_pumpswap(
     )
     .await?;
 
-    let snapshot =
-        pumpswap::parse_hydration_response(observation, &payload)?;
+    let snapshot = pumpswap::parse_hydration_response(observation, &payload)?;
 
     let now = unix_time_ms_now()?;
 
-    let normalized = pumpswap::hydrate_normalized_observation(
-        observation,
-        &snapshot,
-        now,
-        now,
-    )?;
+    let normalized = pumpswap::hydrate_normalized_observation(observation, &snapshot, now, now)?;
 
     let context = VenueQuoteContext::PumpSwap {
         pool_id: normalized.pool_id.clone(),
         snapshot: &snapshot,
     };
 
-    let readiness =
-        quote_readiness_for_pool(&normalized, &context)?;
+    let readiness = quote_readiness_for_pool(&normalized, &context)?;
 
     Ok((normalized, snapshot, readiness))
 }
@@ -774,10 +725,7 @@ async fn fetch_multiple_accounts<T>(
 where
     T: AsRef<str>,
 {
-    let keys = pubkeys
-        .iter()
-        .map(|key| key.as_ref())
-        .collect::<Vec<_>>();
+    let keys = pubkeys.iter().map(|key| key.as_ref()).collect::<Vec<_>>();
 
     let request = json!({
         "jsonrpc": "2.0",
@@ -796,11 +744,7 @@ where
     post_rpc(rpc_client, &request, label).await
 }
 
-async fn post_rpc(
-    rpc_client: &Client,
-    request: &Value,
-    label: &str,
-) -> Result<Value, String> {
+async fn post_rpc(rpc_client: &Client, request: &Value, label: &str) -> Result<Value, String> {
     let response = rpc_client
         .post(SOLANA_RPC_URL)
         .json(request)
@@ -811,23 +755,16 @@ async fn post_rpc(
     let status = response.status();
 
     if !status.is_success() {
-        return Err(format!(
-            "{label} RPC returned HTTP status {status}"
-        ));
+        return Err(format!("{label} RPC returned HTTP status {status}"));
     }
 
     response
         .json::<Value>()
         .await
-        .map_err(|error| {
-            format!("{label} returned invalid JSON: {error}")
-        })
+        .map_err(|error| format!("{label} returned invalid JSON: {error}"))
 }
 
-fn response_slot(
-    payload: &Value,
-    label: &str,
-) -> Result<u64, String> {
+fn response_slot(payload: &Value, label: &str) -> Result<u64, String> {
     if let Some(error) = payload.get("error") {
         return Err(format!("{label} RPC error: {error}"));
     }
@@ -835,38 +772,23 @@ fn response_slot(
     payload
         .pointer("/result/context/slot")
         .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            format!("{label} response missing context slot")
-        })
+        .ok_or_else(|| format!("{label} response missing context slot"))
 }
 
-fn response_accounts<'a>(
-    payload: &'a Value,
-    label: &str,
-) -> Result<&'a Vec<Value>, String> {
+fn response_accounts<'a>(payload: &'a Value, label: &str) -> Result<&'a Vec<Value>, String> {
     payload
         .pointer("/result/value")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!("{label} response missing account array")
-        })
+        .ok_or_else(|| format!("{label} response missing account array"))
 }
 
-fn require_present(
-    accounts: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<(), String> {
+fn require_present(accounts: &[Value], index: usize, label: &str) -> Result<(), String> {
     let account = accounts
         .get(index)
-        .ok_or_else(|| {
-            format!("Orca route {label} account index missing")
-        })?;
+        .ok_or_else(|| format!("Orca route {label} account index missing"))?;
 
     if account.is_null() {
-        return Err(format!(
-            "Orca route required {label} account is missing"
-        ));
+        return Err(format!("Orca route required {label} account is missing"));
     }
 
     Ok(())
@@ -878,8 +800,7 @@ fn decode_required_account(
     expected_owner: &str,
     label: &str,
 ) -> Result<DecodedRpcAccount, String> {
-    let decoded =
-        decode_required_account_any_owner(accounts, index, label)?;
+    let decoded = decode_required_account_any_owner(accounts, index, label)?;
 
     if decoded.owner != expected_owner {
         return Err(format!(
@@ -915,18 +836,13 @@ fn decode_tick_array_or_zero(
 ) -> Result<orca_whirlpools_core::TickArrayFacade, String> {
     let account = accounts
         .get(index)
-        .ok_or_else(|| {
-            format!("Orca route tick-array account index {index} missing")
-        })?;
+        .ok_or_else(|| format!("Orca route tick-array account index {index} missing"))?;
 
     if account.is_null() {
-        return Ok(
-            orca_o2::zeroed_tick_array(expected_start_tick_index)
-        );
+        return Ok(orca_o2::zeroed_tick_array(expected_start_tick_index));
     }
 
-    let decoded =
-        decode_rpc_account(account, "Orca route tick array")?;
+    let decoded = decode_rpc_account(account, "Orca route tick array")?;
 
     orca_o2::decode_tick_array_account(
         &decoded.data,
@@ -936,10 +852,7 @@ fn decode_tick_array_or_zero(
     )
 }
 
-fn decode_rpc_account(
-    account: &Value,
-    label: &str,
-) -> Result<DecodedRpcAccount, String> {
+fn decode_rpc_account(account: &Value, label: &str) -> Result<DecodedRpcAccount, String> {
     let owner = account
         .get("owner")
         .and_then(Value::as_str)
@@ -949,9 +862,7 @@ fn decode_rpc_account(
     let data = account
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!("{label} missing account data array")
-        })?;
+        .ok_or_else(|| format!("{label} missing account data array"))?;
 
     if data.len() != 2 {
         return Err(format!(
@@ -962,15 +873,11 @@ fn decode_rpc_account(
 
     let encoded = data[0]
         .as_str()
-        .ok_or_else(|| {
-            format!("{label} account data payload is not a string")
-        })?;
+        .ok_or_else(|| format!("{label} account data payload is not a string"))?;
 
     let encoding = data[1]
         .as_str()
-        .ok_or_else(|| {
-            format!("{label} account data encoding is not a string")
-        })?;
+        .ok_or_else(|| format!("{label} account data encoding is not a string"))?;
 
     if encoding != "base64" {
         return Err(format!(
@@ -980,9 +887,7 @@ fn decode_rpc_account(
 
     let decoded = BASE64_STANDARD
         .decode(encoded)
-        .map_err(|error| {
-            format!("{label} invalid base64 account data: {error}")
-        })?;
+        .map_err(|error| format!("{label} invalid base64 account data: {error}"))?;
 
     Ok(DecodedRpcAccount {
         owner,
@@ -990,16 +895,9 @@ fn decode_rpc_account(
     })
 }
 
-async fn wait_for_subscription_confirmation<S>(
-    websocket: &mut S,
-) -> Result<(), String>
+async fn wait_for_subscription_confirmation<S>(websocket: &mut S) -> Result<(), String>
 where
-    S: StreamExt<
-            Item = Result<
-                Message,
-                tokio_tungstenite::tungstenite::Error,
-            >,
-        > + Unpin,
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     loop {
         let payload = next_json_message(websocket).await?;
@@ -1017,10 +915,7 @@ where
         payload
             .get("result")
             .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                "Orca program subscription confirmation missing result"
-                    .to_owned()
-            })?;
+            .ok_or_else(|| "Orca program subscription confirmation missing result".to_owned())?;
 
         println!("orca_route_program_subscription_confirmed");
 
@@ -1028,44 +923,25 @@ where
     }
 }
 
-async fn next_json_message<S>(
-    websocket: &mut S,
-) -> Result<Value, String>
+async fn next_json_message<S>(websocket: &mut S) -> Result<Value, String>
 where
-    S: StreamExt<
-            Item = Result<
-                Message,
-                tokio_tungstenite::tungstenite::Error,
-            >,
-        > + Unpin,
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     loop {
         let message = websocket
             .next()
             .await
-            .ok_or_else(|| {
-                "Solana WebSocket stream ended".to_owned()
-            })?
-            .map_err(|error| {
-                format!("Solana WebSocket read failed: {error}")
-            })?;
+            .ok_or_else(|| "Solana WebSocket stream ended".to_owned())?
+            .map_err(|error| format!("Solana WebSocket read failed: {error}"))?;
 
         match message {
             Message::Text(text) => {
                 return serde_json::from_str(text.as_ref())
-                    .map_err(|error| {
-                        format!(
-                            "invalid Solana WebSocket JSON: {error}"
-                        )
-                    });
+                    .map_err(|error| format!("invalid Solana WebSocket JSON: {error}"));
             }
             Message::Binary(bytes) => {
                 return serde_json::from_slice(bytes.as_ref())
-                    .map_err(|error| {
-                        format!(
-                            "invalid binary Solana WebSocket JSON: {error}"
-                        )
-                    });
+                    .map_err(|error| format!("invalid binary Solana WebSocket JSON: {error}"));
             }
             Message::Close(frame) => {
                 return Err(format!(
@@ -1080,24 +956,17 @@ where
 fn unix_time_ms_now() -> Result<u64, String> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| {
-            format!("system clock precedes Unix epoch: {error}")
-        })?;
+        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?;
 
     u64::try_from(duration.as_millis())
-        .map_err(|_| {
-            "Unix millisecond timestamp overflow".to_owned()
-        })
+        .map_err(|_| "Unix millisecond timestamp overflow".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_orca_pool(
-        token_a: &str,
-        token_b: &str,
-    ) -> orca::OrcaWhirlpoolState {
+    fn sample_orca_pool(token_a: &str, token_b: &str) -> orca::OrcaWhirlpoolState {
         orca::OrcaWhirlpoolState {
             whirlpools_config: "config".to_owned(),
             whirlpool_bump: 255,
@@ -1117,22 +986,14 @@ mod tests {
 
     #[test]
     fn anchor_pair_prefers_wrapped_sol() {
-        let pool =
-            sample_orca_pool(USDC_MINT, WRAPPED_SOL_MINT);
+        let pool = sample_orca_pool(USDC_MINT, WRAPPED_SOL_MINT);
 
-        assert_eq!(
-            anchor_pair(&pool),
-            Some((WRAPPED_SOL_MINT, USDC_MINT))
-        );
+        assert_eq!(anchor_pair(&pool), Some((WRAPPED_SOL_MINT, USDC_MINT)));
     }
 
     #[test]
-    fn probe_amounts_are_bounded_and_increasing()
-    -> Result<(), String> {
-        assert_eq!(
-            probe_amounts(6)?,
-            vec![1_000, 10_000, 100_000, 1_000_000]
-        );
+    fn probe_amounts_are_bounded_and_increasing() -> Result<(), String> {
+        assert_eq!(probe_amounts(6)?, vec![1_000, 10_000, 100_000, 1_000_000]);
 
         Ok(())
     }
