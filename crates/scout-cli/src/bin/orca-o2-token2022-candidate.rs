@@ -317,11 +317,7 @@ fn parse_transfer_fee_config(
     Ok(active.into_core())
 }
 
-fn validate_transfer_fee(
-    fee: ParsedTransferFee,
-    label: &str,
-    which: &str,
-) -> Result<(), String> {
+fn validate_transfer_fee(fee: ParsedTransferFee, label: &str, which: &str) -> Result<(), String> {
     if fee.basis_points > MAX_FEE_BASIS_POINTS {
         return Err(format!(
             "{label} Token-2022 {which} transfer fee exceeds 10000 bps: {}",
@@ -344,21 +340,15 @@ fn read_u64(data: &[u8], offset: usize, label: &str) -> Result<u64, String> {
     Ok(u64::from_le_bytes(read_array::<8>(data, offset, label)?))
 }
 
-fn read_array<const N: usize>(
-    data: &[u8],
-    offset: usize,
-    label: &str,
-) -> Result<[u8; N], String> {
+fn read_array<const N: usize>(data: &[u8], offset: usize, label: &str) -> Result<[u8; N], String> {
     let end = offset
         .checked_add(N)
         .ok_or_else(|| format!("{label} byte offset overflow"))?;
-
     let bytes = data
         .get(offset..end)
         .ok_or_else(|| format!("{label} bytes outside account data"))?;
 
-    <[u8; N]>::try_from(bytes)
-        .map_err(|_| format!("{label} byte slice had invalid length"))
+    <[u8; N]>::try_from(bytes).map_err(|_| format!("{label} byte slice had invalid length"))
 }
 
 #[cfg(test)]
@@ -371,11 +361,7 @@ mod tests {
         data
     }
 
-    fn clock_data(
-        slot: u64,
-        epoch: u64,
-        unix_timestamp: i64,
-    ) -> Vec<u8> {
+    fn clock_data(slot: u64, epoch: u64, unix_timestamp: i64) -> Vec<u8> {
         let mut data = vec![0u8; CLOCK_DATA_LEN];
         data[0..8].copy_from_slice(&slot.to_le_bytes());
         data[16..24].copy_from_slice(&epoch.to_le_bytes());
@@ -383,48 +369,28 @@ mod tests {
         data
     }
 
-    fn mint_with_extensions(
-        extensions: &[(u16, Vec<u8>)],
-    ) -> Result<Vec<u8>, String> {
-        let extension_bytes = extensions.iter().try_fold(
-            0usize,
-            |total, (_, value)| {
-                total
-                    .checked_add(TOKEN_2022_TLV_HEADER_LEN)
-                    .and_then(|next| next.checked_add(value.len()))
-                    .ok_or_else(|| {
-                        "test Token-2022 extension size overflow".to_owned()
-                    })
-            },
-        )?;
-
+    fn mint_with_extensions(extensions: &[(u16, Vec<u8>)]) -> Result<Vec<u8>, String> {
+        let extension_bytes = extensions.iter().try_fold(0usize, |total, (_, value)| {
+            total
+                .checked_add(TOKEN_2022_TLV_HEADER_LEN)
+                .and_then(|next| next.checked_add(value.len()))
+                .ok_or_else(|| "test Token-2022 extension size overflow".to_owned())
+        })?;
         let total_len = TOKEN_2022_MINT_TLV_START
             .checked_add(extension_bytes)
             .ok_or_else(|| "test Token-2022 mint size overflow".to_owned())?;
-
         let mut data = vec![0u8; total_len];
         data[45] = 1;
         data[TOKEN_2022_ACCOUNT_TYPE_OFFSET] = TOKEN_2022_MINT_ACCOUNT_TYPE;
-
         let mut offset = TOKEN_2022_MINT_TLV_START;
 
         for (extension_type, value) in extensions {
             let value_len = u16::try_from(value.len())
-                .map_err(|_| {
-                    "test Token-2022 extension value too large".to_owned()
-                })?;
-
-            data[offset..offset + 2]
-                .copy_from_slice(&extension_type.to_le_bytes());
-
-            data[offset + 2..offset + 4]
-                .copy_from_slice(&value_len.to_le_bytes());
-
+                .map_err(|_| "test Token-2022 extension value too large".to_owned())?;
+            data[offset..offset + 2].copy_from_slice(&extension_type.to_le_bytes());
+            data[offset + 2..offset + 4].copy_from_slice(&value_len.to_le_bytes());
             offset += TOKEN_2022_TLV_HEADER_LEN;
-
-            data[offset..offset + value.len()]
-                .copy_from_slice(value);
-
+            data[offset..offset + value.len()].copy_from_slice(value);
             offset += value.len();
         }
 
@@ -440,62 +406,25 @@ mod tests {
         newer_bps: u16,
     ) -> Vec<u8> {
         let mut data = vec![0u8; TRANSFER_FEE_CONFIG_LEN];
-
-        data[
-            TRANSFER_FEE_OLDER_EPOCH_OFFSET
-                ..TRANSFER_FEE_OLDER_EPOCH_OFFSET + 8
-        ]
-        .copy_from_slice(&older_epoch.to_le_bytes());
-
-        data[
-            TRANSFER_FEE_OLDER_MAX_FEE_OFFSET
-                ..TRANSFER_FEE_OLDER_MAX_FEE_OFFSET + 8
-        ]
-        .copy_from_slice(&older_max_fee.to_le_bytes());
-
-        data[
-            TRANSFER_FEE_OLDER_BPS_OFFSET
-                ..TRANSFER_FEE_OLDER_BPS_OFFSET + 2
-        ]
-        .copy_from_slice(&older_bps.to_le_bytes());
-
-        data[
-            TRANSFER_FEE_NEWER_EPOCH_OFFSET
-                ..TRANSFER_FEE_NEWER_EPOCH_OFFSET + 8
-        ]
-        .copy_from_slice(&newer_epoch.to_le_bytes());
-
-        data[
-            TRANSFER_FEE_NEWER_MAX_FEE_OFFSET
-                ..TRANSFER_FEE_NEWER_MAX_FEE_OFFSET + 8
-        ]
-        .copy_from_slice(&newer_max_fee.to_le_bytes());
-
-        data[
-            TRANSFER_FEE_NEWER_BPS_OFFSET
-                ..TRANSFER_FEE_NEWER_BPS_OFFSET + 2
-        ]
-        .copy_from_slice(&newer_bps.to_le_bytes());
-
+        data[TRANSFER_FEE_OLDER_EPOCH_OFFSET..TRANSFER_FEE_OLDER_EPOCH_OFFSET + 8]
+            .copy_from_slice(&older_epoch.to_le_bytes());
+        data[TRANSFER_FEE_OLDER_MAX_FEE_OFFSET..TRANSFER_FEE_OLDER_MAX_FEE_OFFSET + 8]
+            .copy_from_slice(&older_max_fee.to_le_bytes());
+        data[TRANSFER_FEE_OLDER_BPS_OFFSET..TRANSFER_FEE_OLDER_BPS_OFFSET + 2]
+            .copy_from_slice(&older_bps.to_le_bytes());
+        data[TRANSFER_FEE_NEWER_EPOCH_OFFSET..TRANSFER_FEE_NEWER_EPOCH_OFFSET + 8]
+            .copy_from_slice(&newer_epoch.to_le_bytes());
+        data[TRANSFER_FEE_NEWER_MAX_FEE_OFFSET..TRANSFER_FEE_NEWER_MAX_FEE_OFFSET + 8]
+            .copy_from_slice(&newer_max_fee.to_le_bytes());
+        data[TRANSFER_FEE_NEWER_BPS_OFFSET..TRANSFER_FEE_NEWER_BPS_OFFSET + 2]
+            .copy_from_slice(&newer_bps.to_le_bytes());
         data
     }
 
     #[test]
-    fn clock_snapshot_supplies_epoch_and_timestamp()
-        -> Result<(), String>
-    {
-        let data = clock_data(
-            123_456,
-            812,
-            1_777_777_777,
-        );
-
-        let clock = decode_clock_sysvar(
-            CLOCK_SYSVAR_ID,
-            SYSVAR_OWNER_ID,
-            &data,
-        )?;
-
+    fn clock_snapshot_supplies_epoch_and_timestamp() -> Result<(), String> {
+        let data = clock_data(123_456, 812, 1_777_777_777);
+        let clock = decode_clock_sysvar(CLOCK_SYSVAR_ID, SYSVAR_OWNER_ID, &data)?;
         assert_eq!(clock.slot, 123_456);
         assert_eq!(clock.epoch, 812);
         assert_eq!(clock.unix_timestamp, 1_777_777_777);
@@ -503,28 +432,13 @@ mod tests {
     }
 
     #[test]
-    fn clock_identity_and_layout_fail_closed()
-        -> Result<(), String>
-    {
+    fn clock_identity_and_layout_fail_closed() -> Result<(), String> {
         let data = clock_data(1, 2, 3);
-
-        let wrong_key = decode_clock_sysvar(
-            "11111111111111111111111111111111",
-            SYSVAR_OWNER_ID,
-            &data,
-        );
-
-        let wrong_owner = decode_clock_sysvar(
-            CLOCK_SYSVAR_ID,
-            "11111111111111111111111111111111",
-            &data,
-        );
-
-        let wrong_len = decode_clock_sysvar(
-            CLOCK_SYSVAR_ID,
-            SYSVAR_OWNER_ID,
-            &data[..39],
-        );
+        let wrong_key =
+            decode_clock_sysvar("11111111111111111111111111111111", SYSVAR_OWNER_ID, &data);
+        let wrong_owner =
+            decode_clock_sysvar(CLOCK_SYSVAR_ID, "11111111111111111111111111111111", &data);
+        let wrong_len = decode_clock_sysvar(CLOCK_SYSVAR_ID, SYSVAR_OWNER_ID, &data[..39]);
 
         assert!(wrong_key.is_err());
         assert!(wrong_owner.is_err());
@@ -533,19 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn negative_clock_timestamp_fails_closed()
-        -> Result<(), String>
-    {
+    fn negative_clock_timestamp_fails_closed() -> Result<(), String> {
         let data = clock_data(1, 2, -1);
-
-        match decode_clock_sysvar(
-            CLOCK_SYSVAR_ID,
-            SYSVAR_OWNER_ID,
-            &data,
-        ) {
-            Ok(_) => Err(
-                "negative Clock timestamp was accepted".to_owned(),
-            ),
+        match decode_clock_sysvar(CLOCK_SYSVAR_ID, SYSVAR_OWNER_ID, &data) {
+            Ok(_) => Err("negative Clock timestamp was accepted".to_owned()),
             Err(error) => {
                 assert!(error.contains("negative"));
                 Ok(())
@@ -554,33 +459,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_spl_mint_has_no_transfer_fee()
-        -> Result<(), String>
-    {
-        let fee = transfer_fee_for_mint(
-            SPL_TOKEN_PROGRAM_ID,
-            &initialized_mint(),
-            999,
-            "mint",
-        )?;
-
+    fn legacy_spl_mint_has_no_transfer_fee() -> Result<(), String> {
+        let fee = transfer_fee_for_mint(SPL_TOKEN_PROGRAM_ID, &initialized_mint(), 999, "mint")?;
         assert!(fee.is_none());
         Ok(())
     }
 
     #[test]
-    fn unknown_mint_owner_fails_closed()
-        -> Result<(), String>
-    {
+    fn unknown_mint_owner_fails_closed() -> Result<(), String> {
         match transfer_fee_for_mint(
             "11111111111111111111111111111111",
             &initialized_mint(),
             999,
             "mint",
         ) {
-            Ok(_) => Err(
-                "unknown mint program owner was accepted".to_owned(),
-            ),
+            Ok(_) => Err("unknown mint program owner was accepted".to_owned()),
             Err(error) => {
                 assert!(error.contains("unsupported token program"));
                 Ok(())
@@ -589,52 +482,20 @@ mod tests {
     }
 
     #[test]
-    fn plain_token_2022_mint_has_no_transfer_fee()
-        -> Result<(), String>
-    {
-        let fee = transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &initialized_mint(),
-            99,
-            "mint",
-        )?;
-
+    fn plain_token_2022_mint_has_no_transfer_fee() -> Result<(), String> {
+        let fee = transfer_fee_for_mint(TOKEN_2022_PROGRAM_ID, &initialized_mint(), 99, "mint")?;
         assert!(fee.is_none());
         Ok(())
     }
 
     #[test]
-    fn epoch_boundary_selects_correct_transfer_fee()
-        -> Result<(), String>
-    {
-        let config = transfer_fee_config(
-            1,
-            10,
-            100,
-            100,
-            5_000,
-            1,
-        );
-
-        let data = mint_with_extensions(&[
-            (EXTENSION_TRANSFER_FEE_CONFIG, config),
-        ])?;
-
-        let before = transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &data,
-            99,
-            "mint",
-        )?
-        .ok_or_else(|| "expected older transfer fee".to_owned())?;
-
-        let at = transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &data,
-            100,
-            "mint",
-        )?
-        .ok_or_else(|| "expected newer transfer fee".to_owned())?;
+    fn epoch_boundary_selects_correct_transfer_fee() -> Result<(), String> {
+        let config = transfer_fee_config(1, 10, 100, 100, 5_000, 1);
+        let data = mint_with_extensions(&[(EXTENSION_TRANSFER_FEE_CONFIG, config)])?;
+        let before = transfer_fee_for_mint(TOKEN_2022_PROGRAM_ID, &data, 99, "mint")?
+            .ok_or_else(|| "expected older transfer fee".to_owned())?;
+        let at = transfer_fee_for_mint(TOKEN_2022_PROGRAM_ID, &data, 100, "mint")?
+            .ok_or_else(|| "expected newer transfer fee".to_owned())?;
 
         assert_eq!(before.fee_bps, 100);
         assert_eq!(before.max_fee, 10);
@@ -644,37 +505,15 @@ mod tests {
     }
 
     #[test]
-    fn metadata_extensions_can_coexist_with_transfer_fee()
-        -> Result<(), String>
-    {
-        let config = transfer_fee_config(
-            1,
-            10,
-            100,
-            100,
-            5_000,
-            1,
-        );
-
+    fn metadata_extensions_can_coexist_with_transfer_fee() -> Result<(), String> {
+        let config = transfer_fee_config(1, 10, 100, 100, 5_000, 1);
         let data = mint_with_extensions(&[
-            (
-                EXTENSION_METADATA_POINTER,
-                vec![0u8; METADATA_POINTER_LEN],
-            ),
+            (EXTENSION_METADATA_POINTER, vec![0u8; METADATA_POINTER_LEN]),
             (EXTENSION_TRANSFER_FEE_CONFIG, config),
-            (
-                EXTENSION_TOKEN_METADATA,
-                vec![7u8; 12],
-            ),
+            (EXTENSION_TOKEN_METADATA, vec![7u8; 12]),
         ])?;
-
-        let fee = transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &data,
-            100,
-            "mint",
-        )?
-        .ok_or_else(|| "expected transfer fee".to_owned())?;
+        let fee = transfer_fee_for_mint(TOKEN_2022_PROGRAM_ID, &data, 100, "mint")?
+            .ok_or_else(|| "expected transfer fee".to_owned())?;
 
         assert_eq!(fee.fee_bps, 1);
         assert_eq!(fee.max_fee, 5_000);
@@ -682,22 +521,10 @@ mod tests {
     }
 
     #[test]
-    fn transfer_hook_fails_closed()
-        -> Result<(), String>
-    {
-        let data = mint_with_extensions(&[
-            (EXTENSION_TRANSFER_HOOK, vec![0u8; 64]),
-        ])?;
-
-        match transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &data,
-            100,
-            "mint",
-        ) {
-            Ok(_) => Err(
-                "TransferHook mint was accepted".to_owned(),
-            ),
+    fn transfer_hook_fails_closed() -> Result<(), String> {
+        let data = mint_with_extensions(&[(EXTENSION_TRANSFER_HOOK, vec![0u8; 64])])?;
+        match transfer_fee_for_mint(TOKEN_2022_PROGRAM_ID, &data, 100, "mint") {
+            Ok(_) => Err("TransferHook mint was accepted".to_owned()),
             Err(error) => {
                 assert!(error.contains("TransferHook"));
                 Ok(())
@@ -706,33 +533,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_unsupported_extensions_fail_closed()
-        -> Result<(), String>
-    {
-        let malformed = mint_with_extensions(&[
-            (
-                EXTENSION_TRANSFER_FEE_CONFIG,
-                vec![0u8; 107],
-            ),
-        ])?;
-
-        let unsupported = mint_with_extensions(&[
-            (3u16, vec![0u8; 32]),
-        ])?;
-
-        let malformed_result = transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &malformed,
-            100,
-            "malformed mint",
-        );
-
-        let unsupported_result = transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &unsupported,
-            100,
-            "unsupported mint",
-        );
+    fn malformed_or_unsupported_extensions_fail_closed() -> Result<(), String> {
+        let malformed = mint_with_extensions(&[(EXTENSION_TRANSFER_FEE_CONFIG, vec![0u8; 107])])?;
+        let unsupported = mint_with_extensions(&[(3u16, vec![0u8; 32])])?;
+        let malformed_result =
+            transfer_fee_for_mint(TOKEN_2022_PROGRAM_ID, &malformed, 100, "malformed mint");
+        let unsupported_result =
+            transfer_fee_for_mint(TOKEN_2022_PROGRAM_ID, &unsupported, 100, "unsupported mint");
 
         assert!(malformed_result.is_err());
         assert!(unsupported_result.is_err());
@@ -740,31 +547,11 @@ mod tests {
     }
 
     #[test]
-    fn transfer_fee_above_basis_point_limit_fails_closed()
-        -> Result<(), String>
-    {
-        let config = transfer_fee_config(
-            1,
-            10,
-            10_001,
-            100,
-            5_000,
-            1,
-        );
-
-        let data = mint_with_extensions(&[
-            (EXTENSION_TRANSFER_FEE_CONFIG, config),
-        ])?;
-
-        match transfer_fee_for_mint(
-            TOKEN_2022_PROGRAM_ID,
-            &data,
-            99,
-            "mint",
-        ) {
-            Ok(_) => Err(
-                "invalid transfer-fee bps was accepted".to_owned(),
-            ),
+    fn transfer_fee_above_basis_point_limit_fails_closed() -> Result<(), String> {
+        let config = transfer_fee_config(1, 10, 10_001, 100, 5_000, 1);
+        let data = mint_with_extensions(&[(EXTENSION_TRANSFER_FEE_CONFIG, config)])?;
+        match transfer_fee_for_mint(TOKEN_2022_PROGRAM_ID, &data, 99, "mint") {
+            Ok(_) => Err("invalid transfer-fee bps was accepted".to_owned()),
             Err(error) => {
                 assert!(error.contains("exceeds 10000 bps"));
                 Ok(())
