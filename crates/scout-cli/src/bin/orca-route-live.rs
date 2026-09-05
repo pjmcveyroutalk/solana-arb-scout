@@ -609,10 +609,7 @@ mod tests {
 
     #[test]
     fn probe_amounts_are_bounded_and_increasing() -> Result<(), String> {
-        assert_eq!(
-            probe_amounts(6)?,
-            vec![1_000, 10_000, 100_000, 1_000_000]
-        );
+        assert_eq!(probe_amounts(6)?, vec![1_000, 10_000, 100_000, 1_000_000]);
 
         Ok(())
     }
