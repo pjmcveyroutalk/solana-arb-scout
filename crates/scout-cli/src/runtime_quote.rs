@@ -95,12 +95,7 @@ pub fn quote_route_exact_input(
                 pumpswap_quote_contexts,
                 orca_prepared,
                 |leg_2_adapter| {
-                    quote_two_leg_exact_input(
-                        route,
-                        amount_in_raw,
-                        leg_1_adapter,
-                        leg_2_adapter,
-                    )
+                    quote_two_leg_exact_input(route, amount_in_raw, leg_1_adapter, leg_2_adapter)
                 },
             )
         },
@@ -150,12 +145,10 @@ fn with_leg_adapter<T>(
                     leg.pool_id()
                 )
             })?;
-
             let context = VenueQuoteContext::Raydium {
                 pool_id: leg.pool_id().to_owned(),
                 snapshot,
             };
-
             operation(&context)
         }
         Venue::PumpSwap => {
@@ -165,12 +158,10 @@ fn with_leg_adapter<T>(
                     leg.pool_id()
                 )
             })?;
-
             let context = VenueQuoteContext::PumpSwap {
                 pool_id: leg.pool_id().to_owned(),
                 snapshot,
             };
-
             operation(&context)
         }
         Venue::Orca => {
@@ -180,7 +171,6 @@ fn with_leg_adapter<T>(
                     leg.pool_id()
                 )
             })?;
-
             operation(&prepared.quote_snapshot)
         }
     }
@@ -193,3 +183,4 @@ fn log_missing(pool: &NormalizedPoolState, reason: &str) {
         pool.pool_id
     );
 }
+
