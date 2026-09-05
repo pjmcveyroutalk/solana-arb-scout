@@ -1679,13 +1679,8 @@ mod tests {
 
         let amount_after_fee = independent_apply_transfer_fee(amount_in, transfer_fee)?;
 
-        let baseline_a_to_b = quote_fixture(
-            &pool,
-            &pool.token_mint_a,
-            amount_after_fee,
-            None,
-            None,
-        )?;
+        let baseline_a_to_b =
+            quote_fixture(&pool, &pool.token_mint_a, amount_after_fee, None, None)?;
         let input_fee_a_to_b = quote_fixture(
             &pool,
             &pool.token_mint_a,
@@ -1700,8 +1695,7 @@ mod tests {
         );
         assert_eq!(input_fee_a_to_b.token_in, amount_in);
 
-        let baseline_full_a_to_b =
-            quote_fixture(&pool, &pool.token_mint_a, amount_in, None, None)?;
+        let baseline_full_a_to_b = quote_fixture(&pool, &pool.token_mint_a, amount_in, None, None)?;
         let expected_output_a_to_b =
             independent_apply_transfer_fee(baseline_full_a_to_b.token_est_out, transfer_fee)?;
         let output_fee_a_to_b = quote_fixture(
@@ -1714,13 +1708,8 @@ mod tests {
 
         assert_eq!(output_fee_a_to_b.token_est_out, expected_output_a_to_b);
 
-        let baseline_b_to_a = quote_fixture(
-            &pool,
-            &pool.token_mint_b,
-            amount_after_fee,
-            None,
-            None,
-        )?;
+        let baseline_b_to_a =
+            quote_fixture(&pool, &pool.token_mint_b, amount_after_fee, None, None)?;
         let input_fee_b_to_a = quote_fixture(
             &pool,
             &pool.token_mint_b,
@@ -1735,8 +1724,7 @@ mod tests {
         );
         assert_eq!(input_fee_b_to_a.token_in, amount_in);
 
-        let baseline_full_b_to_a =
-            quote_fixture(&pool, &pool.token_mint_b, amount_in, None, None)?;
+        let baseline_full_b_to_a = quote_fixture(&pool, &pool.token_mint_b, amount_in, None, None)?;
         let expected_output_b_to_a =
             independent_apply_transfer_fee(baseline_full_b_to_a.token_est_out, transfer_fee)?;
         let output_fee_b_to_a = quote_fixture(
@@ -1770,10 +1758,7 @@ mod tests {
         let amount_after_input_fee = independent_apply_transfer_fee(amount_in, input_fee)?;
 
         assert_eq!(amount_after_input_fee, 9_999);
-        assert_eq!(
-            independent_apply_transfer_fee(100_000, output_fee)?,
-            99_993
-        );
+        assert_eq!(independent_apply_transfer_fee(100_000, output_fee)?, 99_993);
 
         let baseline = quote_fixture(
             &pool,
@@ -1783,8 +1768,7 @@ mod tests {
             None,
         )?;
 
-        let expected_output =
-            independent_apply_transfer_fee(baseline.token_est_out, output_fee)?;
+        let expected_output = independent_apply_transfer_fee(baseline.token_est_out, output_fee)?;
 
         let both_fee_quote = quote_fixture(
             &pool,
@@ -1825,8 +1809,7 @@ mod tests {
 
         let before_activation =
             snapshot_quote_with_token_2022_a(&pool, 99, &mint_a_data, amount_in)?;
-        let at_activation =
-            snapshot_quote_with_token_2022_a(&pool, 100, &mint_a_data, amount_in)?;
+        let at_activation = snapshot_quote_with_token_2022_a(&pool, 100, &mint_a_data, amount_in)?;
 
         let older_amount_after_fee = independent_apply_transfer_fee(amount_in, older_fee)?;
         let newer_amount_after_fee = independent_apply_transfer_fee(amount_in, newer_fee)?;
