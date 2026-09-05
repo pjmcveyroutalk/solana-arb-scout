@@ -338,4 +338,4 @@ fn read_array<const N: usize>(data: &[u8], offset: usize, label: &str) -> Result
         .ok_or_else(|| format!("{label} bytes outside account data"))?;
 
     <[u8; N]>::try_from(bytes).map_err(|_| format!("{label} byte slice had invalid length"))
-  }
+}
