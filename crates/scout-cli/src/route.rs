@@ -257,6 +257,78 @@ mod tests {
     }
 
     #[test]
+    fn orca_clmm_and_raydium_generate_both_route_directions_without_cpmm_reserves() {
+        let mut orca = sample_pool(
+            Venue::Orca,
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_TOKEN,
+        );
+        orca.quote_reserves = QuoteReserveState::Unavailable;
+
+        let raydium = sample_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            TEST_TOKEN,
+        );
+
+        let routes = generate_two_leg_routes(&[orca, raydium]);
+
+        assert_eq!(routes.len(), 2);
+
+        assert!(routes.iter().any(|route| {
+            route.leg_1().venue() == Venue::Orca
+                && route.leg_2().venue() == Venue::RaydiumCpmm
+                && route.anchor_mint() == WRAPPED_SOL_MINT
+                && route.intermediate_mint() == TEST_TOKEN
+        }));
+
+        assert!(routes.iter().any(|route| {
+            route.leg_1().venue() == Venue::RaydiumCpmm
+                && route.leg_2().venue() == Venue::Orca
+                && route.anchor_mint() == WRAPPED_SOL_MINT
+                && route.intermediate_mint() == TEST_TOKEN
+        }));
+    }
+
+    #[test]
+    fn orca_clmm_and_pumpswap_generate_both_route_directions_without_cpmm_reserves() {
+        let mut orca = sample_pool(
+            Venue::Orca,
+            "orca-pool",
+            WRAPPED_SOL_MINT,
+            TEST_TOKEN,
+        );
+        orca.quote_reserves = QuoteReserveState::Unavailable;
+
+        let pumpswap = sample_pool(
+            Venue::PumpSwap,
+            "pumpswap-pool",
+            TEST_TOKEN,
+            WRAPPED_SOL_MINT,
+        );
+
+        let routes = generate_two_leg_routes(&[orca, pumpswap]);
+
+        assert_eq!(routes.len(), 2);
+
+        assert!(routes.iter().any(|route| {
+            route.leg_1().venue() == Venue::Orca
+                && route.leg_2().venue() == Venue::PumpSwap
+                && route.anchor_mint() == WRAPPED_SOL_MINT
+                && route.intermediate_mint() == TEST_TOKEN
+        }));
+
+        assert!(routes.iter().any(|route| {
+            route.leg_1().venue() == Venue::PumpSwap
+                && route.leg_2().venue() == Venue::Orca
+                && route.anchor_mint() == WRAPPED_SOL_MINT
+                && route.intermediate_mint() == TEST_TOKEN
+        }));
+    }
+
+    #[test]
     fn same_venue_pools_do_not_form_route() {
         let pools = vec![
             sample_pool(
@@ -299,8 +371,18 @@ mod tests {
     #[test]
     fn unsupported_anchor_does_not_form_route() {
         let pools = vec![
-            sample_pool(Venue::RaydiumCpmm, "raydium-pool", OTHER_TOKEN, TEST_TOKEN),
-            sample_pool(Venue::PumpSwap, "pumpswap-pool", OTHER_TOKEN, TEST_TOKEN),
+            sample_pool(
+                Venue::RaydiumCpmm,
+                "raydium-pool",
+                OTHER_TOKEN,
+                TEST_TOKEN,
+            ),
+            sample_pool(
+                Venue::PumpSwap,
+                "pumpswap-pool",
+                OTHER_TOKEN,
+                TEST_TOKEN,
+            ),
         ];
 
         assert!(generate_two_leg_routes(&pools).is_empty());
@@ -331,8 +413,18 @@ mod tests {
     #[test]
     fn usdc_anchor_is_permitted() {
         let pools = vec![
-            sample_pool(Venue::RaydiumCpmm, "raydium-pool", USDC_MINT, TEST_TOKEN),
-            sample_pool(Venue::PumpSwap, "pumpswap-pool", TEST_TOKEN, USDC_MINT),
+            sample_pool(
+                Venue::RaydiumCpmm,
+                "raydium-pool",
+                USDC_MINT,
+                TEST_TOKEN,
+            ),
+            sample_pool(
+                Venue::PumpSwap,
+                "pumpswap-pool",
+                TEST_TOKEN,
+                USDC_MINT,
+            ),
         ];
 
         let routes = generate_two_leg_routes(&pools);
@@ -344,8 +436,18 @@ mod tests {
     #[test]
     fn usdt_anchor_is_permitted() {
         let pools = vec![
-            sample_pool(Venue::RaydiumCpmm, "raydium-pool", USDT_MINT, TEST_TOKEN),
-            sample_pool(Venue::PumpSwap, "pumpswap-pool", TEST_TOKEN, USDT_MINT),
+            sample_pool(
+                Venue::RaydiumCpmm,
+                "raydium-pool",
+                USDT_MINT,
+                TEST_TOKEN,
+            ),
+            sample_pool(
+                Venue::PumpSwap,
+                "pumpswap-pool",
+                TEST_TOKEN,
+                USDT_MINT,
+            ),
         ];
 
         let routes = generate_two_leg_routes(&pools);
