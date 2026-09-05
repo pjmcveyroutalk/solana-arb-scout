@@ -1900,9 +1900,7 @@ pub fn validate_r13_jsonl(
                     "search_incomplete" => search_incomplete_count += 1,
                     "no_atomic_match_complete" => no_atomic_match_complete_count += 1,
                     "atomic_route_match" => atomic_route_match_count += 1,
-                    "atomic_route_amounts_unresolved" => {
-                        atomic_route_amounts_unresolved_count += 1
-                    }
+                    "atomic_route_amounts_unresolved" => atomic_route_amounts_unresolved_count += 1,
                     "atomic_route_outcome_resolved" => atomic_route_outcome_resolved_count += 1,
                     _ => {}
                 }
