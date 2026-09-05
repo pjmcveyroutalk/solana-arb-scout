@@ -352,9 +352,11 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
             path.display()
         )
     })?;
+
     if bytes.is_empty() {
         return Err("R13 source R12 evidence is empty".to_owned());
     }
+
     if !bytes.ends_with(b"\n") {
         return Err("R13 source R12 evidence is not newline terminated".to_owned());
     }
@@ -373,20 +375,25 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
     for line in text.lines() {
         let record: Value = serde_json::from_str(line)
             .map_err(|error| format!("R13 could not parse R12 JSONL record: {error}"))?;
+
         if required_str(&record, "schema_version")? != "r12-shadow-v1" {
             return Err("R13 source schema is not r12-shadow-v1".to_owned());
         }
+
         let sequence = required_u64(&record, "record_sequence")?;
+
         if sequence != expected_sequence {
             return Err(format!(
                 "R13 source R12 sequence mismatch: expected={expected_sequence} actual={sequence}"
             ));
         }
+
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or_else(|| "R13 source sequence overflow".to_owned())?;
 
         let run_id = required_str(&record, "run_id")?.to_owned();
+
         match source_run_id.as_deref() {
             None => source_run_id = Some(run_id.clone()),
             Some(expected) if expected == run_id => {}
@@ -397,6 +404,7 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
             .get("github_actions")
             .cloned()
             .ok_or_else(|| "R13 source R12 record missing github_actions".to_owned())?;
+
         match source_github_actions.as_ref() {
             None => source_github_actions = Some(github.clone()),
             Some(expected) if expected == &github => {}
@@ -406,18 +414,22 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
         }
 
         let event_type = required_str(&record, "event_type")?;
+
         match event_type {
             "run_start" => {
                 if saw_start || sequence != 1 {
                     return Err("R13 source R12 run_start lifecycle invalid".to_owned());
                 }
+
                 saw_start = true;
             }
             "candidate_evaluation" => {
                 if !saw_start || saw_end {
                     return Err("R13 source candidate outside completed lifecycle".to_owned());
                 }
+
                 let candidate = parse_candidate(&record)?;
+
                 if routes
                     .insert(candidate.route.route_id.clone(), candidate.route.clone())
                     .is_some_and(|previous| previous != candidate.route)
@@ -427,6 +439,7 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
                         candidate.route.route_id
                     ));
                 }
+
                 candidates.push(candidate);
             }
             "route_rejection" => {
@@ -438,6 +451,7 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
                 if !saw_start || saw_end {
                     return Err("R13 source R12 run_end lifecycle invalid".to_owned());
                 }
+
                 saw_end = true;
             }
             other => {
@@ -451,23 +465,27 @@ pub fn load_plan(path: &Path) -> Result<ForensicsPlan, String> {
     if !saw_start || !saw_end {
         return Err("R13 requires a completed R12 run with run_start and run_end".to_owned());
     }
+
     if candidates.is_empty() {
         return Err("R13 completed R12 source contains no candidate_evaluation records".to_owned());
     }
 
     let mut candidate_keys = BTreeSet::new();
+
     for candidate in &candidates {
         let key = (
             candidate.source_run_id.clone(),
             candidate.source_record_sequence,
             candidate.candidate_id.clone(),
         );
+
         if !candidate_keys.insert(key) {
             return Err("R13 source contains duplicate candidate provenance".to_owned());
         }
     }
 
     let mut history_requests = BTreeSet::new();
+
     for route in routes.values() {
         history_requests.insert(route.history_request(&route.leg_1)?);
         history_requests.insert(route.history_request(&route.leg_2)?);
@@ -964,6 +982,7 @@ fn match_orca_leg(
         }
 
         let a_to_b = parse_orca_swap_direction(&instruction.data)?;
+
         let (user_input, user_output) = if a_to_b {
             (&instruction.account_keys[3], &instruction.account_keys[5])
         } else {
@@ -1042,6 +1061,7 @@ fn token_account_mint_evidence(
         .get(account)
         .and_then(|value| value.get("mint"))
         .and_then(Value::as_str);
+
     let after = post
         .get(account)
         .and_then(|value| value.get("mint"))
@@ -1154,6 +1174,7 @@ fn token_balances_by_account(
 
     for value in values {
         let index = required_u64(value, "accountIndex")? as usize;
+
         let account = account_keys
             .get(index)
             .ok_or_else(|| format!("R13 {field} accountIndex out of range"))?
@@ -1249,6 +1270,7 @@ fn resolved_instructions(
 
             for group in groups {
                 let outer_index = required_u64(group, "index")? as usize;
+
                 let instructions = group
                     .get("instructions")
                     .and_then(Value::as_array)
@@ -1473,6 +1495,7 @@ fn write_forensics_artifact_in_directory(
     let intersections = intersections.ok_or_else(|| {
         "R13 mature evidence missing route intersections after contract validation".to_owned()
     })?;
+
     let analyses = analyses.ok_or_else(|| {
         "R13 mature evidence missing route analyses after contract validation".to_owned()
     })?;
@@ -1734,6 +1757,7 @@ pub fn validate_r13_jsonl(
     let mut saw_maturity = false;
     let mut saw_end = false;
     let mut maturity_reached: Option<bool> = None;
+
     let mut route_results = 0usize;
     let mut candidate_annotations = 0usize;
     let mut transaction_matches = 0usize;
@@ -1810,9 +1834,11 @@ pub fn validate_r13_jsonl(
 
                 required_u64(payload, "required_end_slot")?;
                 optional_u64(payload, "initial_confirmed_tip")?;
+
                 let final_tip = optional_u64(payload, "final_confirmed_tip")?;
                 let poll_attempts = required_u64(payload, "poll_attempts")?;
                 let rpc_error_count = required_u64(payload, "rpc_error_count")?;
+
                 required_u64(payload, "wait_elapsed_ms")?;
 
                 if poll_attempts == 0 || rpc_error_count > poll_attempts {
@@ -1867,13 +1893,16 @@ pub fn validate_r13_jsonl(
 
                 let payload = required_object(&record, "payload")?;
                 let status = required_str(payload, "status")?;
+
                 validate_route_status(status)?;
 
                 match status {
                     "search_incomplete" => search_incomplete_count += 1,
                     "no_atomic_match_complete" => no_atomic_match_complete_count += 1,
                     "atomic_route_match" => atomic_route_match_count += 1,
-                    "atomic_route_amounts_unresolved" => atomic_route_amounts_unresolved_count += 1,
+                    "atomic_route_amounts_unresolved" => {
+                        atomic_route_amounts_unresolved_count += 1
+                    }
                     "atomic_route_outcome_resolved" => atomic_route_outcome_resolved_count += 1,
                     _ => {}
                 }
@@ -1937,6 +1966,7 @@ pub fn validate_r13_jsonl(
 
                 let payload = required_object(&record, "payload")?;
                 let status = required_str(payload, "captureability_status")?;
+
                 validate_candidate_status(status)?;
 
                 match maturity_reached {
@@ -2512,7 +2542,9 @@ mod tests {
             accounts.clone(),
             orca_swap_data(ORCA_SWAP_V2, true),
         );
+
         let a_to_b_leg = leg("orca", "orca-pool", "mint-a", "mint-b", 100);
+
         let a_to_b = match_leg(&a_to_b_leg, &a_to_b_instruction)?
             .ok_or_else(|| "Orca SwapV2 A-to-B fixture did not match".to_owned())?;
 
@@ -2525,7 +2557,9 @@ mod tests {
             accounts,
             orca_swap_data(ORCA_SWAP_V2, false),
         );
+
         let b_to_a_leg = leg("orca", "orca-pool", "mint-b", "mint-a", 100);
+
         let b_to_a = match_leg(&b_to_a_leg, &b_to_a_instruction)?
             .ok_or_else(|| "Orca SwapV2 B-to-A fixture did not match".to_owned())?;
 
@@ -2555,7 +2589,9 @@ mod tests {
             ],
             orca_swap_data(ORCA_SWAP, true),
         );
+
         let route_leg = leg("orca", "orca-pool", "mint-a", "mint-b", 100);
+
         let matched = match_leg(&route_leg, &instruction)?
             .ok_or_else(|| "Orca legacy swap fixture did not match".to_owned())?;
 
@@ -2564,6 +2600,7 @@ mod tests {
         assert_eq!(matched.user_output_token_account, "owner-b");
 
         let account_keys = vec!["owner-a".to_owned(), "owner-b".to_owned()];
+
         let complete = json!({
             "preTokenBalances": [
                 token_balance(0, "mint-a"),
@@ -2628,6 +2665,7 @@ mod tests {
             "tick-2",
             "oracle",
         ];
+
         let route_leg = leg("orca", "orca-pool", "mint-a", "mint-b", 100);
 
         let wrong_pool = resolved_instruction(
@@ -2644,11 +2682,8 @@ mod tests {
         let mut valid_accounts = accounts;
         valid_accounts[4] = "orca-pool";
 
-        let malformed = resolved_instruction(
-            ORCA_WHIRLPOOL_PROGRAM_ID,
-            valid_accounts,
-            malformed_data,
-        );
+        let malformed =
+            resolved_instruction(ORCA_WHIRLPOOL_PROGRAM_ID, valid_accounts, malformed_data);
 
         assert!(matches!(
             match_leg(&route_leg, &malformed),
@@ -2688,6 +2723,7 @@ mod tests {
     #[test]
     fn immature_artifact_contains_no_route_search_results() -> Result<(), String> {
         let plan = plan_with_candidate()?;
+
         let maturity = EvidenceMaturity {
             required_end_slot: 133,
             initial_confirmed_tip: Some(102),
@@ -2731,6 +2767,7 @@ mod tests {
                 "route_search_result" => route_results += 1,
                 "candidate_annotation" => {
                     let payload = required_object(&record, "payload")?;
+
                     if required_str(payload, "captureability_status")? == "window_not_mature" {
                         immature_annotations += 1;
                     }
@@ -2830,6 +2867,7 @@ mod tests {
             }
 
             let payload = required_object(&record, "payload")?;
+
             for signature in required_array(payload, "intersecting_signatures")? {
                 retained.insert(
                     signature
