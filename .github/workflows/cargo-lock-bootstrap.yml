@@ -1,0 +1,39 @@
+name: Scout Cargo Lock Bootstrap
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/cargo-lock-bootstrap.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate Certified Rust 1.80 Cargo.lock
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install exact Rust 1.80
+        run: |
+          rustup toolchain install 1.80.0 \
+            --profile minimal
+
+      - name: Generate certified dependency graph
+        run: |
+          rustup run 1.80.0 cargo generate-lockfile
+          rustup run 1.80.0 cargo update -p tinyvec --precise 1.12.0
+          rustup run 1.80.0 cargo metadata --locked --no-deps >/dev/null
+
+      - name: Preserve Cargo.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: scout-rust-1.80-cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
