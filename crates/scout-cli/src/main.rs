@@ -27,8 +27,8 @@ use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL
 use scout_core::{NormalizedPoolState, Venue};
 use serde_json::{json, Value};
 use sizing::{
-    parse_pyth_usd_price, pyth_usd_price_request, usd_dollars_to_anchor_raw, PythUsdFeed,
-    SolUsdPrice, USD_SIZE_GRID,
+    parse_pyth_usd_price, pyth_usd_price_request, usd_dollars_to_anchor_raw_with_prices,
+    PythUsdFeed, SolUsdPrice, USD_SIZE_GRID,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1514,11 +1514,13 @@ async fn validate_registry_routes_and_sizes(
         let mut route_grid_quotes = 0usize;
 
         for dollars in USD_SIZE_GRID {
-            let amount_in_raw = match usd_dollars_to_anchor_raw(
+            let amount_in_raw = match usd_dollars_to_anchor_raw_with_prices(
                 dollars,
                 route_candidate.anchor_mint(),
                 anchor_decimals,
-                Some(&usd_prices.sol),
+                &usd_prices.sol,
+                usd_prices.usdc.as_ref(),
+                usd_prices.usdt.as_ref(),
             ) {
                 Ok(amount) => amount,
                 Err(error) => {
