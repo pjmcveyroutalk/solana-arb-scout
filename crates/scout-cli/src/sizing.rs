@@ -622,4 +622,244 @@ mod tests {
                 Some("getAccountInfo")
             );
             assert_eq!(
-                request.pointer("/params/0").and_then(Valu
+                request.pointer("/params/0").and_then(Value::as_str),
+                Some(feed.account())
+            );
+            assert_eq!(
+                request.get("id").and_then(Value::as_u64),
+                Some(feed.request_id())
+            );
+        }
+
+        assert_eq!(
+            sol_usd_price_request()
+                .pointer("/params/0")
+                .and_then(Value::as_str),
+            Some(PYTH_SOL_USD_ACCOUNT)
+        );
+    }
+
+    #[test]
+    fn provenance_binds_account_feed_receiver_and_policy() {
+        for feed in PYTH_USD_FEEDS {
+            let provenance = feed.provenance();
+
+            assert_eq!(provenance.account, feed.account());
+            assert_eq!(provenance.feed_id.as_slice(), feed.feed_id().as_slice());
+            assert_eq!(provenance.receiver_program_id, PYTH_RECEIVER_PROGRAM_ID);
+            assert_eq!(
+                provenance.verification_requirement,
+                PYTH_VERIFICATION_REQUIREMENT
+            );
+            assert_eq!(
+                provenance.acceptance_policy_id,
+                PYTH_USD_ACCEPTANCE_POLICY_ID
+            );
+        }
+    }
+
+    #[test]
+    fn parses_fully_verified_fresh_usd_feeds() -> Result<(), String> {
+        for feed in PYTH_USD_FEEDS {
+            let payload = price_payload(
+                feed,
+                &price_update_bytes(feed, 20_000_000_000, 25_000, -8, NOW - 30),
+            );
+            let price = parse_pyth_usd_price(&payload, NOW, feed)?;
+
+            assert_eq!(price.price, 20_000_000_000);
+            assert_eq!(price.confidence, 25_000);
+            assert_eq!(price.exponent, -8);
+            assert_eq!(price.publish_time, NOW - 30);
+            assert_eq!(price.posted_slot, 123_456);
+            assert_eq!(price.rpc_slot, 123_456);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_confidence_exactly_at_policy_boundary() -> Result<(), String> {
+        let feed = PythUsdFeed::Usdc;
+        let payload = price_payload(
+            feed,
+            &price_update_bytes(feed, 100_000_000, 1_000_000, -8, NOW - 30),
+        );
+
+        let price = parse_pyth_usd_price(&payload, NOW, feed)?;
+        assert_eq!(price.confidence, 1_000_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_confidence_wider_than_policy_boundary() {
+        let feed = PythUsdFeed::Usdc;
+        let payload = price_payload(
+            feed,
+            &price_update_bytes(feed, 100_000_000, 1_000_001, -8, NOW - 30),
+        );
+
+        assert!(parse_pyth_usd_price(&payload, NOW, feed).is_err());
+    }
+
+    #[test]
+    fn rejects_confidence_without_positive_lower_bound() {
+        let feed = PythUsdFeed::Usdt;
+        let payload = price_payload(
+            feed,
+            &price_update_bytes(feed, 100_000_000, 100_000_000, -8, NOW - 30),
+        );
+
+        assert!(parse_pyth_usd_price(&payload, NOW, feed).is_err());
+    }
+
+    #[test]
+    fn rejects_exponent_outside_arithmetic_policy() {
+        let feed = PythUsdFeed::Sol;
+        let payload = price_payload(
+            feed,
+            &price_update_bytes(feed, 20_000_000_000, 25_000, -39, NOW - 30),
+        );
+
+        assert!(parse_pyth_usd_price(&payload, NOW, feed).is_err());
+    }
+
+    #[test]
+    fn sol_wrapper_preserves_existing_parser_contract() -> Result<(), String> {
+        let payload = price_payload(
+            PythUsdFeed::Sol,
+            &price_update_bytes(PythUsdFeed::Sol, 20_000_000_000, 25_000, -8, NOW - 30),
+        );
+
+        let price = parse_sol_usd_price(&payload, NOW)?;
+
+        assert_eq!(price.price, 20_000_000_000);
+        assert_eq!(price.exponent, -8);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_wrong_owner_feed_partial_stale_nonpositive_and_id_mismatch() {
+        let feed = PythUsdFeed::Usdc;
+        let bytes = price_update_bytes(feed, 100_000_000, 25_000, -8, NOW - 30);
+
+        let mut wrong_owner = price_payload(feed, &bytes);
+        wrong_owner["result"]["value"]["owner"] = Value::from("11111111111111111111111111111111");
+        assert!(parse_pyth_usd_price(&wrong_owner, NOW, feed).is_err());
+
+        let mut wrong_feed_bytes = bytes.clone();
+        wrong_feed_bytes[41] ^= 1;
+        assert!(parse_pyth_usd_price(&price_payload(feed, &wrong_feed_bytes), NOW, feed).is_err());
+
+        let mut partial_bytes = bytes.clone();
+        partial_bytes[40] = 0;
+        assert!(parse_pyth_usd_price(&price_payload(feed, &partial_bytes), NOW, feed).is_err());
+
+        let stale = price_update_bytes(feed, 100_000_000, 25_000, -8, NOW - 91);
+        assert!(parse_pyth_usd_price(&price_payload(feed, &stale), NOW, feed).is_err());
+
+        let zero = price_update_bytes(feed, 0, 25_000, -8, NOW - 30);
+        assert!(parse_pyth_usd_price(&price_payload(feed, &zero), NOW, feed).is_err());
+
+        let negative = price_update_bytes(feed, -1, 25_000, -8, NOW - 30);
+        assert!(parse_pyth_usd_price(&price_payload(feed, &negative), NOW, feed).is_err());
+
+        let mut wrong_id = price_payload(feed, &bytes);
+        wrong_id["id"] = Value::from(999u64);
+        assert!(parse_pyth_usd_price(&wrong_id, NOW, feed).is_err());
+
+        let mut wrong_jsonrpc = price_payload(feed, &bytes);
+        wrong_jsonrpc["jsonrpc"] = Value::from("1.0");
+        assert!(parse_pyth_usd_price(&wrong_jsonrpc, NOW, feed).is_err());
+    }
+
+    #[test]
+    fn transitional_entrypoint_fails_closed_for_stablecoin_anchors() {
+        let sol = test_price(20_000_000_000, 100_000_000, -8);
+
+        assert!(usd_dollars_to_anchor_raw(1, USDC_MINT, 6, Some(&sol)).is_err());
+        assert!(usd_dollars_to_anchor_raw(1, USDT_MINT, 6, Some(&sol)).is_err());
+    }
+
+    #[test]
+    fn conservative_sizing_uses_upper_confidence_bound_for_all_anchors() -> Result<(), String> {
+        let sol = test_price(20_000_000_000, 100_000_000, -8);
+        let usdc = test_price(100_000_000, 500_000, -8);
+        let usdt = test_price(98_000_000, 500_000, -8);
+
+        assert_eq!(
+            usd_dollars_to_anchor_raw_with_prices(
+                1,
+                WRAPPED_SOL_MINT,
+                9,
+                &sol,
+                Some(&usdc),
+                Some(&usdt),
+            )?,
+            4_975_124
+        );
+        assert_eq!(
+            usd_dollars_to_anchor_raw_with_prices(1, USDC_MINT, 6, &sol, Some(&usdc), Some(&usdt),)?,
+            995_024
+        );
+        assert_eq!(
+            usd_dollars_to_anchor_raw_with_prices(1, USDT_MINT, 6, &sol, Some(&usdc), Some(&usdt),)?,
+            1_015_228
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn conservative_sizing_fails_closed_without_required_stable_feed() {
+        let sol = test_price(20_000_000_000, 100_000_000, -8);
+        let usdc = test_price(100_000_000, 500_000, -8);
+        let usdt = test_price(100_000_000, 500_000, -8);
+
+        assert!(
+            usd_dollars_to_anchor_raw_with_prices(1, USDC_MINT, 6, &sol, None, Some(&usdt),)
+                .is_err()
+        );
+        assert!(
+            usd_dollars_to_anchor_raw_with_prices(1, USDT_MINT, 6, &sol, Some(&usdc), None,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn conservative_sizing_rejects_upper_bound_overflow() {
+        let sol = test_price(u64::MAX, 1, -8);
+
+        assert!(
+            usd_dollars_to_anchor_raw_with_prices(1, WRAPPED_SOL_MINT, 9, &sol, None, None,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn conservative_sizing_supports_positive_exponents() -> Result<(), String> {
+        let sol = test_price(2, 0, 2);
+
+        assert_eq!(
+            usd_dollars_to_anchor_raw_with_prices(1, WRAPPED_SOL_MINT, 9, &sol, None, None,)?,
+            5_000_000
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn transitional_wsol_entrypoint_also_uses_upper_confidence_bound() -> Result<(), String> {
+        let sol = test_price(20_000_000_000, 100_000_000, -8);
+
+        assert_eq!(
+            usd_dollars_to_anchor_raw(1, WRAPPED_SOL_MINT, 9, Some(&sol))?,
+            4_975_124
+        );
+
+        Ok(())
+    }
+}
+
