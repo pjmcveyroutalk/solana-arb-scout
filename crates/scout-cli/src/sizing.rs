@@ -413,35 +413,6 @@ pub fn parse_sol_usd_price(payload: &Value, now_unix_seconds: i64) -> Result<Sol
     parse_pyth_usd_price(payload, now_unix_seconds, PythUsdFeed::Sol)
 }
 
-pub fn usd_dollars_to_anchor_raw(
-    dollars: u64,
-    anchor_mint: &str,
-    anchor_decimals: u8,
-    sol_usd_price: Option<&SolUsdPrice>,
-) -> Result<u64, String> {
-    if anchor_mint == USDC_MINT || anchor_mint == USDT_MINT {
-        return Err(format!(
-            "stablecoin USD sizing requires its accepted Pyth USD feed for anchor {anchor_mint}"
-        ));
-    }
-
-    if anchor_mint != WRAPPED_SOL_MINT {
-        return Err(format!("unsupported Rung 10 USD anchor mint {anchor_mint}"));
-    }
-
-    let sol_usd_price = sol_usd_price
-        .ok_or_else(|| "Pyth SOL/USD price context is required for WSOL sizing".to_owned())?;
-
-    usd_dollars_to_anchor_raw_with_prices(
-        dollars,
-        anchor_mint,
-        anchor_decimals,
-        sol_usd_price,
-        None,
-        None,
-    )
-}
-
 pub fn usd_dollars_to_anchor_raw_with_prices(
     dollars: u64,
     anchor_mint: &str,
@@ -776,14 +747,6 @@ mod tests {
     }
 
     #[test]
-    fn transitional_entrypoint_fails_closed_for_stablecoin_anchors() {
-        let sol = test_price(20_000_000_000, 100_000_000, -8);
-
-        assert!(usd_dollars_to_anchor_raw(1, USDC_MINT, 6, Some(&sol)).is_err());
-        assert!(usd_dollars_to_anchor_raw(1, USDT_MINT, 6, Some(&sol)).is_err());
-    }
-
-    #[test]
     fn conservative_sizing_uses_upper_confidence_bound_for_all_anchors() -> Result<(), String> {
         let sol = test_price(20_000_000_000, 100_000_000, -8);
         let usdc = test_price(100_000_000, 500_000, -8);
@@ -845,18 +808,6 @@ mod tests {
         assert_eq!(
             usd_dollars_to_anchor_raw_with_prices(1, WRAPPED_SOL_MINT, 9, &sol, None, None,)?,
             5_000_000
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn transitional_wsol_entrypoint_also_uses_upper_confidence_bound() -> Result<(), String> {
-        let sol = test_price(20_000_000_000, 100_000_000, -8);
-
-        assert_eq!(
-            usd_dollars_to_anchor_raw(1, WRAPPED_SOL_MINT, 9, Some(&sol))?,
-            4_975_124
         );
 
         Ok(())
