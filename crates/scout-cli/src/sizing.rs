@@ -801,25 +801,11 @@ mod tests {
             4_975_124
         );
         assert_eq!(
-            usd_dollars_to_anchor_raw_with_prices(
-                1,
-                USDC_MINT,
-                6,
-                &sol,
-                Some(&usdc),
-                Some(&usdt),
-            )?,
+            usd_dollars_to_anchor_raw_with_prices(1, USDC_MINT, 6, &sol, Some(&usdc), Some(&usdt),)?,
             995_024
         );
         assert_eq!(
-            usd_dollars_to_anchor_raw_with_prices(
-                1,
-                USDT_MINT,
-                6,
-                &sol,
-                Some(&usdc),
-                Some(&usdt),
-            )?,
+            usd_dollars_to_anchor_raw_with_prices(1, USDT_MINT, 6, &sol, Some(&usdc), Some(&usdt),)?,
             1_015_228
         );
 
@@ -832,39 +818,24 @@ mod tests {
         let usdc = test_price(100_000_000, 500_000, -8);
         let usdt = test_price(100_000_000, 500_000, -8);
 
-        assert!(usd_dollars_to_anchor_raw_with_prices(
-            1,
-            USDC_MINT,
-            6,
-            &sol,
-            None,
-            Some(&usdt),
-        )
-        .is_err());
-        assert!(usd_dollars_to_anchor_raw_with_prices(
-            1,
-            USDT_MINT,
-            6,
-            &sol,
-            Some(&usdc),
-            None,
-        )
-        .is_err());
+        assert!(
+            usd_dollars_to_anchor_raw_with_prices(1, USDC_MINT, 6, &sol, None, Some(&usdt),)
+                .is_err()
+        );
+        assert!(
+            usd_dollars_to_anchor_raw_with_prices(1, USDT_MINT, 6, &sol, Some(&usdc), None,)
+                .is_err()
+        );
     }
 
     #[test]
     fn conservative_sizing_rejects_upper_bound_overflow() {
         let sol = test_price(u64::MAX, 1, -8);
 
-        assert!(usd_dollars_to_anchor_raw_with_prices(
-            1,
-            WRAPPED_SOL_MINT,
-            9,
-            &sol,
-            None,
-            None,
-        )
-        .is_err());
+        assert!(
+            usd_dollars_to_anchor_raw_with_prices(1, WRAPPED_SOL_MINT, 9, &sol, None, None,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -872,14 +843,7 @@ mod tests {
         let sol = test_price(2, 0, 2);
 
         assert_eq!(
-            usd_dollars_to_anchor_raw_with_prices(
-                1,
-                WRAPPED_SOL_MINT,
-                9,
-                &sol,
-                None,
-                None,
-            )?,
+            usd_dollars_to_anchor_raw_with_prices(1, WRAPPED_SOL_MINT, 9, &sol, None, None,)?,
             5_000_000
         );
 
