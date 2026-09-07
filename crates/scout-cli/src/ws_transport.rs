@@ -74,11 +74,7 @@ impl SubscriptionLifecycle {
         self.ready = false;
     }
 
-    pub fn mark_confirmed(
-        &mut self,
-        generation: u64,
-        subscription_id: u64,
-    ) -> Result<(), String> {
+    pub fn mark_confirmed(&mut self, generation: u64, subscription_id: u64) -> Result<(), String> {
         self.require_generation(generation)?;
 
         if !self.requested {
@@ -109,7 +105,9 @@ impl SubscriptionLifecycle {
         self.require_generation(generation)?;
 
         if !self.confirmed() {
-            return Err("authoritative refresh arrived before subscription confirmation".to_owned());
+            return Err(
+                "authoritative refresh arrived before subscription confirmation".to_owned(),
+            );
         }
 
         self.authoritative_slot = Some(slot);
