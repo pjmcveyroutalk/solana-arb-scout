@@ -26,6 +26,8 @@ mod raydium;
 mod registry;
 #[path = "../route.rs"]
 mod route;
+#[path = "../rpc_transport.rs"]
+mod rpc_transport;
 #[path = "../sizing.rs"]
 mod sizing;
 
@@ -372,22 +374,7 @@ where
 }
 
 async fn post_rpc(rpc_client: &Client, request: &Value, label: &str) -> Result<Value, String> {
-    let response = rpc_client
-        .post(SOLANA_RPC_URL)
-        .json(request)
-        .send()
-        .await
-        .map_err(|error| format!("{label} RPC request failed: {error}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("{label} RPC returned HTTP status {status}"));
-    }
-
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("{label} returned invalid JSON: {error}"))
+    rpc_transport::post_json(rpc_client, SOLANA_RPC_URL, request, label).await
 }
 
 async fn wait_for_subscription_confirmation<S>(websocket: &mut S) -> Result<(), String>
