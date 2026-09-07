@@ -63,9 +63,7 @@ fn retry_after_delay(headers: &HeaderMap) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        retry_after_delay, DEFAULT_RPC_429_DELAY, MAX_RPC_429_DELAY, MAX_RPC_429_RETRIES,
-    };
+    use super::{retry_after_delay, DEFAULT_RPC_429_DELAY, MAX_RPC_429_DELAY, MAX_RPC_429_RETRIES};
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use tokio::time::Duration;
 
@@ -103,3 +101,6 @@ mod tests {
         assert_eq!(retry_after_delay(&headers), DEFAULT_RPC_429_DELAY);
     }
 }
+
+
+    
