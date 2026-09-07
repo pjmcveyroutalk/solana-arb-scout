@@ -114,5 +114,3 @@ where
     Ok(prepared_by_pool)
 }
 
-
-        
