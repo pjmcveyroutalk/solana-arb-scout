@@ -16,6 +16,7 @@ mod recorder;
 mod registry;
 mod rpc_transport;
 mod route;
+mod ws_transport;
 mod runtime_quote;
 mod sizing;
 
@@ -133,7 +134,7 @@ async fn main() -> Result<(), String> {
         .await
         .map_err(|error| format!("could not subscribe to Solana slots: {error}"))?;
 
-    wait_for_subscription_confirmation(&mut reader, 1, "slot").await?;
+    ws_transport::wait_for_subscription_confirmation(&mut reader, 1, "slot").await?;
 
     println!("Scout V0 live read-only Solana stream");
     println!("No signing, transaction construction, submission, or execution capability.");
@@ -147,7 +148,7 @@ async fn main() -> Result<(), String> {
         .await
         .map_err(|error| format!("could not subscribe to Raydium CPMM: {error}"))?;
 
-    wait_for_subscription_confirmation(&mut reader, 2, "Raydium CPMM").await?;
+    ws_transport::wait_for_subscription_confirmation(&mut reader, 2, "Raydium CPMM").await?;
 
     let (mut raydium_states, mut raydium_quote_contexts) =
         observe_raydium(&rpc_client, &mut reader).await?;
@@ -159,7 +160,7 @@ async fn main() -> Result<(), String> {
         .await
         .map_err(|error| format!("could not subscribe to PumpSwap: {error}"))?;
 
-    wait_for_subscription_confirmation(&mut reader, 4, "PumpSwap").await?;
+    ws_transport::wait_for_subscription_confirmation(&mut reader, 4, "PumpSwap").await?;
 
     let (mut pumpswap_states, mut pumpswap_quote_contexts) =
         observe_pumpswap(&rpc_client, &mut reader).await?;
@@ -169,7 +170,7 @@ async fn main() -> Result<(), String> {
         .await
         .map_err(|error| format!("could not subscribe to Orca Whirlpool: {error}"))?;
 
-    wait_for_subscription_confirmation(&mut reader, 18, "Orca Whirlpool").await?;
+    ws_transport::wait_for_subscription_confirmation(&mut reader, 18, "Orca Whirlpool").await?;
 
     let orca_prepared =
         orca_runtime::observe_and_prepare(&rpc_client, SOLANA_RPC_URL, &mut reader).await?;
@@ -273,7 +274,7 @@ where
     let mut observed = 0usize;
 
     while observed < MAX_SLOT_OBSERVATIONS {
-        let payload = next_json_message(reader).await?;
+        let payload = ws_transport::next_json_message(reader, OBSERVATION_TIMEOUT).await?;
 
         if payload.get("method").and_then(Value::as_str) != Some("slotNotification") {
             continue;
@@ -312,7 +313,7 @@ where
     let mut observed = 0usize;
 
     while observed < MAX_RAYDIUM_OBSERVATIONS {
-        let payload = next_json_message(reader).await?;
+        let payload = ws_transport::next_json_message(reader, OBSERVATION_TIMEOUT).await?;
 
         let observation = match raydium::parse_program_notification(&payload) {
             Ok(Some(observation)) => observation,
@@ -391,7 +392,7 @@ where
     let mut observed = 0usize;
 
     while observed < MAX_PUMPSWAP_OBSERVATIONS {
-        let payload = next_json_message(reader).await?;
+        let payload = ws_transport::next_json_message(reader, OBSERVATION_TIMEOUT).await?;
 
         let observation = match pumpswap::parse_program_notification(&payload) {
             Ok(Some(observation)) => observation,
@@ -2193,57 +2194,6 @@ fn unix_time_seconds_now() -> Result<i64, String> {
     i64::try_from(duration.as_secs()).map_err(|_| "Unix timestamp seconds exceeded i64".to_owned())
 }
 
-async fn wait_for_subscription_confirmation<S>(
-    reader: &mut S,
-    request_id: u64,
-    label: &str,
-) -> Result<(), String>
-where
-    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    loop {
-        let payload = next_json_message(reader).await?;
-
-        if payload.get("id").and_then(Value::as_u64) != Some(request_id) {
-            continue;
-        }
-
-        if let Some(error) = payload.get("error") {
-            return Err(format!("{label} subscription rejected: {error}"));
-        }
-
-        let subscription_id = payload
-            .get("result")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("{label} subscription response missing id"))?;
-
-        println!("{label}_subscription_id={subscription_id}");
-        return Ok(());
-    }
-}
-
-async fn next_json_message<S>(reader: &mut S) -> Result<Value, String>
-where
-    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    loop {
-        let next_message = timeout(OBSERVATION_TIMEOUT, reader.next())
-            .await
-            .map_err(|_| "timed out waiting for Solana data".to_owned())?
-            .ok_or_else(|| "Solana WebSocket stream closed".to_owned())?
-            .map_err(|error| format!("WebSocket receive error: {error}"))?;
-
-        if !next_message.is_text() {
-            continue;
-        }
-
-        let text = next_message
-            .into_text()
-            .map_err(|error| format!("invalid text frame: {error}"))?;
-
-        return serde_json::from_str(&text).map_err(|error| format!("invalid JSON: {error}"));
-    }
-}
 
 #[cfg(test)]
 mod tests {
