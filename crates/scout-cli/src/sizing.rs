@@ -681,8 +681,7 @@ mod tests {
         let bytes = price_update_bytes(feed, 100_000_000, 25_000, -8, NOW - 30);
 
         let mut wrong_owner = price_payload(feed, &bytes);
-        wrong_owner["result"]["value"]["owner"] =
-            Value::from("11111111111111111111111111111111");
+        wrong_owner["result"]["value"]["owner"] = Value::from("11111111111111111111111111111111");
         assert!(parse_pyth_usd_price(&wrong_owner, NOW, feed).is_err());
 
         let mut wrong_feed_bytes = bytes.clone();
