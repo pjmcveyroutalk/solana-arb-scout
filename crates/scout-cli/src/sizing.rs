@@ -29,6 +29,11 @@ const USDT_USD_FEED_ID: [u8; 32] = [
 
 const MAX_PYTH_USD_AGE_SECONDS: u64 = 90;
 const MAX_FUTURE_SKEW_SECONDS: i64 = 5;
+const MAX_PYTH_CONFIDENCE_BPS: u64 = 100;
+const BPS_DENOMINATOR: u64 = 10_000;
+const MAX_PYTH_ABS_EXPONENT: u32 = 38;
+const PYTH_USD_ACCEPTANCE_POLICY_ID: &str = "pyth-usd-full-verified-fresh-confidence-1pct-v1";
+const PYTH_VERIFICATION_REQUIREMENT: &str = "fully-verified";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PythUsdFeed {
@@ -40,6 +45,15 @@ pub enum PythUsdFeed {
 #[cfg(test)]
 const PYTH_USD_FEEDS: [PythUsdFeed; 3] = [PythUsdFeed::Sol, PythUsdFeed::Usdc, PythUsdFeed::Usdt];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PythUsdProvenance {
+    account: &'static str,
+    feed_id: &'static [u8; 32],
+    receiver_program_id: &'static str,
+    verification_requirement: &'static str,
+    acceptance_policy_id: &'static str,
+}
+
 impl PythUsdFeed {
     pub fn label(self) -> &'static str {
         match self {
@@ -50,11 +64,7 @@ impl PythUsdFeed {
     }
 
     pub fn account(self) -> &'static str {
-        match self {
-            Self::Sol => PYTH_SOL_USD_ACCOUNT,
-            Self::Usdc => PYTH_USDC_USD_ACCOUNT,
-            Self::Usdt => PYTH_USDT_USD_ACCOUNT,
-        }
+        self.provenance().account
     }
 
     pub fn request_id(self) -> u64 {
@@ -66,10 +76,22 @@ impl PythUsdFeed {
     }
 
     fn feed_id(self) -> &'static [u8; 32] {
-        match self {
-            Self::Sol => &SOL_USD_FEED_ID,
-            Self::Usdc => &USDC_USD_FEED_ID,
-            Self::Usdt => &USDT_USD_FEED_ID,
+        self.provenance().feed_id
+    }
+
+    fn provenance(self) -> PythUsdProvenance {
+        let (account, feed_id) = match self {
+            Self::Sol => (PYTH_SOL_USD_ACCOUNT, &SOL_USD_FEED_ID),
+            Self::Usdc => (PYTH_USDC_USD_ACCOUNT, &USDC_USD_FEED_ID),
+            Self::Usdt => (PYTH_USDT_USD_ACCOUNT, &USDT_USD_FEED_ID),
+        };
+
+        PythUsdProvenance {
+            account,
+            feed_id,
+            receiver_program_id: PYTH_RECEIVER_PROGRAM_ID,
+            verification_requirement: PYTH_VERIFICATION_REQUIREMENT,
+            acceptance_policy_id: PYTH_USD_ACCEPTANCE_POLICY_ID,
         }
     }
 }
@@ -99,12 +121,14 @@ impl SolUsdPrice {
 }
 
 pub fn pyth_usd_price_request(feed: PythUsdFeed) -> Value {
+    let provenance = feed.provenance();
+
     json!({
         "jsonrpc": "2.0",
         "id": feed.request_id(),
         "method": "getAccountInfo",
         "params": [
-            feed.account(),
+            provenance.account,
             {
                 "commitment": "processed",
                 "encoding": "base64"
@@ -123,9 +147,23 @@ pub fn parse_pyth_usd_price(
     now_unix_seconds: i64,
     feed: PythUsdFeed,
 ) -> Result<SolUsdPrice, String> {
+    let provenance = feed.provenance();
+
     if let Some(error) = payload.get("error") {
         return Err(format!(
             "Pyth {} getAccountInfo returned an RPC error: {error}",
+            feed.label()
+        ));
+    }
+
+    let jsonrpc = payload
+        .get("jsonrpc")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Pyth {} response missing jsonrpc version", feed.label()))?;
+
+    if jsonrpc != "2.0" {
+        return Err(format!(
+            "Pyth {} response has unexpected jsonrpc version: {jsonrpc}",
             feed.label()
         ));
     }
@@ -161,10 +199,11 @@ pub fn parse_pyth_usd_price(
         .and_then(Value::as_str)
         .ok_or_else(|| format!("Pyth {} account missing owner", feed.label()))?;
 
-    if owner != PYTH_RECEIVER_PROGRAM_ID {
+    if owner != provenance.receiver_program_id {
         return Err(format!(
-            "Pyth {} owner mismatch: expected {PYTH_RECEIVER_PROGRAM_ID}, got {owner}",
-            feed.label()
+            "Pyth {} owner mismatch: expected {}, got {owner}",
+            feed.label(),
+            provenance.receiver_program_id
         ));
     }
 
@@ -225,8 +264,9 @@ pub fn parse_pyth_usd_price(
 
     if verification_level != 1 {
         return Err(format!(
-            "Pyth {} price update is not fully verified",
-            feed.label()
+            "Pyth {} price update does not satisfy verification requirement {}",
+            feed.label(),
+            provenance.verification_requirement
         ));
     }
 
@@ -234,7 +274,7 @@ pub fn parse_pyth_usd_price(
         .get(41..73)
         .ok_or_else(|| format!("Pyth {} PriceUpdateV2 missing feed id", feed.label()))?;
 
-    if feed_id != feed.feed_id().as_slice() {
+    if feed_id != provenance.feed_id.as_slice() {
         return Err(format!("Pyth price update feed id is not {}", feed.label()));
     }
 
@@ -253,6 +293,9 @@ pub fn parse_pyth_usd_price(
     let exponent = read_i32(&data, 89)?;
     let publish_time = read_i64(&data, 93)?;
     let posted_slot = read_u64(&data, 125)?;
+
+    validate_pyth_usd_confidence(feed, price, confidence, provenance.acceptance_policy_id)?;
+    validate_pyth_usd_exponent(feed, exponent, provenance.acceptance_policy_id)?;
 
     if posted_slot > rpc_slot {
         return Err(format!(
@@ -296,6 +339,72 @@ pub fn parse_pyth_usd_price(
         posted_slot,
         rpc_slot,
     })
+}
+
+fn validate_pyth_usd_confidence(
+    feed: PythUsdFeed,
+    price: u64,
+    confidence: u64,
+    policy_id: &str,
+) -> Result<(), String> {
+    if confidence >= price {
+        return Err(format!(
+            concat!(
+                "Pyth {} confidence interval has no positive lower price bound: ",
+                "price={price} confidence={confidence} policy={policy_id}"
+            ),
+            feed.label()
+        ));
+    }
+
+    let confidence_bps_numerator = u128::from(confidence)
+        .checked_mul(u128::from(BPS_DENOMINATOR))
+        .ok_or_else(|| format!("Pyth {} confidence-ratio overflow", feed.label()))?;
+
+    let confidence_bps_limit = u128::from(price)
+        .checked_mul(u128::from(MAX_PYTH_CONFIDENCE_BPS))
+        .ok_or_else(|| format!("Pyth {} confidence-limit overflow", feed.label()))?;
+
+    if confidence_bps_numerator > confidence_bps_limit {
+        return Err(format!(
+            concat!(
+                "Pyth {} confidence interval exceeds Scout acceptance policy: ",
+                "price={price} confidence={confidence} max_confidence_bps=",
+                "{MAX_PYTH_CONFIDENCE_BPS} policy={policy_id}"
+            ),
+            feed.label()
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_pyth_usd_exponent(
+    feed: PythUsdFeed,
+    exponent: i32,
+    policy_id: &str,
+) -> Result<(), String> {
+    let magnitude = exponent
+        .checked_abs()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            format!(
+                "Pyth {} exponent magnitude conversion failed: exponent={exponent}",
+                feed.label()
+            )
+        })?;
+
+    if magnitude > MAX_PYTH_ABS_EXPONENT {
+        return Err(format!(
+            concat!(
+                "Pyth {} exponent exceeds Scout arithmetic policy: exponent={exponent} ",
+                "max_abs_exponent={MAX_PYTH_ABS_EXPONENT} policy={policy_id}"
+            ),
+            feed.label()
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,6 +575,25 @@ mod tests {
     }
 
     #[test]
+    fn provenance_binds_account_feed_receiver_and_policy() {
+        for feed in PYTH_USD_FEEDS {
+            let provenance = feed.provenance();
+
+            assert_eq!(provenance.account, feed.account());
+            assert_eq!(provenance.feed_id.as_slice(), feed.feed_id().as_slice());
+            assert_eq!(provenance.receiver_program_id, PYTH_RECEIVER_PROGRAM_ID);
+            assert_eq!(
+                provenance.verification_requirement,
+                PYTH_VERIFICATION_REQUIREMENT
+            );
+            assert_eq!(
+                provenance.acceptance_policy_id,
+                PYTH_USD_ACCEPTANCE_POLICY_ID
+            );
+        }
+    }
+
+    #[test]
     fn parses_fully_verified_fresh_usd_feeds() -> Result<(), String> {
         for feed in PYTH_USD_FEEDS {
             let payload = price_payload(
@@ -483,6 +611,53 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn accepts_confidence_exactly_at_policy_boundary() -> Result<(), String> {
+        let feed = PythUsdFeed::Usdc;
+        let payload = price_payload(
+            feed,
+            &price_update_bytes(feed, 100_000_000, 1_000_000, -8, NOW - 30),
+        );
+
+        let price = parse_pyth_usd_price(&payload, NOW, feed)?;
+        assert_eq!(price.confidence, 1_000_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_confidence_wider_than_policy_boundary() {
+        let feed = PythUsdFeed::Usdc;
+        let payload = price_payload(
+            feed,
+            &price_update_bytes(feed, 100_000_000, 1_000_001, -8, NOW - 30),
+        );
+
+        assert!(parse_pyth_usd_price(&payload, NOW, feed).is_err());
+    }
+
+    #[test]
+    fn rejects_confidence_without_positive_lower_bound() {
+        let feed = PythUsdFeed::Usdt;
+        let payload = price_payload(
+            feed,
+            &price_update_bytes(feed, 100_000_000, 100_000_000, -8, NOW - 30),
+        );
+
+        assert!(parse_pyth_usd_price(&payload, NOW, feed).is_err());
+    }
+
+    #[test]
+    fn rejects_exponent_outside_arithmetic_policy() {
+        let feed = PythUsdFeed::Sol;
+        let payload = price_payload(
+            feed,
+            &price_update_bytes(feed, 20_000_000_000, 25_000, -39, NOW - 30),
+        );
+
+        assert!(parse_pyth_usd_price(&payload, NOW, feed).is_err());
     }
 
     #[test]
@@ -506,7 +681,8 @@ mod tests {
         let bytes = price_update_bytes(feed, 100_000_000, 25_000, -8, NOW - 30);
 
         let mut wrong_owner = price_payload(feed, &bytes);
-        wrong_owner["result"]["value"]["owner"] = Value::from("11111111111111111111111111111111");
+        wrong_owner["result"]["value"]["owner"] =
+            Value::from("11111111111111111111111111111111");
         assert!(parse_pyth_usd_price(&wrong_owner, NOW, feed).is_err());
 
         let mut wrong_feed_bytes = bytes.clone();
@@ -529,6 +705,10 @@ mod tests {
         let mut wrong_id = price_payload(feed, &bytes);
         wrong_id["id"] = Value::from(999u64);
         assert!(parse_pyth_usd_price(&wrong_id, NOW, feed).is_err());
+
+        let mut wrong_jsonrpc = price_payload(feed, &bytes);
+        wrong_jsonrpc["jsonrpc"] = Value::from("1.0");
+        assert!(parse_pyth_usd_price(&wrong_jsonrpc, NOW, feed).is_err());
     }
 
     #[test]
