@@ -419,49 +419,102 @@ pub fn usd_dollars_to_anchor_raw(
     anchor_decimals: u8,
     sol_usd_price: Option<&SolUsdPrice>,
 ) -> Result<u64, String> {
+    if anchor_mint == USDC_MINT || anchor_mint == USDT_MINT {
+        return Err(format!(
+            "stablecoin USD sizing requires its accepted Pyth USD feed for anchor {anchor_mint}"
+        ));
+    }
+
+    if anchor_mint != WRAPPED_SOL_MINT {
+        return Err(format!("unsupported Rung 10 USD anchor mint {anchor_mint}"));
+    }
+
+    let sol_usd_price = sol_usd_price
+        .ok_or_else(|| "Pyth SOL/USD price context is required for WSOL sizing".to_owned())?;
+
+    usd_dollars_to_anchor_raw_with_prices(
+        dollars,
+        anchor_mint,
+        anchor_decimals,
+        sol_usd_price,
+        None,
+        None,
+    )
+}
+
+pub fn usd_dollars_to_anchor_raw_with_prices(
+    dollars: u64,
+    anchor_mint: &str,
+    anchor_decimals: u8,
+    sol_usd_price: &SolUsdPrice,
+    usdc_usd_price: Option<&SolUsdPrice>,
+    usdt_usd_price: Option<&SolUsdPrice>,
+) -> Result<u64, String> {
+    let price = if anchor_mint == WRAPPED_SOL_MINT {
+        sol_usd_price
+    } else if anchor_mint == USDC_MINT {
+        usdc_usd_price
+            .ok_or_else(|| "Pyth USDC/USD price context is required for USDC sizing".to_owned())?
+    } else if anchor_mint == USDT_MINT {
+        usdt_usd_price
+            .ok_or_else(|| "Pyth USDT/USD price context is required for USDT sizing".to_owned())?
+    } else {
+        return Err(format!("unsupported Rung 10 USD anchor mint {anchor_mint}"));
+    };
+
+    usd_dollars_to_raw_at_upper_usd_bound(dollars, anchor_mint, anchor_decimals, price)
+}
+
+fn usd_dollars_to_raw_at_upper_usd_bound(
+    dollars: u64,
+    anchor_mint: &str,
+    anchor_decimals: u8,
+    price: &SolUsdPrice,
+) -> Result<u64, String> {
     if dollars == 0 {
         return Err("USD size must be greater than zero".to_owned());
     }
 
     let token_scale = checked_pow10(u32::from(anchor_decimals))?;
+    let upper_price = price.price.checked_add(price.confidence).ok_or_else(|| {
+        format!("Pyth USD upper confidence bound overflow for anchor {anchor_mint}")
+    })?;
 
-    let raw = if anchor_mint == USDC_MINT || anchor_mint == USDT_MINT {
+    if upper_price == 0 {
+        return Err(format!(
+            "Pyth USD upper confidence bound must be positive for anchor {anchor_mint}"
+        ));
+    }
+
+    let upper_price_raw = u128::from(upper_price);
+
+    let raw = if price.exponent < 0 {
+        let exponent_magnitude = price
+            .exponent
+            .checked_abs()
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                format!("Pyth USD exponent magnitude overflow for anchor {anchor_mint}")
+            })?;
+        let price_scale = checked_pow10(exponent_magnitude)?;
+
         u128::from(dollars)
             .checked_mul(token_scale)
-            .ok_or_else(|| "stablecoin USD sizing overflow".to_owned())?
-    } else if anchor_mint == WRAPPED_SOL_MINT {
-        let price = sol_usd_price
-            .ok_or_else(|| "SOL/USD price context is required for WSOL sizing".to_owned())?;
-        let price_raw = u128::from(price.price);
-
-        if price.exponent < 0 {
-            let exponent_magnitude = price
-                .exponent
-                .checked_abs()
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| "Pyth SOL/USD exponent magnitude overflow".to_owned())?;
-            let price_scale = checked_pow10(exponent_magnitude)?;
-
-            u128::from(dollars)
-                .checked_mul(token_scale)
-                .and_then(|value| value.checked_mul(price_scale))
-                .ok_or_else(|| "WSOL USD sizing numerator overflow".to_owned())?
-                / price_raw
-        } else {
-            let exponent = u32::try_from(price.exponent)
-                .map_err(|_| "Pyth SOL/USD exponent conversion failed".to_owned())?;
-            let price_scale = checked_pow10(exponent)?;
-            let denominator = price_raw
-                .checked_mul(price_scale)
-                .ok_or_else(|| "WSOL USD sizing denominator overflow".to_owned())?;
-
-            u128::from(dollars)
-                .checked_mul(token_scale)
-                .ok_or_else(|| "WSOL USD sizing numerator overflow".to_owned())?
-                / denominator
-        }
+            .and_then(|value| value.checked_mul(price_scale))
+            .ok_or_else(|| format!("USD sizing numerator overflow for anchor {anchor_mint}"))?
+            / upper_price_raw
     } else {
-        return Err(format!("unsupported Rung 10 USD anchor mint {anchor_mint}"));
+        let exponent = u32::try_from(price.exponent)
+            .map_err(|_| format!("Pyth USD exponent conversion failed for anchor {anchor_mint}"))?;
+        let price_scale = checked_pow10(exponent)?;
+        let denominator = upper_price_raw
+            .checked_mul(price_scale)
+            .ok_or_else(|| format!("USD sizing denominator overflow for anchor {anchor_mint}"))?;
+
+        u128::from(dollars)
+            .checked_mul(token_scale)
+            .ok_or_else(|| format!("USD sizing numerator overflow for anchor {anchor_mint}"))?
+            / denominator
     };
 
     if raw == 0 {
@@ -546,6 +599,17 @@ mod tests {
             },
             "id": feed.request_id()
         })
+    }
+
+    fn test_price(price: u64, confidence: u64, exponent: i32) -> SolUsdPrice {
+        SolUsdPrice {
+            price,
+            confidence,
+            exponent,
+            publish_time: NOW,
+            posted_slot: 1,
+            rpc_slot: 1,
+        }
     }
 
     #[test]
@@ -712,59 +776,126 @@ mod tests {
     }
 
     #[test]
-    fn stablecoin_grid_maps_exactly_to_raw_units() -> Result<(), String> {
-        for dollars in USD_SIZE_GRID {
-            let expected = dollars
-                .checked_mul(1_000_000)
-                .ok_or_else(|| "test stablecoin multiplication overflow".to_owned())?;
+    fn transitional_entrypoint_fails_closed_for_stablecoin_anchors() {
+        let sol = test_price(20_000_000_000, 100_000_000, -8);
 
-            assert_eq!(
-                usd_dollars_to_anchor_raw(dollars, USDC_MINT, 6, None)?,
-                expected
-            );
-            assert_eq!(
-                usd_dollars_to_anchor_raw(dollars, USDT_MINT, 6, None)?,
-                expected
-            );
-        }
+        assert!(usd_dollars_to_anchor_raw(1, USDC_MINT, 6, Some(&sol)).is_err());
+        assert!(usd_dollars_to_anchor_raw(1, USDT_MINT, 6, Some(&sol)).is_err());
+    }
+
+    #[test]
+    fn conservative_sizing_uses_upper_confidence_bound_for_all_anchors() -> Result<(), String> {
+        let sol = test_price(20_000_000_000, 100_000_000, -8);
+        let usdc = test_price(100_000_000, 500_000, -8);
+        let usdt = test_price(98_000_000, 500_000, -8);
+
+        assert_eq!(
+            usd_dollars_to_anchor_raw_with_prices(
+                1,
+                WRAPPED_SOL_MINT,
+                9,
+                &sol,
+                Some(&usdc),
+                Some(&usdt),
+            )?,
+            4_975_124
+        );
+        assert_eq!(
+            usd_dollars_to_anchor_raw_with_prices(
+                1,
+                USDC_MINT,
+                6,
+                &sol,
+                Some(&usdc),
+                Some(&usdt),
+            )?,
+            995_024
+        );
+        assert_eq!(
+            usd_dollars_to_anchor_raw_with_prices(
+                1,
+                USDT_MINT,
+                6,
+                &sol,
+                Some(&usdc),
+                Some(&usdt),
+            )?,
+            1_015_228
+        );
 
         Ok(())
     }
 
     #[test]
-    fn wsol_grid_uses_integer_price_scaling_and_floors_raw_units() -> Result<(), String> {
-        let price = SolUsdPrice {
-            price: 20_000_000_000,
-            confidence: 1,
-            exponent: -8,
-            publish_time: NOW,
-            posted_slot: 1,
-            rpc_slot: 1,
-        };
+    fn conservative_sizing_fails_closed_without_required_stable_feed() {
+        let sol = test_price(20_000_000_000, 100_000_000, -8);
+        let usdc = test_price(100_000_000, 500_000, -8);
+        let usdt = test_price(100_000_000, 500_000, -8);
+
+        assert!(usd_dollars_to_anchor_raw_with_prices(
+            1,
+            USDC_MINT,
+            6,
+            &sol,
+            None,
+            Some(&usdt),
+        )
+        .is_err());
+        assert!(usd_dollars_to_anchor_raw_with_prices(
+            1,
+            USDT_MINT,
+            6,
+            &sol,
+            Some(&usdc),
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn conservative_sizing_rejects_upper_bound_overflow() {
+        let sol = test_price(u64::MAX, 1, -8);
+
+        assert!(usd_dollars_to_anchor_raw_with_prices(
+            1,
+            WRAPPED_SOL_MINT,
+            9,
+            &sol,
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn conservative_sizing_supports_positive_exponents() -> Result<(), String> {
+        let sol = test_price(2, 0, 2);
 
         assert_eq!(
-            usd_dollars_to_anchor_raw(1, WRAPPED_SOL_MINT, 9, Some(&price))?,
-            5_000_000
-        );
-        assert_eq!(
-            usd_dollars_to_anchor_raw(1_000, WRAPPED_SOL_MINT, 9, Some(&price))?,
-            5_000_000_000
-        );
-
-        let positive_exponent_price = SolUsdPrice {
-            price: 2,
-            confidence: 0,
-            exponent: 2,
-            publish_time: NOW,
-            posted_slot: 1,
-            rpc_slot: 1,
-        };
-
-        assert_eq!(
-            usd_dollars_to_anchor_raw(1, WRAPPED_SOL_MINT, 9, Some(&positive_exponent_price))?,
+            usd_dollars_to_anchor_raw_with_prices(
+                1,
+                WRAPPED_SOL_MINT,
+                9,
+                &sol,
+                None,
+                None,
+            )?,
             5_000_000
         );
 
         Ok(())
     }
+
+    #[test]
+    fn transitional_wsol_entrypoint_also_uses_upper_confidence_bound() -> Result<(), String> {
+        let sol = test_price(20_000_000_000, 100_000_000, -8);
+
+        assert_eq!(
+            usd_dollars_to_anchor_raw(1, WRAPPED_SOL_MINT, 9, Some(&sol))?,
+            4_975_124
+        );
+
+        Ok(())
+    }
 }
+
