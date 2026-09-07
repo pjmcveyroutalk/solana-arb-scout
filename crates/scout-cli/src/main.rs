@@ -14,6 +14,7 @@ mod quote;
 mod raydium;
 mod recorder;
 mod registry;
+mod rpc_transport;
 mod route;
 mod runtime_quote;
 mod sizing;
@@ -22,7 +23,7 @@ use discovery::{parse_raydium_pair_lookup_response, raydium_pair_lookup_requests
 use futures_util::{SinkExt, StreamExt};
 use quote::{quote_readiness_for_pool, VenueQuoteContext};
 use registry::ActiveMintRegistry;
-use reqwest::{header::RETRY_AFTER, Client, StatusCode};
+use reqwest::Client;
 use route::{generate_two_leg_routes, RouteLeg, USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
 use scout_core::{NormalizedPoolState, Venue};
 use serde_json::{json, Value};
@@ -45,10 +46,8 @@ const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DETERMINISTIC_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(210);
 const GPA_REQUEST_PACING: Duration = Duration::from_millis(300);
-const GPA_RETRY_FALLBACK: Duration = Duration::from_secs(1);
 const R13_MATURITY_MAX_WAIT: Duration = Duration::from_secs(30);
 const R13_MATURITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const MAX_GPA_RETRIES: usize = 2;
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
@@ -1040,101 +1039,37 @@ async fn fetch_program_accounts(
     let request_id = request.get("id").and_then(Value::as_u64).unwrap_or(0);
     let started_at = Instant::now();
 
-    for attempt in 0..=MAX_GPA_RETRIES {
-        sleep(GPA_REQUEST_PACING).await;
+    sleep(GPA_REQUEST_PACING).await;
 
-        println!(
-            "rpc_request_start: label={label} id={request_id} method=getProgramAccounts attempt={}",
-            attempt + 1
-        );
+    println!("rpc_request_start: label={label} id={request_id} method=getProgramAccounts");
 
-        let response = rpc_client
-            .post(SOLANA_RPC_URL)
-            .json(request)
-            .send()
-            .await
-            .map_err(|error| {
-                format!(
-                    "{label} RPC request failed after {} ms: {error}",
-                    started_at.elapsed().as_millis()
-                )
-            })?;
-
-        let status = response.status();
-
-        if status == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_GPA_RETRIES {
-            let retry_delay = retry_after_delay(&response);
-
-            println!(
-                concat!(
-                    "rpc_request_rate_limited: label={} id={} status={} attempt={} ",
-                    "retry_after_ms={}"
-                ),
-                label,
-                request_id,
-                status,
-                attempt + 1,
-                retry_delay.as_millis()
-            );
-
-            sleep(retry_delay).await;
-            continue;
-        }
-
-        if !status.is_success() {
-            return Err(format!(
-                "{label} RPC returned HTTP status {status} after {} ms",
-                started_at.elapsed().as_millis()
-            ));
-        }
-
-        let payload = response.json::<Value>().await.map_err(|error| {
+    let payload = rpc_transport::post_json(rpc_client, SOLANA_RPC_URL, request, label)
+        .await
+        .map_err(|error| {
             format!(
-                "{label} RPC returned invalid JSON after {} ms: {error}",
+                "{label} RPC request failed after {} ms: {error}",
                 started_at.elapsed().as_millis()
             )
         })?;
 
-        let result_count = payload
-            .pointer("/result/value")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
+    let result_count = payload
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
 
-        println!(
-            concat!(
-                "rpc_request_finish: label={} id={} status={} elapsed_ms={} ",
-                "result_count={} rpc_error={} attempts={}"
-            ),
-            label,
-            request_id,
-            status,
-            started_at.elapsed().as_millis(),
-            result_count,
-            payload.get("error").is_some(),
-            attempt + 1
-        );
+    println!(
+        concat!(
+            "rpc_request_finish: label={} id={} elapsed_ms={} ",
+            "result_count={} rpc_error={}"
+        ),
+        label,
+        request_id,
+        started_at.elapsed().as_millis(),
+        result_count,
+        payload.get("error").is_some()
+    );
 
-        return Ok(payload);
-    }
-
-    Err(format!(
-        "{label} RPC exhausted bounded getProgramAccounts retry policy after {} attempts",
-        MAX_GPA_RETRIES + 1
-    ))
-}
-
-fn retry_after_delay(response: &reqwest::Response) -> Duration {
-    response
-        .headers()
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_retry_after_seconds)
-        .map(Duration::from_secs)
-        .unwrap_or(GPA_RETRY_FALLBACK)
-}
-
-fn parse_retry_after_seconds(value: &str) -> Option<u64> {
-    value.trim().parse::<u64>().ok()
+    Ok(payload)
 }
 
 async fn fetch_pyth_usd_price(
@@ -1148,51 +1083,27 @@ async fn fetch_pyth_usd_price(
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let started_at = Instant::now();
+    let label = format!("Pyth {}", feed.label());
 
     println!(
-        "rpc_request_start: label=Pyth {} id={} method={}",
-        feed.label(),
-        request_id,
-        method
+        "rpc_request_start: label={} id={} method={}",
+        label, request_id, method
     );
 
-    let response = rpc_client
-        .post(SOLANA_RPC_URL)
-        .json(&request)
-        .send()
+    let payload = rpc_transport::post_json(rpc_client, SOLANA_RPC_URL, &request, &label)
         .await
         .map_err(|error| {
             format!(
-                "Pyth {} RPC request failed after {} ms: {error}",
-                feed.label(),
+                "{} RPC request failed after {} ms: {error}",
+                label,
                 started_at.elapsed().as_millis()
             )
         })?;
 
-    let status = response.status();
-
-    if !status.is_success() {
-        return Err(format!(
-            "Pyth {} RPC returned HTTP status {} after {} ms",
-            feed.label(),
-            status,
-            started_at.elapsed().as_millis()
-        ));
-    }
-
-    let payload = response.json::<Value>().await.map_err(|error| {
-        format!(
-            "Pyth {} RPC returned invalid JSON after {} ms: {error}",
-            feed.label(),
-            started_at.elapsed().as_millis()
-        )
-    })?;
-
     println!(
-        "rpc_request_finish: label=Pyth {} id={} status={} elapsed_ms={} rpc_error={}",
-        feed.label(),
+        "rpc_request_finish: label={} id={} elapsed_ms={} rpc_error={}",
+        label,
         request_id,
-        status,
         started_at.elapsed().as_millis(),
         payload.get("error").is_some()
     );
@@ -2165,6 +2076,7 @@ async fn fetch_localized_priority_observation(
 ) -> costs::PriorityObservationState {
     let request = costs::localized_priority_fee_request(footprint);
     let started_at = Instant::now();
+    let label = "Rung11C localized priority";
 
     println!(
         concat!(
@@ -2174,39 +2086,18 @@ async fn fetch_localized_priority_observation(
         footprint.accounts().len()
     );
 
-    let response = match rpc_client.post(SOLANA_RPC_URL).json(&request).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            let reason = format!(
-                "localized priority RPC request failed after {} ms: {error}",
-                started_at.elapsed().as_millis()
-            );
-            println!("rung11c_priority_observation_unavailable: {reason}");
-            return costs::PriorityObservationState::Unavailable(reason);
-        }
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        let reason = format!(
-            "localized priority RPC returned HTTP status {status} after {} ms",
-            started_at.elapsed().as_millis()
-        );
-        println!("rung11c_priority_observation_unavailable: {reason}");
-        return costs::PriorityObservationState::Unavailable(reason);
-    }
-
-    let payload = match response.json::<Value>().await {
-        Ok(payload) => payload,
-        Err(error) => {
-            let reason = format!(
-                "localized priority RPC returned invalid JSON after {} ms: {error}",
-                started_at.elapsed().as_millis()
-            );
-            println!("rung11c_priority_observation_unavailable: {reason}");
-            return costs::PriorityObservationState::Unavailable(reason);
-        }
-    };
+    let payload =
+        match rpc_transport::post_json(rpc_client, SOLANA_RPC_URL, &request, label).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                let reason = format!(
+                    "localized priority RPC request failed after {} ms: {error}",
+                    started_at.elapsed().as_millis()
+                );
+                println!("rung11c_priority_observation_unavailable: {reason}");
+                return costs::PriorityObservationState::Unavailable(reason);
+            }
+        };
 
     match costs::parse_localized_priority_fee_response(&payload, footprint) {
         Ok(observation) => {
@@ -2258,16 +2149,14 @@ async fn fetch_hydration<const N: usize>(
     });
 
     let started_at = Instant::now();
+    let label = format!("{venue} hydration");
 
     println!(
-        "rpc_request_start: label={} hydration id={} method=getMultipleAccounts account_count={}",
-        venue, request_id, N
+        "rpc_request_start: label={} id={} method=getMultipleAccounts account_count={}",
+        label, request_id, N
     );
 
-    let response = rpc_client
-        .post(SOLANA_RPC_URL)
-        .json(&request)
-        .send()
+    let payload = rpc_transport::post_json(rpc_client, SOLANA_RPC_URL, &request, &label)
         .await
         .map_err(|error| {
             format!(
@@ -2276,30 +2165,10 @@ async fn fetch_hydration<const N: usize>(
             )
         })?;
 
-    let status = response.status();
-
-    if !status.is_success() {
-        return Err(format!(
-            "{venue} hydration RPC returned HTTP status {status} after {} ms",
-            started_at.elapsed().as_millis()
-        ));
-    }
-
-    let payload = response.json::<Value>().await.map_err(|error| {
-        format!(
-            "{venue} hydration RPC returned invalid JSON after {} ms: {error}",
-            started_at.elapsed().as_millis()
-        )
-    })?;
-
     println!(
-        concat!(
-            "rpc_request_finish: label={} hydration id={} status={} ",
-            "elapsed_ms={} rpc_error={}"
-        ),
-        venue,
+        "rpc_request_finish: label={} id={} elapsed_ms={} rpc_error={}",
+        label,
         request_id,
-        status,
         started_at.elapsed().as_millis(),
         payload.get("error").is_some()
     );
@@ -2407,15 +2276,5 @@ mod tests {
             "Rung 9 deterministic discovery incomplete: incomplete_probe_count=2 first_cause=first transport failure"
         );
     }
-
-    #[test]
-    fn retry_after_accepts_integer_seconds_only() {
-        assert_eq!(parse_retry_after_seconds("3"), Some(3));
-        assert_eq!(parse_retry_after_seconds(" 7 "), Some(7));
-        assert_eq!(
-            parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"),
-            None
-        );
-        assert_eq!(parse_retry_after_seconds("invalid"), None);
-    }
 }
+
