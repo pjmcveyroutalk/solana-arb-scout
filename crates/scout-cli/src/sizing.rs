@@ -75,6 +75,7 @@ impl PythUsdFeed {
         }
     }
 
+    #[cfg(test)]
     fn feed_id(self) -> &'static [u8; 32] {
         self.provenance().feed_id
     }
