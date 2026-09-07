@@ -349,11 +349,11 @@ fn validate_pyth_usd_confidence(
 ) -> Result<(), String> {
     if confidence >= price {
         return Err(format!(
-            concat!(
-                "Pyth {} confidence interval has no positive lower price bound: ",
-                "price={price} confidence={confidence} policy={policy_id}"
-            ),
-            feed.label()
+            "Pyth {} confidence interval has no positive lower price bound: price={} confidence={} policy={}",
+            feed.label(),
+            price,
+            confidence,
+            policy_id
         ));
     }
 
@@ -367,12 +367,12 @@ fn validate_pyth_usd_confidence(
 
     if confidence_bps_numerator > confidence_bps_limit {
         return Err(format!(
-            concat!(
-                "Pyth {} confidence interval exceeds Scout acceptance policy: ",
-                "price={price} confidence={confidence} max_confidence_bps=",
-                "{MAX_PYTH_CONFIDENCE_BPS} policy={policy_id}"
-            ),
-            feed.label()
+            "Pyth {} confidence interval exceeds Scout acceptance policy: price={} confidence={} max_confidence_bps={} policy={}",
+            feed.label(),
+            price,
+            confidence,
+            MAX_PYTH_CONFIDENCE_BPS,
+            policy_id
         ));
     }
 
@@ -396,11 +396,11 @@ fn validate_pyth_usd_exponent(
 
     if magnitude > MAX_PYTH_ABS_EXPONENT {
         return Err(format!(
-            concat!(
-                "Pyth {} exponent exceeds Scout arithmetic policy: exponent={exponent} ",
-                "max_abs_exponent={MAX_PYTH_ABS_EXPONENT} policy={policy_id}"
-            ),
-            feed.label()
+            "Pyth {} exponent exceeds Scout arithmetic policy: exponent={} max_abs_exponent={} policy={}",
+            feed.label(),
+            exponent,
+            MAX_PYTH_ABS_EXPONENT,
+            policy_id
         ));
     }
 
