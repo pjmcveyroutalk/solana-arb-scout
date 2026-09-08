@@ -494,4 +494,3 @@ fn unix_time_ms_now() -> Result<u64, String> {
     u64::try_from(duration.as_millis())
         .map_err(|_| "Unix millisecond timestamp overflow".to_owned())
 }
-
