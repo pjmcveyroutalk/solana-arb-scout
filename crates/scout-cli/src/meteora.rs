@@ -395,7 +395,9 @@ pub fn meteora_mul_div(
     let remainder = product % denominator;
 
     if rounding == MeteoraRounding::Up && remainder != U256::ZERO {
-        quotient = quotient.checked_add(U256::ONE).ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+        quotient = quotient
+            .checked_add(U256::ONE)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
     }
     u128::try_from(quotient).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
 }
@@ -439,7 +441,9 @@ pub fn meteora_q64_price_from_bin_id(
         .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
         .checked_div(u128::from(BASIS_POINT_MAX))
         .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
-    let base = Q64_ONE.checked_add(bps).ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let base = Q64_ONE
+        .checked_add(bps)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
 
     meteora_q64_pow(base, bin_id)
 }
@@ -510,7 +514,9 @@ pub fn meteora_compute_fee(
         .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
         .checked_add(denominator - 1)
         .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
-    let fee = numerator.checked_div(denominator).ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let fee = numerator
+        .checked_div(denominator)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
 
     u64::try_from(fee).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
 }
@@ -692,7 +698,9 @@ fn meteora_q64_pow(base: u128, exponent: i32) -> Result<u128, MeteoraDlmmFailure
         return Err(MeteoraDlmmFailure::ArithmeticOverflow);
     }
     if invert {
-        result = u128::MAX.checked_div(result).ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+        result = u128::MAX
+            .checked_div(result)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
     }
 
     Ok(result)
