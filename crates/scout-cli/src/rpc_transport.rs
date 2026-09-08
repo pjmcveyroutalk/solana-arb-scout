@@ -101,5 +101,3 @@ mod tests {
         assert_eq!(retry_after_delay(&headers), DEFAULT_RPC_429_DELAY);
     }
 }
-
-
