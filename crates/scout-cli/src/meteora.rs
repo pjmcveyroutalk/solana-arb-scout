@@ -191,6 +191,165 @@ pub struct MeteoraBitmapExtensionState {
     pub negative_bin_array_bitmap: MeteoraBitmapRegion,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteoraClockSnapshot {
+    pub slot: u64,
+    pub epoch_start_timestamp: i64,
+    pub epoch: u64,
+    pub leader_schedule_epoch: u64,
+    pub unix_timestamp: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteoraSnapshotSource {
+    pub source_slot: u64,
+    pub generation_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeteoraBinArraySnapshotInput {
+    pub pubkey: [u8; 32],
+    pub state: MeteoraBinArrayState,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MeteoraValidatedBinArray {
+    pubkey: [u8; 32],
+    state: MeteoraBinArrayState,
+}
+
+impl MeteoraValidatedBinArray {
+    pub fn pubkey(&self) -> [u8; 32] {
+        self.pubkey
+    }
+
+    pub fn index(&self) -> i64 {
+        self.state.index
+    }
+
+    pub fn state(&self) -> &MeteoraBinArrayState {
+        &self.state
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MeteoraDlmmSnapshot {
+    lb_pair_pubkey: [u8; 32],
+    lb_pair: MeteoraLbPairState,
+    bin_arrays: Vec<MeteoraValidatedBinArray>,
+    bitmap_extension: Option<MeteoraBitmapExtensionState>,
+    mint_x: [u8; 32],
+    mint_y: [u8; 32],
+    clock: MeteoraClockSnapshot,
+    profile: DlmmProtocolProfile,
+    source: MeteoraSnapshotSource,
+}
+
+impl MeteoraDlmmSnapshot {
+    pub fn new(
+        lb_pair_pubkey: [u8; 32],
+        lb_pair: MeteoraLbPairState,
+        bin_arrays: Vec<MeteoraBinArraySnapshotInput>,
+        bitmap_extension: Option<MeteoraBitmapExtensionState>,
+        clock: MeteoraClockSnapshot,
+        profile: DlmmProtocolProfile,
+        source: MeteoraSnapshotSource,
+    ) -> Result<Self, MeteoraDlmmFailure> {
+        if let Some(extension) = bitmap_extension.as_ref() {
+            if extension.lb_pair != lb_pair_pubkey {
+                return Err(MeteoraDlmmFailure::InvalidBitmapExtension);
+            }
+        }
+
+        let mut validated_bin_arrays = Vec::with_capacity(bin_arrays.len());
+
+        for input in bin_arrays {
+            validate_bin_array_index(input.state.index)?;
+
+            if !profile.accepts_bin_array_version(input.state.version) {
+                return Err(MeteoraDlmmFailure::UnsupportedBinArrayVersion);
+            }
+            if input.state.lb_pair != lb_pair_pubkey {
+                return Err(MeteoraDlmmFailure::InvalidBinArray);
+            }
+            if input.state.bins.len() != MAX_BIN_PER_ARRAY as usize {
+                return Err(MeteoraDlmmFailure::InvalidBinArray);
+            }
+
+            let (canonical_pubkey, _) = derive_bin_array_pda(lb_pair_pubkey, input.state.index)?;
+            if input.pubkey != canonical_pubkey {
+                return Err(MeteoraDlmmFailure::LegacyOrNonCanonicalBinArray);
+            }
+            for existing in &validated_bin_arrays {
+                if existing.index() == input.state.index {
+                    return Err(MeteoraDlmmFailure::InvalidLayout);
+                }
+            }
+
+            validated_bin_arrays.push(MeteoraValidatedBinArray {
+                pubkey: input.pubkey,
+                state: input.state,
+            });
+        }
+
+        Ok(Self {
+            lb_pair_pubkey,
+            mint_x: lb_pair.mint_x,
+            mint_y: lb_pair.mint_y,
+            lb_pair,
+            bin_arrays: validated_bin_arrays,
+            bitmap_extension,
+            clock,
+            profile,
+            source,
+        })
+    }
+
+    pub fn lb_pair_pubkey(&self) -> [u8; 32] {
+        self.lb_pair_pubkey
+    }
+
+    pub fn lb_pair(&self) -> &MeteoraLbPairState {
+        &self.lb_pair
+    }
+
+    pub fn bin_arrays(&self) -> &[MeteoraValidatedBinArray] {
+        &self.bin_arrays
+    }
+
+    pub fn bin_array_by_index(
+        &self,
+        index: i64,
+    ) -> Result<Option<&MeteoraValidatedBinArray>, MeteoraDlmmFailure> {
+        validate_bin_array_index(index)?;
+        Ok(self.bin_arrays.iter().find(|array| array.index() == index))
+    }
+
+    pub fn bitmap_extension(&self) -> Option<&MeteoraBitmapExtensionState> {
+        self.bitmap_extension.as_ref()
+    }
+
+    pub fn mint_x(&self) -> [u8; 32] {
+        self.mint_x
+    }
+
+    pub fn mint_y(&self) -> [u8; 32] {
+        self.mint_y
+    }
+
+    pub fn clock(&self) -> MeteoraClockSnapshot {
+        self.clock
+    }
+
+    pub fn profile(&self) -> DlmmProtocolProfile {
+        self.profile
+    }
+
+    pub fn source(&self) -> MeteoraSnapshotSource {
+        self.source
+    }
+}
+
 pub fn bin_id_to_bin_array_index(bin_id: i32) -> Result<i64, MeteoraDlmmFailure> {
     let quotient = bin_id / MAX_BIN_PER_ARRAY;
     let remainder = bin_id % MAX_BIN_PER_ARRAY;
@@ -941,6 +1100,185 @@ mod tests {
     }
 
     #[test]
+    fn m5_snapshot_preserves_order_and_index_lookup() -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        let inputs = vec![
+            bin_array_snapshot_input(lb_pair_pubkey, 2)?,
+            bin_array_snapshot_input(lb_pair_pubkey, -1)?,
+            bin_array_snapshot_input(lb_pair_pubkey, 0)?,
+        ];
+        let snapshot = MeteoraDlmmSnapshot::new(
+            lb_pair_pubkey,
+            lb_pair,
+            inputs,
+            None,
+            test_clock(),
+            DlmmProtocolProfile::V0_12,
+            test_source(),
+        )?;
+
+        let indexes = snapshot
+            .bin_arrays()
+            .iter()
+            .map(MeteoraValidatedBinArray::index)
+            .collect::<Vec<_>>();
+
+        assert_eq!(indexes, vec![2, -1, 0]);
+        let found_index = snapshot.bin_array_by_index(-1)?.map(MeteoraValidatedBinArray::index);
+        assert_eq!(found_index, Some(-1));
+        assert_eq!(snapshot.bin_array_by_index(1), Ok(None));
+        assert_eq!(
+            snapshot.bin_array_by_index(BIN_ARRAY_MAX_INDEX + 1),
+            Err(MeteoraDlmmFailure::ProtocolSearchRangeExceeded)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m5_snapshot_rejects_bin_array_from_another_lb_pair() -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        let mut input = bin_array_snapshot_input(lb_pair_pubkey, -1)?;
+        input.state.lb_pair = [8_u8; 32];
+
+        assert_eq!(
+            MeteoraDlmmSnapshot::new(
+                lb_pair_pubkey,
+                lb_pair,
+                vec![input],
+                None,
+                test_clock(),
+                DlmmProtocolProfile::V0_12,
+                test_source(),
+            ),
+            Err(MeteoraDlmmFailure::InvalidBinArray)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m5_snapshot_rejects_malformed_bin_count() -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        let mut input = bin_array_snapshot_input(lb_pair_pubkey, -1)?;
+        assert!(input.state.bins.pop().is_some());
+
+        assert_eq!(
+            MeteoraDlmmSnapshot::new(
+                lb_pair_pubkey,
+                lb_pair,
+                vec![input],
+                None,
+                test_clock(),
+                DlmmProtocolProfile::V0_12,
+                test_source(),
+            ),
+            Err(MeteoraDlmmFailure::InvalidBinArray)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m5_snapshot_rejects_noncanonical_bin_array_pubkey() -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        let mut input = bin_array_snapshot_input(lb_pair_pubkey, -1)?;
+        input.pubkey[0] ^= 1;
+
+        assert_eq!(
+            MeteoraDlmmSnapshot::new(
+                lb_pair_pubkey,
+                lb_pair,
+                vec![input],
+                None,
+                test_clock(),
+                DlmmProtocolProfile::V0_12,
+                test_source(),
+            ),
+            Err(MeteoraDlmmFailure::LegacyOrNonCanonicalBinArray)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m5_snapshot_rejects_duplicate_indexes() -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        let input = bin_array_snapshot_input(lb_pair_pubkey, 3)?;
+
+        assert_eq!(
+            MeteoraDlmmSnapshot::new(
+                lb_pair_pubkey,
+                lb_pair,
+                vec![input.clone(), input],
+                None,
+                test_clock(),
+                DlmmProtocolProfile::V0_12,
+                test_source(),
+            ),
+            Err(MeteoraDlmmFailure::InvalidLayout)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m5_snapshot_rejects_wrong_bitmap_extension() -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        let extension = MeteoraBitmapExtensionState {
+            lb_pair: [8_u8; 32],
+            positive_bin_array_bitmap: [[0_u64; 8]; 12],
+            negative_bin_array_bitmap: [[0_u64; 8]; 12],
+        };
+
+        assert_eq!(
+            MeteoraDlmmSnapshot::new(
+                lb_pair_pubkey,
+                lb_pair,
+                Vec::new(),
+                Some(extension),
+                test_clock(),
+                DlmmProtocolProfile::V0_12,
+                test_source(),
+            ),
+            Err(MeteoraDlmmFailure::InvalidBitmapExtension)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m5_snapshot_retains_metadata_and_inputs() -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        let snapshot = MeteoraDlmmSnapshot::new(
+            lb_pair_pubkey,
+            lb_pair,
+            Vec::new(),
+            None,
+            test_clock(),
+            DlmmProtocolProfile::V0_12,
+            test_source(),
+        )?;
+
+        assert_eq!(snapshot.lb_pair_pubkey(), lb_pair_pubkey);
+        assert_eq!(snapshot.mint_x(), [7_u8; 32]);
+        assert_eq!(snapshot.mint_y(), [9_u8; 32]);
+        assert_eq!(snapshot.clock(), test_clock());
+        assert_eq!(snapshot.profile(), DlmmProtocolProfile::V0_12);
+        assert_eq!(snapshot.source(), test_source());
+        assert!(snapshot.bitmap_extension().is_none());
+
+        Ok(())
+    }
+
+    #[test]
     fn lb_pair_decoder_reads_locked_m1_fields() {
         let data = valid_lb_pair_bytes();
 
@@ -1225,6 +1563,36 @@ mod tests {
         );
 
         data
+    }
+
+    fn bin_array_snapshot_input(
+        lb_pair_pubkey: [u8; 32],
+        index: i64,
+    ) -> Result<MeteoraBinArraySnapshotInput, MeteoraDlmmFailure> {
+        let mut data = valid_bin_array_bytes();
+        write_bytes(&mut data, BIN_ARRAY_INDEX_OFFSET, index.to_le_bytes());
+        write_bytes(&mut data, BIN_ARRAY_LB_PAIR_OFFSET, lb_pair_pubkey);
+        let state = decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, DlmmProtocolProfile::V0_12)?;
+        let (pubkey, _) = derive_bin_array_pda(lb_pair_pubkey, index)?;
+
+        Ok(MeteoraBinArraySnapshotInput { pubkey, state })
+    }
+
+    fn test_clock() -> MeteoraClockSnapshot {
+        MeteoraClockSnapshot {
+            slot: 42_000,
+            epoch_start_timestamp: 1_700_000_000,
+            epoch: 500,
+            leader_schedule_epoch: 501,
+            unix_timestamp: 1_700_000_123,
+        }
+    }
+
+    fn test_source() -> MeteoraSnapshotSource {
+        MeteoraSnapshotSource {
+            source_slot: 42_010,
+            generation_id: 9,
+        }
     }
 
     fn empty_bitmap_extension() -> MeteoraBitmapExtensionState {
