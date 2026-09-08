@@ -1125,7 +1125,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(indexes, vec![2, -1, 0]);
-        let found_index = snapshot.bin_array_by_index(-1)?.map(MeteoraValidatedBinArray::index);
+        let found_index = snapshot
+            .bin_array_by_index(-1)?
+            .map(MeteoraValidatedBinArray::index);
         assert_eq!(found_index, Some(-1));
         assert_eq!(snapshot.bin_array_by_index(1), Ok(None));
         assert_eq!(
