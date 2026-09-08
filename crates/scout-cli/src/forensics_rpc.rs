@@ -946,4 +946,3 @@ mod tests {
         assert!(parse_block_evidence(123, "target", &block).is_err());
     }
 }
-
