@@ -384,4 +384,3 @@ mod tests {
         assert!(lifecycle.mark_ready(1).is_err());
     }
 }
-
