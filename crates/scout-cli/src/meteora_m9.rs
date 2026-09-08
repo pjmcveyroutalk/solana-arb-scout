@@ -236,7 +236,9 @@ mod tests {
         assert_eq!(plan.ordered_indexes(), vec![512]);
         let (expected_pubkey, expected_bump) = derive_bin_array_pda(LB_PAIR, 512)?;
         assert_eq!(
-            plan.targets.first().map(|target| (target.pubkey, target.bump)),
+            plan.targets
+                .first()
+                .map(|target| (target.pubkey, target.bump)),
             Some((expected_pubkey, expected_bump))
         );
         Ok(())
