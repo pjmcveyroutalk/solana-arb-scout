@@ -397,13 +397,8 @@ fn fill_bin_exact_in(
         });
     }
 
-    let fill = meteora_exact_in_fill_at_bin(
-        bin,
-        bin.price,
-        amount_left,
-        swap_for_y,
-        support_limit_order,
-    )?;
+    let fill =
+        meteora_exact_in_fill_at_bin(bin, bin.price, amount_left, swap_for_y, support_limit_order)?;
     if fill.amount_in == 0 {
         return Ok(MeteoraExactInBinAccounting {
             input_consumed: 0,
@@ -479,8 +474,7 @@ mod tests {
         derive_bin_array_pda, DlmmProtocolProfile, MeteoraBin, MeteoraBinArraySnapshotInput,
         MeteoraBinArrayState, MeteoraBitmapExtensionState, MeteoraClockSnapshot,
         MeteoraInternalBitmap, MeteoraLbPairState, MeteoraSnapshotSource, BIN_ARRAY_VERSION_V3,
-        INTERNAL_BITMAP_MIN_INDEX,
-        MAX_BIN_PER_ARRAY, Q64_ONE,
+        INTERNAL_BITMAP_MIN_INDEX, MAX_BIN_PER_ARRAY, Q64_ONE,
     };
 
     #[test]
@@ -551,7 +545,10 @@ mod tests {
         assert_eq!(result.touched_bin_arrays, vec![0, 3]);
         assert!(result.touched_bins.contains(&0));
         assert!(result.touched_bins.contains(&210));
-        assert!(!result.touched_bins.iter().any(|bin_id| (70..210).contains(bin_id)));
+        assert!(!result
+            .touched_bins
+            .iter()
+            .any(|bin_id| (70..210).contains(bin_id)));
         assert_eq!(result.amount_out, 150);
         assert_eq!(result.unspent_input, 0);
 
@@ -559,8 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn m8_bitmap_known_missing_array_is_insufficient_hydration(
-    ) -> Result<(), MeteoraDlmmFailure> {
+    fn m8_bitmap_known_missing_array_is_insufficient_hydration() -> Result<(), MeteoraDlmmFailure> {
         let lb_pair_pubkey = [7_u8; 32];
         let mut lb_pair = test_lb_pair(0);
         set_internal_bitmap_bit(&mut lb_pair.bin_array_bitmap, 0);
@@ -593,8 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn m8_single_sided_wrong_direction_is_liquidity_exhausted(
-    ) -> Result<(), MeteoraDlmmFailure> {
+    fn m8_single_sided_wrong_direction_is_liquidity_exhausted() -> Result<(), MeteoraDlmmFailure> {
         let lb_pair_pubkey = [7_u8; 32];
         let mut lb_pair = test_lb_pair(0);
         set_internal_bitmap_bit(&mut lb_pair.bin_array_bitmap, 0);
@@ -625,8 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn m8_swap_for_y_traverses_downward_and_uses_y_liquidity(
-    ) -> Result<(), MeteoraDlmmFailure> {
+    fn m8_swap_for_y_traverses_downward_and_uses_y_liquidity() -> Result<(), MeteoraDlmmFailure> {
         let lb_pair_pubkey = [7_u8; 32];
         let mut lb_pair = test_lb_pair(1);
         set_internal_bitmap_bit(&mut lb_pair.bin_array_bitmap, 0);
@@ -796,3 +790,4 @@ mod tests {
         bitmap[word_index] |= 1_u64 << bit_index;
     }
 }
+
