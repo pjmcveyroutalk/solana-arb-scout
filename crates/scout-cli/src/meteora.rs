@@ -25,6 +25,7 @@ pub const LB_PAIR_ACTIVE_ID_OFFSET: usize = 76;
 pub const LB_PAIR_BIN_STEP_OFFSET: usize = 80;
 pub const LB_PAIR_MINT_X_OFFSET: usize = 88;
 pub const LB_PAIR_MINT_Y_OFFSET: usize = 120;
+pub const LB_PAIR_BIN_ARRAY_BITMAP_OFFSET: usize = 584;
 
 pub const BIN_ARRAY_ACCOUNT_LEN: usize = 10_136;
 pub const BIN_ARRAY_DISCRIMINATOR: [u8; 8] = [92, 142, 92, 220, 5, 148, 70, 181];
@@ -70,7 +71,11 @@ const BITMAP_EXTENSION_POSITIVE_OFFSET: usize = 40;
 const BITMAP_EXTENSION_NEGATIVE_OFFSET: usize = 808;
 const BITMAP_EXTENSION_CHUNKS: usize = 12;
 const BITMAP_EXTENSION_WORDS: usize = 8;
+const INTERNAL_BITMAP_WORDS: usize = 16;
+const BITMAP_WORD_BITS: i64 = 64;
+const EXTENSION_BITMAP_BITS: i64 = 512;
 
+pub type MeteoraInternalBitmap = [u64; 16];
 pub type MeteoraBitmapRegion = [[u64; 8]; 12];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +154,7 @@ pub struct MeteoraLbPairState {
     pub bin_step: u16,
     pub mint_x: [u8; 32],
     pub mint_y: [u8; 32],
+    pub bin_array_bitmap: MeteoraInternalBitmap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +265,53 @@ pub fn derive_bin_array_pda(
     .ok_or(MeteoraDlmmFailure::InvalidLayout)
 }
 
+pub fn bin_array_bitmap_bit(
+    internal_bitmap: &MeteoraInternalBitmap,
+    bitmap_extension: Option<&MeteoraBitmapExtensionState>,
+    index: i64,
+) -> Result<bool, MeteoraDlmmFailure> {
+    match bin_array_bitmap_region(index)? {
+        MeteoraBinArrayBitmapRegion::Internal => internal_bitmap_bit(internal_bitmap, index),
+        MeteoraBinArrayBitmapRegion::NegativeExtension => {
+            let extension = bitmap_extension.ok_or(MeteoraDlmmFailure::BitmapExtensionRequired)?;
+            extension_bitmap_bit(&extension.negative_bin_array_bitmap, index, false)
+        }
+        MeteoraBinArrayBitmapRegion::PositiveExtension => {
+            let extension = bitmap_extension.ok_or(MeteoraDlmmFailure::BitmapExtensionRequired)?;
+            extension_bitmap_bit(&extension.positive_bin_array_bitmap, index, true)
+        }
+    }
+}
+
+pub fn next_initialized_bin_array_index(
+    internal_bitmap: &MeteoraInternalBitmap,
+    bitmap_extension: Option<&MeteoraBitmapExtensionState>,
+    start_index: i64,
+    swap_for_y: bool,
+) -> Result<Option<i64>, MeteoraDlmmFailure> {
+    validate_bin_array_index(start_index)?;
+
+    let step = if swap_for_y { -1_i64 } else { 1_i64 };
+    let terminal = if swap_for_y {
+        BIN_ARRAY_MIN_INDEX
+    } else {
+        BIN_ARRAY_MAX_INDEX
+    };
+    let mut index = start_index;
+
+    loop {
+        if bin_array_bitmap_bit(internal_bitmap, bitmap_extension, index)? {
+            return Ok(Some(index));
+        }
+        if index == terminal {
+            return Ok(None);
+        }
+        index = index
+            .checked_add(step)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    }
+}
+
 pub fn decode_lb_pair(owner: &str, data: &[u8]) -> Result<MeteoraLbPairState, MeteoraDlmmFailure> {
     let invalid = MeteoraDlmmFailure::InvalidLbPair;
 
@@ -286,6 +339,7 @@ pub fn decode_lb_pair(owner: &str, data: &[u8]) -> Result<MeteoraLbPairState, Me
         bin_step: read_u16(data, LB_PAIR_BIN_STEP_OFFSET, invalid)?,
         mint_x: read_array::<32>(data, LB_PAIR_MINT_X_OFFSET, invalid)?,
         mint_y: read_array::<32>(data, LB_PAIR_MINT_Y_OFFSET, invalid)?,
+        bin_array_bitmap: decode_internal_bitmap(data)?,
     })
 }
 
@@ -413,6 +467,79 @@ fn decode_bitmap_words(
     }
 
     Ok(())
+}
+
+fn decode_internal_bitmap(data: &[u8]) -> Result<MeteoraInternalBitmap, MeteoraDlmmFailure> {
+    let invalid = MeteoraDlmmFailure::InvalidLbPair;
+    let mut bitmap = [0_u64; INTERNAL_BITMAP_WORDS];
+
+    for (word_index, word) in bitmap.iter_mut().enumerate() {
+        let byte_offset = word_index
+            .checked_mul(8)
+            .and_then(|value| LB_PAIR_BIN_ARRAY_BITMAP_OFFSET.checked_add(value))
+            .ok_or(invalid)?;
+        *word = read_u64(data, byte_offset, invalid)?;
+    }
+
+    Ok(bitmap)
+}
+
+fn internal_bitmap_bit(
+    bitmap: &MeteoraInternalBitmap,
+    index: i64,
+) -> Result<bool, MeteoraDlmmFailure> {
+    if !(INTERNAL_BITMAP_MIN_INDEX..=INTERNAL_BITMAP_MAX_INDEX).contains(&index) {
+        return Err(MeteoraDlmmFailure::InvalidLayout);
+    }
+
+    let bit_offset = index
+        .checked_sub(INTERNAL_BITMAP_MIN_INDEX)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let word_index = usize::try_from(bit_offset / BITMAP_WORD_BITS)
+        .map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let bit_index = u32::try_from(bit_offset % BITMAP_WORD_BITS)
+        .map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let word = bitmap
+        .get(word_index)
+        .copied()
+        .ok_or(MeteoraDlmmFailure::InvalidLayout)?;
+
+    Ok((word & (1_u64 << bit_index)) != 0)
+}
+
+fn extension_bitmap_bit(
+    bitmap: &MeteoraBitmapRegion,
+    index: i64,
+    positive: bool,
+) -> Result<bool, MeteoraDlmmFailure> {
+    let logical_offset = if positive {
+        index
+            .checked_sub(POSITIVE_BITMAP_EXTENSION_MIN_INDEX)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+    } else {
+        NEGATIVE_BITMAP_EXTENSION_MAX_INDEX
+            .checked_sub(index)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+    };
+
+    if logical_offset < 0 {
+        return Err(MeteoraDlmmFailure::InvalidLayout);
+    }
+
+    let chunk_index = usize::try_from(logical_offset / EXTENSION_BITMAP_BITS)
+        .map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let chunk_bit = logical_offset % EXTENSION_BITMAP_BITS;
+    let word_index = usize::try_from(chunk_bit / BITMAP_WORD_BITS)
+        .map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let bit_index = u32::try_from(chunk_bit % BITMAP_WORD_BITS)
+        .map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let word = bitmap
+        .get(chunk_index)
+        .and_then(|chunk| chunk.get(word_index))
+        .copied()
+        .ok_or(MeteoraDlmmFailure::InvalidLayout)?;
+
+    Ok((word & (1_u64 << bit_index)) != 0)
 }
 
 fn validate_bin_array_index(index: i64) -> Result<(), MeteoraDlmmFailure> {
@@ -674,6 +801,143 @@ mod tests {
     }
 
     #[test]
+    fn m4_internal_bitmap_bit_mapping_matches_meteora_layout() {
+        let mut bitmap = [0_u64; INTERNAL_BITMAP_WORDS];
+        set_internal_bitmap_bit(&mut bitmap, -512);
+        set_internal_bitmap_bit(&mut bitmap, -1);
+        set_internal_bitmap_bit(&mut bitmap, 0);
+        set_internal_bitmap_bit(&mut bitmap, 511);
+
+        assert_eq!(bin_array_bitmap_bit(&bitmap, None, -512), Ok(true));
+        assert_eq!(bin_array_bitmap_bit(&bitmap, None, -1), Ok(true));
+        assert_eq!(bin_array_bitmap_bit(&bitmap, None, 0), Ok(true));
+        assert_eq!(bin_array_bitmap_bit(&bitmap, None, 511), Ok(true));
+        assert_eq!(bin_array_bitmap_bit(&bitmap, None, 1), Ok(false));
+    }
+
+    #[test]
+    fn m4_extension_bitmap_bit_mapping_matches_positive_and_negative_chunks() {
+        let internal = [0_u64; INTERNAL_BITMAP_WORDS];
+        let mut extension = empty_bitmap_extension();
+        set_extension_bitmap_bit(&mut extension.positive_bin_array_bitmap, 512, true);
+        set_extension_bitmap_bit(&mut extension.positive_bin_array_bitmap, 1_023, true);
+        set_extension_bitmap_bit(&mut extension.positive_bin_array_bitmap, 1_024, true);
+        set_extension_bitmap_bit(&mut extension.positive_bin_array_bitmap, 6_655, true);
+        set_extension_bitmap_bit(&mut extension.negative_bin_array_bitmap, -513, false);
+        set_extension_bitmap_bit(&mut extension.negative_bin_array_bitmap, -1_024, false);
+        set_extension_bitmap_bit(&mut extension.negative_bin_array_bitmap, -1_025, false);
+        set_extension_bitmap_bit(&mut extension.negative_bin_array_bitmap, -6_656, false);
+
+        for index in [512_i64, 1_023, 1_024, 6_655, -513, -1_024, -1_025, -6_656] {
+            assert_eq!(bin_array_bitmap_bit(&internal, Some(&extension), index), Ok(true));
+        }
+    }
+
+    #[test]
+    fn m4_extension_access_fails_closed_when_extension_is_missing() {
+        let internal = [0_u64; INTERNAL_BITMAP_WORDS];
+
+        assert_eq!(
+            bin_array_bitmap_bit(&internal, None, -513),
+            Err(MeteoraDlmmFailure::BitmapExtensionRequired)
+        );
+        assert_eq!(
+            bin_array_bitmap_bit(&internal, None, 512),
+            Err(MeteoraDlmmFailure::BitmapExtensionRequired)
+        );
+    }
+
+    #[test]
+    fn m4_search_is_inclusive_and_directional_across_internal_bitmap() {
+        let mut internal = [0_u64; INTERNAL_BITMAP_WORDS];
+        set_internal_bitmap_bit(&mut internal, -2);
+        set_internal_bitmap_bit(&mut internal, 3);
+
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, None, 0, true),
+            Ok(Some(-2))
+        );
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, None, 0, false),
+            Ok(Some(3))
+        );
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, None, -2, true),
+            Ok(Some(-2))
+        );
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, None, 3, false),
+            Ok(Some(3))
+        );
+    }
+
+    #[test]
+    fn m4_search_crosses_internal_and_extension_boundaries() {
+        let mut internal = [0_u64; INTERNAL_BITMAP_WORDS];
+        let mut extension = empty_bitmap_extension();
+        set_internal_bitmap_bit(&mut internal, -510);
+        set_internal_bitmap_bit(&mut internal, 509);
+        set_extension_bitmap_bit(&mut extension.negative_bin_array_bitmap, -514, false);
+        set_extension_bitmap_bit(&mut extension.positive_bin_array_bitmap, 513, true);
+
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, Some(&extension), -511, true),
+            Ok(Some(-514))
+        );
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, Some(&extension), 510, false),
+            Ok(Some(513))
+        );
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, Some(&extension), -510, false),
+            Ok(Some(-510))
+        );
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, Some(&extension), 509, true),
+            Ok(Some(509))
+        );
+    }
+
+    #[test]
+    fn m4_search_requires_extension_only_when_traversal_enters_extension_range() {
+        let internal = [0_u64; INTERNAL_BITMAP_WORDS];
+
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, None, 511, false),
+            Err(MeteoraDlmmFailure::BitmapExtensionRequired)
+        );
+        assert_eq!(
+            next_initialized_bin_array_index(&internal, None, -512, true),
+            Err(MeteoraDlmmFailure::BitmapExtensionRequired)
+        );
+    }
+
+    #[test]
+    fn m4_search_returns_none_at_protocol_edge_when_no_initialized_array_exists() {
+        let internal = [0_u64; INTERNAL_BITMAP_WORDS];
+        let extension = empty_bitmap_extension();
+
+        assert_eq!(
+            next_initialized_bin_array_index(
+                &internal,
+                Some(&extension),
+                BIN_ARRAY_MIN_INDEX,
+                true,
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            next_initialized_bin_array_index(
+                &internal,
+                Some(&extension),
+                BIN_ARRAY_MAX_INDEX,
+                false,
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
     fn lb_pair_decoder_reads_locked_m1_fields() {
         let data = valid_lb_pair_bytes();
 
@@ -692,6 +956,11 @@ mod tests {
         assert_eq!(
             decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &data).map(|state| state.mint_y),
             Ok([9_u8; 32])
+        );
+        assert_eq!(
+            decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &data)
+                .map(|state| state.bin_array_bitmap[0]),
+            Ok(0x0123_4567_89ab_cdef)
         );
     }
 
@@ -854,6 +1123,11 @@ mod tests {
         write_bytes(&mut data, LB_PAIR_BIN_STEP_OFFSET, 10_u16.to_le_bytes());
         write_bytes(&mut data, LB_PAIR_MINT_X_OFFSET, [7_u8; 32]);
         write_bytes(&mut data, LB_PAIR_MINT_Y_OFFSET, [9_u8; 32]);
+        write_bytes(
+            &mut data,
+            LB_PAIR_BIN_ARRAY_BITMAP_OFFSET,
+            0x0123_4567_89ab_cdef_u64.to_le_bytes(),
+        );
 
         data
     }
@@ -949,6 +1223,34 @@ mod tests {
         );
 
         data
+    }
+
+    fn empty_bitmap_extension() -> MeteoraBitmapExtensionState {
+        MeteoraBitmapExtensionState {
+            lb_pair: [0_u8; 32],
+            positive_bin_array_bitmap: [[0_u64; 8]; 12],
+            negative_bin_array_bitmap: [[0_u64; 8]; 12],
+        }
+    }
+
+    fn set_internal_bitmap_bit(bitmap: &mut MeteoraInternalBitmap, index: i64) {
+        let bit_offset = index - INTERNAL_BITMAP_MIN_INDEX;
+        let word_index = (bit_offset / BITMAP_WORD_BITS) as usize;
+        let bit_index = (bit_offset % BITMAP_WORD_BITS) as u32;
+        bitmap[word_index] |= 1_u64 << bit_index;
+    }
+
+    fn set_extension_bitmap_bit(bitmap: &mut MeteoraBitmapRegion, index: i64, positive: bool) {
+        let logical_offset = if positive {
+            index - POSITIVE_BITMAP_EXTENSION_MIN_INDEX
+        } else {
+            NEGATIVE_BITMAP_EXTENSION_MAX_INDEX - index
+        };
+        let chunk_index = (logical_offset / EXTENSION_BITMAP_BITS) as usize;
+        let chunk_bit = logical_offset % EXTENSION_BITMAP_BITS;
+        let word_index = (chunk_bit / BITMAP_WORD_BITS) as usize;
+        let bit_index = (chunk_bit % BITMAP_WORD_BITS) as u32;
+        bitmap[chunk_index][word_index] |= 1_u64 << bit_index;
     }
 
     fn write_bytes<const N: usize>(data: &mut [u8], offset: usize, bytes: [u8; N]) {
