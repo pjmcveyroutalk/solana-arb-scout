@@ -261,7 +261,8 @@ impl MeteoraDlmmSnapshot {
             }
         }
 
-        let mut validated_bin_arrays = Vec::with_capacity(bin_arrays.len());
+        let mut validated_bin_arrays: Vec<MeteoraValidatedBinArray> =
+            Vec::with_capacity(bin_arrays.len());
 
         for input in bin_arrays {
             validate_bin_array_index(input.state.index)?;
