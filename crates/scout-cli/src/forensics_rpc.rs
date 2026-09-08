@@ -3,9 +3,6 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[path = "r14.rs"]
-pub mod r14;
-
 pub const SIGNATURE_PAGE_LIMIT: usize = 100;
 pub const MAX_SIGNATURE_PAGES_PER_ADDRESS: usize = 2;
 pub const MAX_TRANSACTION_FETCHES: usize = 32;
@@ -946,3 +943,4 @@ mod tests {
         assert!(parse_block_evidence(123, "target", &block).is_err());
     }
 }
+
