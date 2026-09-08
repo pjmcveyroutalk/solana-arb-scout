@@ -24,10 +24,7 @@ mod tests {
 
     #[test]
     fn discriminator_matches_official_swap2_discriminator() {
-        assert_eq!(
-            SWAP2_DISCRIMINATOR,
-            [65, 75, 63, 76, 235, 91, 91, 136]
-        );
+        assert_eq!(SWAP2_DISCRIMINATOR, [65, 75, 63, 76, 235, 91, 91, 136]);
     }
 
     #[test]
@@ -37,8 +34,8 @@ mod tests {
         assert_eq!(
             data,
             [
-                65, 75, 63, 76, 235, 91, 91, 136, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0,
+                65, 75, 63, 76, 235, 91, 91, 136, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0,
             ]
         );
     }
@@ -72,10 +69,8 @@ mod tests {
 
     #[test]
     fn representative_values_prove_little_endian_argument_order() {
-        let data = serialize_swap2_empty_remaining_accounts(
-            0x0102_0304_0506_0708,
-            0x1112_1314_1516_1718,
-        );
+        let data =
+            serialize_swap2_empty_remaining_accounts(0x0102_0304_0506_0708, 0x1112_1314_1516_1718);
 
         assert_eq!(
             &data[8..16],
