@@ -485,8 +485,8 @@ mod tests {
         set_internal_bitmap_bit(&mut lb_pair.bin_array_bitmap, 0);
 
         let mut array = test_bin_array_input(lb_pair_pubkey, 0)?;
-        array.state.bins[0] = test_bin(200, 100, false);
-        array.state.bins[1] = test_bin(200, 100, false);
+        array.state.bins[0] = test_bin(100, 100, false);
+        array.state.bins[1] = test_bin(100, 100, false);
         let snapshot = test_snapshot(lb_pair_pubkey, lb_pair, vec![array])?;
 
         let result = meteora_exact_in_traverse(&snapshot, 150, false, true)?;
@@ -535,9 +535,9 @@ mod tests {
         set_internal_bitmap_bit(&mut lb_pair.bin_array_bitmap, 3);
 
         let mut array_zero = test_bin_array_input(lb_pair_pubkey, 0)?;
-        array_zero.state.bins[0] = test_bin(200, 100, false);
+        array_zero.state.bins[0] = test_bin(100, 100, false);
         let mut array_three = test_bin_array_input(lb_pair_pubkey, 3)?;
-        array_three.state.bins[0] = test_bin(200, 100, false);
+        array_three.state.bins[0] = test_bin(100, 100, false);
         let snapshot = test_snapshot(lb_pair_pubkey, lb_pair, vec![array_zero, array_three])?;
 
         let result = meteora_exact_in_traverse(&snapshot, 150, false, true)?;
@@ -563,7 +563,7 @@ mod tests {
         set_internal_bitmap_bit(&mut lb_pair.bin_array_bitmap, 3);
 
         let mut array_zero = test_bin_array_input(lb_pair_pubkey, 0)?;
-        array_zero.state.bins[0] = test_bin(200, 100, false);
+        array_zero.state.bins[0] = test_bin(100, 100, false);
         let snapshot = test_snapshot(lb_pair_pubkey, lb_pair, vec![array_zero])?;
 
         let result = meteora_exact_in_traverse(&snapshot, 150, false, true)?;
@@ -790,3 +790,4 @@ mod tests {
         bitmap[word_index] |= 1_u64 << bit_index;
     }
 }
+
