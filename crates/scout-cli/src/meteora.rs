@@ -843,12 +843,7 @@ fn meteora_exact_in_fill_layer(
         });
     }
 
-    let max_amount_in = meteora_amount_in(
-        max_amount_out,
-        price,
-        swap_for_y,
-        MeteoraRounding::Up,
-    )?;
+    let max_amount_in = meteora_amount_in(max_amount_out, price, swap_for_y, MeteoraRounding::Up)?;
 
     if amount_in >= max_amount_in {
         return Ok(MeteoraFillLayerResult {
@@ -860,12 +855,7 @@ fn meteora_exact_in_fill_layer(
         });
     }
 
-    let amount_out = meteora_amount_out(
-        amount_in,
-        price,
-        swap_for_y,
-        MeteoraRounding::Down,
-    )?;
+    let amount_out = meteora_amount_out(amount_in, price, swap_for_y, MeteoraRounding::Down)?;
 
     Ok(MeteoraFillLayerResult {
         amount_in,
@@ -2023,8 +2013,7 @@ mod tests {
             }
         );
 
-        let wrong_direction =
-            meteora_exact_in_fill_at_bin(&bid_side, Q64_ONE, 160, false, true)?;
+        let wrong_direction = meteora_exact_in_fill_at_bin(&bid_side, Q64_ONE, 160, false, true)?;
         assert_eq!(
             wrong_direction,
             MeteoraExactInFillResult {
