@@ -50,6 +50,7 @@ pub const POSITIVE_BITMAP_EXTENSION_MIN_INDEX: i64 = 512;
 
 pub const FEE_PRECISION: u64 = 1_000_000_000;
 pub const MAX_FEE_RATE: u64 = 100_000_000;
+pub const LIMIT_ORDER_FEE_SHARE: u16 = 5_000;
 
 const BASIS_POINT_MAX: u64 = 10_000;
 const VARIABLE_FEE_DENOMINATOR: u128 = 100_000_000_000;
@@ -627,6 +628,240 @@ pub fn meteora_fee_on_input(
         MeteoraCollectFeeMode::InputOnly => Ok(true),
         MeteoraCollectFeeMode::OnlyY => Ok(!swap_for_y),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteoraLimitOrderAmounts {
+    pub open_order_amount: u64,
+    pub processed_order_remaining_amount: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteoraExactInFillResult {
+    pub amount_in: u64,
+    pub amount_left: u64,
+    pub amount_out: u64,
+    pub mm_amount_in: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteoraFeeSplit {
+    pub user_fee: u64,
+    pub protocol_fee: u64,
+}
+
+pub fn meteora_limit_order_amounts_by_direction(
+    bin: &MeteoraBin,
+    swap_for_y: bool,
+) -> MeteoraLimitOrderAmounts {
+    let is_ask_side = bin.limit_order_ask_side != 0;
+    let matches_direction = (swap_for_y && !is_ask_side) || (!swap_for_y && is_ask_side);
+
+    if matches_direction {
+        MeteoraLimitOrderAmounts {
+            open_order_amount: bin.open_order_amount,
+            processed_order_remaining_amount: bin.processed_order_remaining_amount,
+        }
+    } else {
+        MeteoraLimitOrderAmounts {
+            open_order_amount: 0,
+            processed_order_remaining_amount: 0,
+        }
+    }
+}
+
+pub fn meteora_max_amount_out_with_limit_orders(
+    bin: &MeteoraBin,
+    swap_for_y: bool,
+    support_limit_order: bool,
+) -> Result<u64, MeteoraDlmmFailure> {
+    let mm_amount = if swap_for_y {
+        bin.amount_y
+    } else {
+        bin.amount_x
+    };
+
+    if !support_limit_order {
+        return Ok(mm_amount);
+    }
+
+    let limit_orders = meteora_limit_order_amounts_by_direction(bin, swap_for_y);
+    mm_amount
+        .checked_add(limit_orders.processed_order_remaining_amount)
+        .and_then(|amount| amount.checked_add(limit_orders.open_order_amount))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_exact_in_fill_at_bin(
+    bin: &MeteoraBin,
+    price: u128,
+    amount_in: u64,
+    swap_for_y: bool,
+    support_limit_order: bool,
+) -> Result<MeteoraExactInFillResult, MeteoraDlmmFailure> {
+    if price == 0 {
+        return Err(MeteoraDlmmFailure::ArithmeticOverflow);
+    }
+
+    let mm_amount = if swap_for_y {
+        bin.amount_y
+    } else {
+        bin.amount_x
+    };
+    let mm_fill = meteora_exact_in_fill_layer(amount_in, mm_amount, price, swap_for_y)?;
+
+    if !support_limit_order {
+        return Ok(MeteoraExactInFillResult {
+            amount_in: mm_fill.amount_in,
+            amount_left: mm_fill.amount_left,
+            amount_out: mm_fill.amount_out,
+            mm_amount_in: mm_fill.amount_in,
+        });
+    }
+
+    let mut total_amount_in = mm_fill.amount_in;
+    let mut total_amount_out = mm_fill.amount_out;
+    let mut amount_left = mm_fill.amount_left;
+
+    if amount_left > 0 {
+        let limit_orders = meteora_limit_order_amounts_by_direction(bin, swap_for_y);
+        let processed_fill = meteora_exact_in_fill_layer(
+            amount_left,
+            limit_orders.processed_order_remaining_amount,
+            price,
+            swap_for_y,
+        )?;
+
+        total_amount_in = total_amount_in
+            .checked_add(processed_fill.amount_in)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+        total_amount_out = total_amount_out
+            .checked_add(processed_fill.amount_out)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+        amount_left = processed_fill.amount_left;
+
+        if amount_left > 0 {
+            let open_fill = meteora_exact_in_fill_layer(
+                amount_left,
+                limit_orders.open_order_amount,
+                price,
+                swap_for_y,
+            )?;
+
+            total_amount_in = total_amount_in
+                .checked_add(open_fill.amount_in)
+                .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+            total_amount_out = total_amount_out
+                .checked_add(open_fill.amount_out)
+                .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+            amount_left = open_fill.amount_left;
+        }
+    }
+
+    Ok(MeteoraExactInFillResult {
+        amount_in: total_amount_in,
+        amount_left,
+        amount_out: total_amount_out,
+        mm_amount_in: mm_fill.amount_in,
+    })
+}
+
+pub fn meteora_split_fee(
+    trading_fee: u64,
+    protocol_share: u16,
+    mm_amount_in: u64,
+    total_amount_in: u64,
+) -> Result<MeteoraFeeSplit, MeteoraDlmmFailure> {
+    if total_amount_in == 0 || trading_fee == 0 {
+        return Ok(MeteoraFeeSplit {
+            user_fee: 0,
+            protocol_fee: 0,
+        });
+    }
+    if mm_amount_in > total_amount_in {
+        return Err(MeteoraDlmmFailure::ArithmeticOverflow);
+    }
+
+    let mm_fee = meteora_mul_div(
+        u128::from(trading_fee),
+        u128::from(mm_amount_in),
+        u128::from(total_amount_in),
+        MeteoraRounding::Up,
+    )?;
+    let mm_fee = u64::try_from(mm_fee).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let total_limit_order_fee = trading_fee
+        .checked_sub(mm_fee)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let limit_order_placer_fee = u128::from(total_limit_order_fee)
+        .checked_mul(u128::from(LIMIT_ORDER_FEE_SHARE))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .checked_div(u128::from(BASIS_POINT_MAX))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let limit_order_placer_fee = u64::try_from(limit_order_placer_fee)
+        .map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let limit_order_protocol_fee = total_limit_order_fee
+        .checked_sub(limit_order_placer_fee)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let mm_protocol_fee = u128::from(mm_fee)
+        .checked_mul(u128::from(protocol_share))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .checked_div(u128::from(BASIS_POINT_MAX))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let mm_protocol_fee =
+        u64::try_from(mm_protocol_fee).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let protocol_fee = limit_order_protocol_fee
+        .checked_add(mm_protocol_fee)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let user_fee = trading_fee
+        .checked_sub(protocol_fee)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    Ok(MeteoraFeeSplit {
+        user_fee,
+        protocol_fee,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MeteoraFillLayerResult {
+    amount_in: u64,
+    amount_left: u64,
+    amount_out: u64,
+}
+
+fn meteora_exact_in_fill_layer(
+    amount_in: u64,
+    max_amount_out: u64,
+    price: u128,
+    swap_for_y: bool,
+) -> Result<MeteoraFillLayerResult, MeteoraDlmmFailure> {
+    if max_amount_out == 0 {
+        return Ok(MeteoraFillLayerResult {
+            amount_in: 0,
+            amount_left: amount_in,
+            amount_out: 0,
+        });
+    }
+
+    let max_amount_in = meteora_amount_in(max_amount_out, price, swap_for_y, MeteoraRounding::Up)?;
+
+    if amount_in >= max_amount_in {
+        return Ok(MeteoraFillLayerResult {
+            amount_in: max_amount_in,
+            amount_left: amount_in
+                .checked_sub(max_amount_in)
+                .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?,
+            amount_out: max_amount_out,
+        });
+    }
+
+    let amount_out = meteora_amount_out(amount_in, price, swap_for_y, MeteoraRounding::Down)?;
+
+    Ok(MeteoraFillLayerResult {
+        amount_in,
+        amount_left: 0,
+        amount_out,
+    })
 }
 
 fn meteora_mul_shr(
@@ -1670,6 +1905,175 @@ mod tests {
     }
 
     #[test]
+    fn m7_limit_order_fee_share_matches_pinned_contract() {
+        assert_eq!(LIMIT_ORDER_FEE_SHARE, 5_000);
+    }
+
+    #[test]
+    fn m7_limit_orders_are_directional() {
+        let bid_side = m7_bin(100, 200, 30, 40, false);
+        let ask_side = m7_bin(100, 200, 50, 60, true);
+
+        assert_eq!(
+            meteora_limit_order_amounts_by_direction(&bid_side, true),
+            MeteoraLimitOrderAmounts {
+                open_order_amount: 30,
+                processed_order_remaining_amount: 40,
+            }
+        );
+        assert_eq!(
+            meteora_limit_order_amounts_by_direction(&bid_side, false),
+            MeteoraLimitOrderAmounts {
+                open_order_amount: 0,
+                processed_order_remaining_amount: 0,
+            }
+        );
+        assert_eq!(
+            meteora_limit_order_amounts_by_direction(&ask_side, false),
+            MeteoraLimitOrderAmounts {
+                open_order_amount: 50,
+                processed_order_remaining_amount: 60,
+            }
+        );
+        assert_eq!(
+            meteora_limit_order_amounts_by_direction(&ask_side, true),
+            MeteoraLimitOrderAmounts {
+                open_order_amount: 0,
+                processed_order_remaining_amount: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn m7_max_amount_out_includes_only_matching_limit_orders() -> Result<(), MeteoraDlmmFailure> {
+        let bid_side = m7_bin(100, 200, 30, 40, false);
+        let ask_side = m7_bin(100, 200, 50, 60, true);
+
+        assert_eq!(
+            meteora_max_amount_out_with_limit_orders(&bid_side, true, true)?,
+            270
+        );
+        assert_eq!(
+            meteora_max_amount_out_with_limit_orders(&bid_side, true, false)?,
+            200
+        );
+        assert_eq!(
+            meteora_max_amount_out_with_limit_orders(&bid_side, false, true)?,
+            100
+        );
+        assert_eq!(
+            meteora_max_amount_out_with_limit_orders(&ask_side, false, true)?,
+            210
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m7_exact_in_fill_layers_mm_processed_then_open() -> Result<(), MeteoraDlmmFailure> {
+        let bin = m7_bin(90, 100, 30, 50, false);
+
+        let partial = meteora_exact_in_fill_at_bin(&bin, Q64_ONE, 160, true, true)?;
+        assert_eq!(
+            partial,
+            MeteoraExactInFillResult {
+                amount_in: 160,
+                amount_left: 0,
+                amount_out: 160,
+                mm_amount_in: 100,
+            }
+        );
+
+        let exhausted = meteora_exact_in_fill_at_bin(&bin, Q64_ONE, 220, true, true)?;
+        assert_eq!(
+            exhausted,
+            MeteoraExactInFillResult {
+                amount_in: 180,
+                amount_left: 40,
+                amount_out: 180,
+                mm_amount_in: 100,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m7_exact_in_fill_can_exclude_or_ignore_limit_orders() -> Result<(), MeteoraDlmmFailure> {
+        let bid_side = m7_bin(90, 100, 30, 50, false);
+
+        let disabled = meteora_exact_in_fill_at_bin(&bid_side, Q64_ONE, 160, true, false)?;
+        assert_eq!(
+            disabled,
+            MeteoraExactInFillResult {
+                amount_in: 100,
+                amount_left: 60,
+                amount_out: 100,
+                mm_amount_in: 100,
+            }
+        );
+
+        let wrong_direction = meteora_exact_in_fill_at_bin(&bid_side, Q64_ONE, 160, false, true)?;
+        assert_eq!(
+            wrong_direction,
+            MeteoraExactInFillResult {
+                amount_in: 90,
+                amount_left: 70,
+                amount_out: 90,
+                mm_amount_in: 90,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m7_fee_split_matches_pinned_limit_order_vector() -> Result<(), MeteoraDlmmFailure> {
+        assert_eq!(
+            meteora_split_fee(1_000, 2_500, 100, 160)?,
+            MeteoraFeeSplit {
+                user_fee: 656,
+                protocol_fee: 344,
+            }
+        );
+        assert_eq!(
+            meteora_split_fee(1_000, 2_500, 160, 160)?,
+            MeteoraFeeSplit {
+                user_fee: 750,
+                protocol_fee: 250,
+            }
+        );
+        assert_eq!(
+            meteora_split_fee(0, 2_500, 100, 160)?,
+            MeteoraFeeSplit {
+                user_fee: 0,
+                protocol_fee: 0,
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m7_limit_order_math_fails_closed_on_invalid_inputs() {
+        let bin = m7_bin(90, 100, 30, 50, false);
+        let overflow_bin = m7_bin(u64::MAX, u64::MAX, 1, 1, true);
+
+        assert_eq!(
+            meteora_exact_in_fill_at_bin(&bin, 0, 1, true, true),
+            Err(MeteoraDlmmFailure::ArithmeticOverflow)
+        );
+        assert_eq!(
+            meteora_split_fee(1_000, 2_500, 161, 160),
+            Err(MeteoraDlmmFailure::ArithmeticOverflow)
+        );
+        assert_eq!(
+            meteora_max_amount_out_with_limit_orders(&overflow_bin, false, true),
+            Err(MeteoraDlmmFailure::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
     fn m5_snapshot_preserves_order_and_index_lookup() -> Result<(), MeteoraDlmmFailure> {
         let lb_pair_pubkey = [7_u8; 32];
         let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
@@ -2193,6 +2597,32 @@ mod tests {
         let word_index = (chunk_bit / BITMAP_WORD_BITS) as usize;
         let bit_index = (chunk_bit % BITMAP_WORD_BITS) as u32;
         bitmap[chunk_index][word_index] |= 1_u64 << bit_index;
+    }
+
+    fn m7_bin(
+        amount_x: u64,
+        amount_y: u64,
+        open_order_amount: u64,
+        processed_order_remaining_amount: u64,
+        ask_side: bool,
+    ) -> MeteoraBin {
+        MeteoraBin {
+            amount_x,
+            amount_y,
+            price: Q64_ONE,
+            liquidity_supply: 0,
+            fulfilled_order_amount_x: 0,
+            fulfilled_order_amount_y: 0,
+            limit_order_fee_ask_side: 0,
+            limit_order_fee_bid_side: 0,
+            fee_amount_x_per_token_stored: 0,
+            fee_amount_y_per_token_stored: 0,
+            open_order_amount,
+            total_processing_order_amount: 0,
+            processed_order_remaining_amount,
+            order_age: 0,
+            limit_order_ask_side: u8::from(ask_side),
+        }
     }
 
     fn write_bytes<const N: usize>(data: &mut [u8], offset: usize, bytes: [u8; N]) {
