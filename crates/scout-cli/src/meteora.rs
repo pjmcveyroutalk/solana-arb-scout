@@ -1,3 +1,4 @@
+use ethnum::U256;
 use solana_pubkey::{pubkey, Pubkey};
 
 pub const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
@@ -49,6 +50,12 @@ pub const POSITIVE_BITMAP_EXTENSION_MIN_INDEX: i64 = 512;
 
 pub const FEE_PRECISION: u64 = 1_000_000_000;
 pub const MAX_FEE_RATE: u64 = 100_000_000;
+
+const BASIS_POINT_MAX: u64 = 10_000;
+const VARIABLE_FEE_DENOMINATOR: u128 = 100_000_000_000;
+const Q64_SCALE_OFFSET: u8 = 64;
+const Q64_MAX_EXPONENTIAL: u32 = 0x80000;
+pub const Q64_ONE: u128 = 1_u128 << Q64_SCALE_OFFSET;
 
 const BIN_AMOUNT_X_OFFSET: usize = 0;
 const BIN_AMOUNT_Y_OFFSET: usize = 8;
@@ -349,6 +356,346 @@ impl MeteoraDlmmSnapshot {
     pub fn source(&self) -> MeteoraSnapshotSource {
         self.source
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeteoraRounding {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeteoraCollectFeeMode {
+    InputOnly,
+    OnlyY,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeteoraVolatilityState {
+    pub volatility_accumulator: u32,
+    pub volatility_reference: u32,
+    pub index_reference: i32,
+}
+
+pub fn meteora_mul_div(
+    x: u128,
+    y: u128,
+    denominator: u128,
+    rounding: MeteoraRounding,
+) -> Result<u128, MeteoraDlmmFailure> {
+    if denominator == 0 {
+        return Err(MeteoraDlmmFailure::ArithmeticOverflow);
+    }
+
+    let denominator = U256::from(denominator);
+    let product = U256::from(x)
+        .checked_mul(U256::from(y))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let mut quotient = product / denominator;
+    let remainder = product % denominator;
+
+    if rounding == MeteoraRounding::Up && remainder != U256::ZERO {
+        quotient = quotient.checked_add(U256::ONE).ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    }
+    u128::try_from(quotient).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_amount_out(
+    amount_in: u64,
+    price: u128,
+    swap_for_y: bool,
+    rounding: MeteoraRounding,
+) -> Result<u64, MeteoraDlmmFailure> {
+    let amount_out = if swap_for_y {
+        meteora_mul_shr(price, u128::from(amount_in), Q64_SCALE_OFFSET, rounding)?
+    } else {
+        meteora_shl_div(u128::from(amount_in), price, Q64_SCALE_OFFSET, rounding)?
+    };
+
+    u64::try_from(amount_out).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_amount_in(
+    amount_out: u64,
+    price: u128,
+    swap_for_y: bool,
+    rounding: MeteoraRounding,
+) -> Result<u64, MeteoraDlmmFailure> {
+    let amount_in = if swap_for_y {
+        meteora_shl_div(u128::from(amount_out), price, Q64_SCALE_OFFSET, rounding)?
+    } else {
+        meteora_mul_shr(u128::from(amount_out), price, Q64_SCALE_OFFSET, rounding)?
+    };
+
+    u64::try_from(amount_in).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_q64_price_from_bin_id(
+    bin_id: i32,
+    bin_step: u16,
+) -> Result<u128, MeteoraDlmmFailure> {
+    let bps = u128::from(bin_step)
+        .checked_shl(u32::from(Q64_SCALE_OFFSET))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .checked_div(u128::from(BASIS_POINT_MAX))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let base = Q64_ONE.checked_add(bps).ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    meteora_q64_pow(base, bin_id)
+}
+
+pub fn meteora_base_fee_rate(lb_pair: &MeteoraLbPairState) -> Result<u128, MeteoraDlmmFailure> {
+    let power = 10_u128
+        .checked_pow(u32::from(lb_pair.base_fee_power_factor))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    u128::from(lb_pair.base_factor)
+        .checked_mul(u128::from(lb_pair.bin_step))
+        .and_then(|value| value.checked_mul(10))
+        .and_then(|value| value.checked_mul(power))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_variable_fee_rate(
+    lb_pair: &MeteoraLbPairState,
+    volatility_accumulator: u32,
+) -> Result<u128, MeteoraDlmmFailure> {
+    if lb_pair.variable_fee_control == 0 {
+        return Ok(0);
+    }
+
+    let volatility_times_bin_step = u128::from(volatility_accumulator)
+        .checked_mul(u128::from(lb_pair.bin_step))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let square = volatility_times_bin_step
+        .checked_mul(volatility_times_bin_step)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let variable_fee = u128::from(lb_pair.variable_fee_control)
+        .checked_mul(square)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    variable_fee
+        .checked_add(VARIABLE_FEE_DENOMINATOR - 1)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .checked_div(VARIABLE_FEE_DENOMINATOR)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_total_fee_rate(
+    lb_pair: &MeteoraLbPairState,
+    volatility_accumulator: u32,
+) -> Result<u128, MeteoraDlmmFailure> {
+    let total = meteora_base_fee_rate(lb_pair)?
+        .checked_add(meteora_variable_fee_rate(lb_pair, volatility_accumulator)?)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    Ok(total.min(u128::from(MAX_FEE_RATE)))
+}
+
+pub fn meteora_compute_fee(
+    lb_pair: &MeteoraLbPairState,
+    volatility_accumulator: u32,
+    amount: u64,
+) -> Result<u64, MeteoraDlmmFailure> {
+    let total_fee_rate = meteora_total_fee_rate(lb_pair, volatility_accumulator)?;
+    let denominator = u128::from(FEE_PRECISION)
+        .checked_sub(total_fee_rate)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    if denominator == 0 {
+        return Err(MeteoraDlmmFailure::ArithmeticOverflow);
+    }
+
+    let numerator = u128::from(amount)
+        .checked_mul(total_fee_rate)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .checked_add(denominator - 1)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let fee = numerator.checked_div(denominator).ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    u64::try_from(fee).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_compute_fee_from_amount(
+    lb_pair: &MeteoraLbPairState,
+    volatility_accumulator: u32,
+    amount_with_fees: u64,
+) -> Result<u64, MeteoraDlmmFailure> {
+    let total_fee_rate = meteora_total_fee_rate(lb_pair, volatility_accumulator)?;
+    let numerator = u128::from(amount_with_fees)
+        .checked_mul(total_fee_rate)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .checked_add(u128::from(FEE_PRECISION - 1))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let fee = numerator
+        .checked_div(u128::from(FEE_PRECISION))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    u64::try_from(fee).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_protocol_fee_amount(
+    lb_pair: &MeteoraLbPairState,
+    fee_amount: u64,
+) -> Result<u64, MeteoraDlmmFailure> {
+    let protocol_fee = u128::from(fee_amount)
+        .checked_mul(u128::from(lb_pair.protocol_share))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .checked_div(u128::from(BASIS_POINT_MAX))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    u64::try_from(protocol_fee).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn meteora_update_volatility_reference(
+    lb_pair: &MeteoraLbPairState,
+    current_timestamp: i64,
+) -> Result<MeteoraVolatilityState, MeteoraDlmmFailure> {
+    let elapsed = current_timestamp
+        .checked_sub(lb_pair.last_update_timestamp)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let mut volatility_reference = lb_pair.volatility_reference;
+    let mut index_reference = lb_pair.index_reference;
+
+    if elapsed >= i64::from(lb_pair.filter_period) {
+        index_reference = lb_pair.active_id;
+
+        if elapsed < i64::from(lb_pair.decay_period) {
+            let decayed_reference = u64::from(lb_pair.volatility_accumulator)
+                .checked_mul(u64::from(lb_pair.reduction_factor))
+                .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+                .checked_div(BASIS_POINT_MAX)
+                .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+            volatility_reference = u32::try_from(decayed_reference)
+                .map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+        } else {
+            volatility_reference = 0;
+        }
+    }
+
+    Ok(MeteoraVolatilityState {
+        volatility_accumulator: lb_pair.volatility_accumulator,
+        volatility_reference,
+        index_reference,
+    })
+}
+
+pub fn meteora_update_volatility_accumulator(
+    state: MeteoraVolatilityState,
+    max_volatility_accumulator: u32,
+    active_id: i32,
+) -> Result<MeteoraVolatilityState, MeteoraDlmmFailure> {
+    let delta_id = i64::from(state.index_reference)
+        .checked_sub(i64::from(active_id))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .unsigned_abs();
+    let volatility_accumulator = u64::from(state.volatility_reference)
+        .checked_add(
+            delta_id
+                .checked_mul(BASIS_POINT_MAX)
+                .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?,
+        )
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+        .min(u64::from(max_volatility_accumulator));
+    let volatility_accumulator = u32::try_from(volatility_accumulator)
+        .map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    Ok(MeteoraVolatilityState {
+        volatility_accumulator,
+        ..state
+    })
+}
+
+pub fn meteora_collect_fee_mode(value: u8) -> Result<MeteoraCollectFeeMode, MeteoraDlmmFailure> {
+    match value {
+        0 => Ok(MeteoraCollectFeeMode::InputOnly),
+        1 => Ok(MeteoraCollectFeeMode::OnlyY),
+        _ => Err(MeteoraDlmmFailure::UnsupportedCollectFeeMode),
+    }
+}
+
+pub fn meteora_fee_on_input(
+    collect_fee_mode: u8,
+    swap_for_y: bool,
+) -> Result<bool, MeteoraDlmmFailure> {
+    match meteora_collect_fee_mode(collect_fee_mode)? {
+        MeteoraCollectFeeMode::InputOnly => Ok(true),
+        MeteoraCollectFeeMode::OnlyY => Ok(!swap_for_y),
+    }
+}
+
+fn meteora_mul_shr(
+    x: u128,
+    y: u128,
+    offset: u8,
+    rounding: MeteoraRounding,
+) -> Result<u128, MeteoraDlmmFailure> {
+    let denominator = 1_u128
+        .checked_shl(u32::from(offset))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    meteora_mul_div(x, y, denominator, rounding)
+}
+
+fn meteora_shl_div(
+    x: u128,
+    y: u128,
+    offset: u8,
+    rounding: MeteoraRounding,
+) -> Result<u128, MeteoraDlmmFailure> {
+    let scale = 1_u128
+        .checked_shl(u32::from(offset))
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    meteora_mul_div(x, scale, y, rounding)
+}
+
+fn meteora_q64_pow(base: u128, exponent: i32) -> Result<u128, MeteoraDlmmFailure> {
+    let mut invert = exponent.is_negative();
+
+    if exponent == 0 {
+        return Ok(Q64_ONE);
+    }
+
+    let exponent = exponent.unsigned_abs();
+    if exponent >= Q64_MAX_EXPONENTIAL {
+        return Err(MeteoraDlmmFailure::ArithmeticOverflow);
+    }
+
+    let mut squared_base = base;
+    let mut result = Q64_ONE;
+
+    if squared_base >= result {
+        squared_base = u128::MAX
+            .checked_div(squared_base)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+        invert = !invert;
+    }
+
+    let mut bit = 1_u32;
+    while bit <= 0x40000 {
+        if exponent & bit != 0 {
+            result = result
+                .checked_mul(squared_base)
+                .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+                >> Q64_SCALE_OFFSET;
+        }
+
+        if bit < 0x40000 {
+            squared_base = squared_base
+                .checked_mul(squared_base)
+                .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+                >> Q64_SCALE_OFFSET;
+        }
+
+        bit <<= 1;
+    }
+
+    if result == 0 {
+        return Err(MeteoraDlmmFailure::ArithmeticOverflow);
+    }
+    if invert {
+        result = u128::MAX.checked_div(result).ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    }
+
+    Ok(result)
 }
 
 pub fn bin_id_to_bin_array_index(bin_id: i32) -> Result<i64, MeteoraDlmmFailure> {
@@ -1098,6 +1445,220 @@ mod tests {
             ),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn m6_q64_price_matches_frozen_vectors() -> Result<(), MeteoraDlmmFailure> {
+        assert_eq!(meteora_q64_price_from_bin_id(0, 25)?, Q64_ONE);
+        assert_eq!(
+            meteora_q64_price_from_bin_id(1, 25)?,
+            18_492_860_933_893_825_495
+        );
+        assert_eq!(
+            meteora_q64_price_from_bin_id(-1, 25)?,
+            18_400_742_218_164_141_262
+        );
+        assert_eq!(
+            meteora_q64_price_from_bin_id(10, 25)?,
+            18_913_135_561_744_016_868
+        );
+        assert_eq!(
+            meteora_q64_price_from_bin_id(-10, 25)?,
+            17_991_853_641_087_124_277
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_q64_price_rejects_unsupported_exponent() {
+        assert_eq!(
+            meteora_q64_price_from_bin_id(0x80000, 1),
+            Err(MeteoraDlmmFailure::ArithmeticOverflow)
+        );
+        assert_eq!(
+            meteora_q64_price_from_bin_id(-0x80000, 1),
+            Err(MeteoraDlmmFailure::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn m6_wide_mul_div_preserves_rounding() -> Result<(), MeteoraDlmmFailure> {
+        let down = meteora_mul_div(u128::MAX, 2, 7, MeteoraRounding::Down)?;
+        let up = meteora_mul_div(u128::MAX, 2, 7, MeteoraRounding::Up)?;
+
+        assert_eq!(down, 97_223_533_405_982_418_132_392_744_980_505_203_272);
+        assert_eq!(up, 97_223_533_405_982_418_132_392_744_980_505_203_273);
+        assert_eq!(
+            meteora_mul_div(1, 1, 0, MeteoraRounding::Down),
+            Err(MeteoraDlmmFailure::ArithmeticOverflow)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_directional_amount_math_uses_protocol_rounding() -> Result<(), MeteoraDlmmFailure> {
+        let price = meteora_q64_price_from_bin_id(1, 25)?;
+
+        let out_y = meteora_amount_out(1_000, price, true, MeteoraRounding::Down)?;
+        let required_x = meteora_amount_in(out_y, price, true, MeteoraRounding::Up)?;
+        let out_x = meteora_amount_out(1_000, price, false, MeteoraRounding::Down)?;
+        let required_y = meteora_amount_in(out_x, price, false, MeteoraRounding::Up)?;
+
+        assert_eq!(out_y, 1_002);
+        assert_eq!(required_x, 1_000);
+        assert_eq!(out_x, 997);
+        assert_eq!(required_y, 1000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_fee_rates_match_frozen_vector() -> Result<(), MeteoraDlmmFailure> {
+        let mut lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        lb_pair.base_factor = 5_000;
+        lb_pair.bin_step = 25;
+        lb_pair.base_fee_power_factor = 0;
+        lb_pair.variable_fee_control = 1_000;
+
+        assert_eq!(meteora_base_fee_rate(&lb_pair)?, 1_250_000);
+        assert_eq!(meteora_variable_fee_rate(&lb_pair, 300_000)?, 562_500);
+        assert_eq!(meteora_total_fee_rate(&lb_pair, 300_000)?, 1_812_500);
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_total_fee_rate_is_capped() -> Result<(), MeteoraDlmmFailure> {
+        let mut lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        lb_pair.base_factor = u16::MAX;
+        lb_pair.bin_step = u16::MAX;
+        lb_pair.base_fee_power_factor = 4;
+        lb_pair.variable_fee_control = 0;
+
+        assert_eq!(
+            meteora_total_fee_rate(&lb_pair, 0)?,
+            u128::from(MAX_FEE_RATE)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_fee_amounts_preserve_ceiling_and_protocol_floor() -> Result<(), MeteoraDlmmFailure> {
+        let mut lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        lb_pair.base_factor = 5_000;
+        lb_pair.bin_step = 25;
+        lb_pair.base_fee_power_factor = 0;
+        lb_pair.variable_fee_control = 1_000;
+        lb_pair.protocol_share = 2_500;
+
+        assert_eq!(meteora_compute_fee(&lb_pair, 300_000, 1_000_000)?, 1_816);
+        assert_eq!(
+            meteora_compute_fee_from_amount(&lb_pair, 300_000, 1_000_000)?,
+            1_813
+        );
+        assert_eq!(meteora_protocol_fee_amount(&lb_pair, 12_345)?, 3_086);
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_dynamic_fee_boundaries_use_reduction_ratio() -> Result<(), MeteoraDlmmFailure> {
+        let mut lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        lb_pair.filter_period = 10;
+        lb_pair.decay_period = 20;
+        lb_pair.reduction_factor = 5_000;
+        lb_pair.volatility_accumulator = 300_000;
+        lb_pair.volatility_reference = 300_000;
+        lb_pair.index_reference = 7;
+        lb_pair.active_id = 7;
+        lb_pair.last_update_timestamp = 1_000;
+        lb_pair.max_volatility_accumulator = 1_000_000;
+
+        let before = meteora_update_volatility_reference(&lb_pair, 1_009)?;
+        let at_filter = meteora_update_volatility_reference(&lb_pair, 1_010)?;
+        let inside_decay = meteora_update_volatility_reference(&lb_pair, 1_019)?;
+        let at_decay = meteora_update_volatility_reference(&lb_pair, 1_020)?;
+        let after_decay = meteora_update_volatility_reference(&lb_pair, 1_021)?;
+
+        assert_eq!(before.volatility_reference, 300_000);
+        assert_eq!(at_filter.volatility_reference, 150_000);
+        assert_eq!(inside_decay.volatility_reference, 150_000);
+        assert_eq!(at_decay.volatility_reference, 0);
+        assert_eq!(after_decay.volatility_reference, 0);
+        assert_ne!(at_filter.volatility_reference, 295_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_volatility_accumulator_tracks_delta_and_cap() -> Result<(), MeteoraDlmmFailure> {
+        let mut lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        lb_pair.filter_period = 100;
+        lb_pair.decay_period = 200;
+        lb_pair.volatility_reference = 50_000;
+        lb_pair.index_reference = 10;
+        lb_pair.last_update_timestamp = 1_000;
+        lb_pair.max_volatility_accumulator = 75_000;
+
+        let reference_state = meteora_update_volatility_reference(&lb_pair, 1_050)?;
+        let state = meteora_update_volatility_accumulator(
+            reference_state,
+            lb_pair.max_volatility_accumulator,
+            0,
+        )?;
+
+        assert_eq!(state.volatility_reference, 50_000);
+        assert_eq!(state.index_reference, 10);
+        assert_eq!(state.volatility_accumulator, 75_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_volatility_accumulator_reuses_one_reference_state() -> Result<(), MeteoraDlmmFailure> {
+        let mut lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+        lb_pair.filter_period = 10;
+        lb_pair.decay_period = 20;
+        lb_pair.reduction_factor = 5_000;
+        lb_pair.volatility_accumulator = 300_000;
+        lb_pair.volatility_reference = 300_000;
+        lb_pair.index_reference = 5;
+        lb_pair.active_id = 7;
+        lb_pair.last_update_timestamp = 1_000;
+        lb_pair.max_volatility_accumulator = 1_000_000;
+
+        let reference_state = meteora_update_volatility_reference(&lb_pair, 1_010)?;
+        let at_nine = meteora_update_volatility_accumulator(reference_state, 1_000_000, 9)?;
+        let at_ten = meteora_update_volatility_accumulator(reference_state, 1_000_000, 10)?;
+
+        assert_eq!(reference_state.index_reference, 7);
+        assert_eq!(reference_state.volatility_reference, 150_000);
+        assert_eq!(at_nine.volatility_accumulator, 170_000);
+        assert_eq!(at_ten.volatility_accumulator, 180_000);
+
+        Ok(())
+    }
+
+    #[test]
+    fn m6_collect_fee_mode_is_directional_and_fail_closed() -> Result<(), MeteoraDlmmFailure> {
+        assert_eq!(
+            meteora_collect_fee_mode(0)?,
+            MeteoraCollectFeeMode::InputOnly
+        );
+        assert_eq!(meteora_collect_fee_mode(1)?, MeteoraCollectFeeMode::OnlyY);
+        assert!(meteora_fee_on_input(0, true)?);
+        assert!(meteora_fee_on_input(0, false)?);
+        assert!(!meteora_fee_on_input(1, true)?);
+        assert!(meteora_fee_on_input(1, false)?);
+        assert_eq!(
+            meteora_collect_fee_mode(2),
+            Err(MeteoraDlmmFailure::UnsupportedCollectFeeMode)
+        );
+
+        Ok(())
     }
 
     #[test]
