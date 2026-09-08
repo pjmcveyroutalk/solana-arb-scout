@@ -1,4 +1,9 @@
+use solana_pubkey::{pubkey, Pubkey};
+
 pub const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+
+const METEORA_DLMM_PROGRAM_PUBKEY: Pubkey = pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+const BIN_ARRAY_SEED: &[u8] = b"bin_array";
 
 pub const LB_PAIR_ACCOUNT_LEN: usize = 904;
 pub const LB_PAIR_DISCRIMINATOR: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13];
@@ -67,6 +72,13 @@ const BITMAP_EXTENSION_CHUNKS: usize = 12;
 const BITMAP_EXTENSION_WORDS: usize = 8;
 
 pub type MeteoraBitmapRegion = [[u64; 8]; 12];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeteoraBinArrayBitmapRegion {
+    Internal,
+    NegativeExtension,
+    PositiveExtension,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DlmmProtocolProfile {
@@ -171,6 +183,80 @@ pub struct MeteoraBitmapExtensionState {
     pub lb_pair: [u8; 32],
     pub positive_bin_array_bitmap: MeteoraBitmapRegion,
     pub negative_bin_array_bitmap: MeteoraBitmapRegion,
+}
+
+pub fn bin_id_to_bin_array_index(bin_id: i32) -> Result<i64, MeteoraDlmmFailure> {
+    let quotient = bin_id / MAX_BIN_PER_ARRAY;
+    let remainder = bin_id % MAX_BIN_PER_ARRAY;
+    let index = if bin_id < 0 && remainder != 0 {
+        quotient
+            .checked_sub(1)
+            .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?
+    } else {
+        quotient
+    };
+    let index = i64::from(index);
+
+    validate_bin_array_index(index)?;
+    Ok(index)
+}
+
+pub fn bin_array_index_to_bin_range(index: i64) -> Result<(i32, i32), MeteoraDlmmFailure> {
+    validate_bin_array_index(index)?;
+
+    let bin_array_width = i64::from(MAX_BIN_PER_ARRAY);
+    let lower = index
+        .checked_mul(bin_array_width)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+    let upper = lower
+        .checked_add(bin_array_width - 1)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    Ok((
+        i32::try_from(lower).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?,
+        i32::try_from(upper).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)?,
+    ))
+}
+
+pub fn bin_id_to_bin_array_offset(bin_id: i32) -> Result<usize, MeteoraDlmmFailure> {
+    let index = bin_id_to_bin_array_index(bin_id)?;
+    let (lower, _) = bin_array_index_to_bin_range(index)?;
+    let offset = bin_id
+        .checked_sub(lower)
+        .ok_or(MeteoraDlmmFailure::ArithmeticOverflow)?;
+
+    usize::try_from(offset).map_err(|_| MeteoraDlmmFailure::ArithmeticOverflow)
+}
+
+pub fn bin_array_bitmap_region(
+    index: i64,
+) -> Result<MeteoraBinArrayBitmapRegion, MeteoraDlmmFailure> {
+    validate_bin_array_index(index)?;
+
+    if index <= NEGATIVE_BITMAP_EXTENSION_MAX_INDEX {
+        Ok(MeteoraBinArrayBitmapRegion::NegativeExtension)
+    } else if index <= INTERNAL_BITMAP_MAX_INDEX {
+        Ok(MeteoraBinArrayBitmapRegion::Internal)
+    } else {
+        Ok(MeteoraBinArrayBitmapRegion::PositiveExtension)
+    }
+}
+
+pub fn derive_bin_array_pda(
+    lb_pair: [u8; 32],
+    index: i64,
+) -> Result<([u8; 32], u8), MeteoraDlmmFailure> {
+    validate_bin_array_index(index)?;
+
+    let lb_pair = Pubkey::new_from_array(lb_pair);
+    let index_bytes = index.to_le_bytes();
+
+    Pubkey::try_find_program_address(
+        &[BIN_ARRAY_SEED, lb_pair.as_ref(), &index_bytes],
+        &METEORA_DLMM_PROGRAM_PUBKEY,
+    )
+    .map(|(pubkey, bump)| (pubkey.to_bytes(), bump))
+    .ok_or(MeteoraDlmmFailure::InvalidLayout)
 }
 
 pub fn decode_lb_pair(owner: &str, data: &[u8]) -> Result<MeteoraLbPairState, MeteoraDlmmFailure> {
@@ -329,6 +415,14 @@ fn decode_bitmap_words(
     Ok(())
 }
 
+fn validate_bin_array_index(index: i64) -> Result<(), MeteoraDlmmFailure> {
+    if !(BIN_ARRAY_MIN_INDEX..=BIN_ARRAY_MAX_INDEX).contains(&index) {
+        return Err(MeteoraDlmmFailure::ProtocolSearchRangeExceeded);
+    }
+
+    Ok(())
+}
+
 fn validate_account_header(
     owner: &str,
     data: &[u8],
@@ -472,6 +566,111 @@ mod tests {
     fn fee_constants_match_v0_12_contract() {
         assert_eq!(FEE_PRECISION, 1_000_000_000);
         assert_eq!(MAX_FEE_RATE, 100_000_000);
+    }
+
+    #[test]
+    fn m3_bin_mapping_uses_floor_division_for_negative_ids() {
+        assert_eq!(bin_id_to_bin_array_index(-1), Ok(-1));
+        assert_eq!(bin_id_to_bin_array_index(-70), Ok(-1));
+        assert_eq!(bin_id_to_bin_array_index(-71), Ok(-2));
+        assert_eq!(bin_id_to_bin_array_index(0), Ok(0));
+        assert_eq!(bin_id_to_bin_array_index(69), Ok(0));
+        assert_eq!(bin_id_to_bin_array_index(70), Ok(1));
+    }
+
+    #[test]
+    fn m3_bin_ranges_and_offsets_are_canonical() {
+        assert_eq!(bin_array_index_to_bin_range(-2), Ok((-140, -71)));
+        assert_eq!(bin_array_index_to_bin_range(-1), Ok((-70, -1)));
+        assert_eq!(bin_array_index_to_bin_range(0), Ok((0, 69)));
+        assert_eq!(bin_array_index_to_bin_range(1), Ok((70, 139)));
+
+        assert_eq!(bin_id_to_bin_array_offset(-71), Ok(69));
+        assert_eq!(bin_id_to_bin_array_offset(-70), Ok(0));
+        assert_eq!(bin_id_to_bin_array_offset(-1), Ok(69));
+        assert_eq!(bin_id_to_bin_array_offset(0), Ok(0));
+        assert_eq!(bin_id_to_bin_array_offset(69), Ok(69));
+    }
+
+    #[test]
+    fn m3_bitmap_regions_are_bounded_without_traversal() {
+        assert_eq!(
+            bin_array_bitmap_region(BIN_ARRAY_MIN_INDEX),
+            Ok(MeteoraBinArrayBitmapRegion::NegativeExtension)
+        );
+        assert_eq!(
+            bin_array_bitmap_region(NEGATIVE_BITMAP_EXTENSION_MAX_INDEX),
+            Ok(MeteoraBinArrayBitmapRegion::NegativeExtension)
+        );
+        assert_eq!(
+            bin_array_bitmap_region(INTERNAL_BITMAP_MIN_INDEX),
+            Ok(MeteoraBinArrayBitmapRegion::Internal)
+        );
+        assert_eq!(
+            bin_array_bitmap_region(INTERNAL_BITMAP_MAX_INDEX),
+            Ok(MeteoraBinArrayBitmapRegion::Internal)
+        );
+        assert_eq!(
+            bin_array_bitmap_region(POSITIVE_BITMAP_EXTENSION_MIN_INDEX),
+            Ok(MeteoraBinArrayBitmapRegion::PositiveExtension)
+        );
+        assert_eq!(
+            bin_array_bitmap_region(BIN_ARRAY_MAX_INDEX),
+            Ok(MeteoraBinArrayBitmapRegion::PositiveExtension)
+        );
+        assert_eq!(
+            bin_array_bitmap_region(BIN_ARRAY_MIN_INDEX - 1),
+            Err(MeteoraDlmmFailure::ProtocolSearchRangeExceeded)
+        );
+        assert_eq!(
+            bin_array_bitmap_region(BIN_ARRAY_MAX_INDEX + 1),
+            Err(MeteoraDlmmFailure::ProtocolSearchRangeExceeded)
+        );
+    }
+
+    #[test]
+    fn m3_bin_mapping_rejects_ids_outside_protocol_search_range() {
+        assert_eq!(
+            bin_id_to_bin_array_index(-465_921),
+            Err(MeteoraDlmmFailure::ProtocolSearchRangeExceeded)
+        );
+        assert_eq!(
+            bin_id_to_bin_array_index(465_920),
+            Err(MeteoraDlmmFailure::ProtocolSearchRangeExceeded)
+        );
+    }
+
+    #[test]
+    fn m3_bin_array_pda_vectors_match_pinned_meteora_contract() {
+        let lb_pair = [7_u8; 32];
+        let lb_pair_pubkey = Pubkey::new_from_array(lb_pair);
+        let vectors = [
+            (-6_656_i64, 254_u8),
+            (-1_025_i64, 254_u8),
+            (-1_024_i64, 255_u8),
+            (-514_i64, 255_u8),
+            (-1_i64, 250_u8),
+            (0_i64, 251_u8),
+            (513_i64, 255_u8),
+            (1_023_i64, 253_u8),
+            (1_024_i64, 254_u8),
+            (6_655_i64, 255_u8),
+        ];
+
+        for (index, expected_bump) in vectors {
+            let index_bytes = index.to_le_bytes();
+            let expected = Pubkey::try_find_program_address(
+                &[b"bin_array", lb_pair_pubkey.as_ref(), &index_bytes],
+                &pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"),
+            )
+            .map(|(pubkey, bump)| (pubkey.to_bytes(), bump));
+
+            assert_eq!(derive_bin_array_pda(lb_pair, index).ok(), expected);
+            assert_eq!(
+                derive_bin_array_pda(lb_pair, index).map(|(_, bump)| bump),
+                Ok(expected_bump)
+            );
+        }
     }
 
     #[test]
