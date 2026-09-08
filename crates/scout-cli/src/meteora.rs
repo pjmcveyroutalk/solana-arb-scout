@@ -342,8 +342,7 @@ fn validate_account_header(
         return Err(MeteoraDlmmFailure::InvalidAccountLength);
     }
 
-    let discriminator =
-        read_array::<8>(data, 0, MeteoraDlmmFailure::InvalidAccountDiscriminator)?;
+    let discriminator = read_array::<8>(data, 0, MeteoraDlmmFailure::InvalidAccountDiscriminator)?;
     if discriminator != expected_discriminator {
         return Err(MeteoraDlmmFailure::InvalidAccountDiscriminator);
     }
@@ -404,7 +403,9 @@ fn read_u128(
     offset: usize,
     failure: MeteoraDlmmFailure,
 ) -> Result<u128, MeteoraDlmmFailure> {
-    Ok(u128::from_le_bytes(read_array::<16>(data, offset, failure)?))
+    Ok(u128::from_le_bytes(read_array::<16>(
+        data, offset, failure,
+    )?))
 }
 
 fn read_array<const N: usize>(
@@ -527,8 +528,7 @@ mod tests {
             Ok(-1)
         );
         assert_eq!(
-            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
-                .map(|state| state.bins.len()),
+            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile).map(|state| state.bins.len()),
             Ok(70)
         );
         assert_eq!(
@@ -554,11 +554,7 @@ mod tests {
         data[BIN_ARRAY_VERSION_OFFSET] = 2;
 
         assert_eq!(
-            decode_bin_array(
-                METEORA_DLMM_PROGRAM_ID,
-                &data,
-                DlmmProtocolProfile::V0_12
-            ),
+            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, DlmmProtocolProfile::V0_12),
             Err(MeteoraDlmmFailure::UnsupportedBinArrayVersion)
         );
     }
@@ -599,9 +595,21 @@ mod tests {
 
         write_bytes(&mut data, 0, LB_PAIR_DISCRIMINATOR);
         write_bytes(&mut data, LB_PAIR_BASE_FACTOR_OFFSET, 25_u16.to_le_bytes());
-        write_bytes(&mut data, LB_PAIR_FILTER_PERIOD_OFFSET, 30_u16.to_le_bytes());
-        write_bytes(&mut data, LB_PAIR_DECAY_PERIOD_OFFSET, 600_u16.to_le_bytes());
-        write_bytes(&mut data, LB_PAIR_REDUCTION_FACTOR_OFFSET, 5_000_u16.to_le_bytes());
+        write_bytes(
+            &mut data,
+            LB_PAIR_FILTER_PERIOD_OFFSET,
+            30_u16.to_le_bytes(),
+        );
+        write_bytes(
+            &mut data,
+            LB_PAIR_DECAY_PERIOD_OFFSET,
+            600_u16.to_le_bytes(),
+        );
+        write_bytes(
+            &mut data,
+            LB_PAIR_REDUCTION_FACTOR_OFFSET,
+            5_000_u16.to_le_bytes(),
+        );
         write_bytes(
             &mut data,
             LB_PAIR_VARIABLE_FEE_CONTROL_OFFSET,
@@ -665,11 +673,31 @@ mod tests {
         write_bytes(first_bin, BIN_AMOUNT_X_OFFSET, 11_u64.to_le_bytes());
         write_bytes(first_bin, BIN_AMOUNT_Y_OFFSET, 22_u64.to_le_bytes());
         write_bytes(first_bin, BIN_PRICE_OFFSET, 33_u128.to_le_bytes());
-        write_bytes(first_bin, BIN_LIQUIDITY_SUPPLY_OFFSET, 44_u128.to_le_bytes());
-        write_bytes(first_bin, BIN_FULFILLED_ORDER_AMOUNT_X_OFFSET, 55_u64.to_le_bytes());
-        write_bytes(first_bin, BIN_FULFILLED_ORDER_AMOUNT_Y_OFFSET, 66_u64.to_le_bytes());
-        write_bytes(first_bin, BIN_LIMIT_ORDER_FEE_ASK_SIDE_OFFSET, 77_u64.to_le_bytes());
-        write_bytes(first_bin, BIN_LIMIT_ORDER_FEE_BID_SIDE_OFFSET, 88_u64.to_le_bytes());
+        write_bytes(
+            first_bin,
+            BIN_LIQUIDITY_SUPPLY_OFFSET,
+            44_u128.to_le_bytes(),
+        );
+        write_bytes(
+            first_bin,
+            BIN_FULFILLED_ORDER_AMOUNT_X_OFFSET,
+            55_u64.to_le_bytes(),
+        );
+        write_bytes(
+            first_bin,
+            BIN_FULFILLED_ORDER_AMOUNT_Y_OFFSET,
+            66_u64.to_le_bytes(),
+        );
+        write_bytes(
+            first_bin,
+            BIN_LIMIT_ORDER_FEE_ASK_SIDE_OFFSET,
+            77_u64.to_le_bytes(),
+        );
+        write_bytes(
+            first_bin,
+            BIN_LIMIT_ORDER_FEE_BID_SIDE_OFFSET,
+            88_u64.to_le_bytes(),
+        );
         write_bytes(
             first_bin,
             BIN_FEE_AMOUNT_X_PER_TOKEN_STORED_OFFSET,
@@ -680,7 +708,11 @@ mod tests {
             BIN_FEE_AMOUNT_Y_PER_TOKEN_STORED_OFFSET,
             111_u128.to_le_bytes(),
         );
-        write_bytes(first_bin, BIN_OPEN_ORDER_AMOUNT_OFFSET, 122_u64.to_le_bytes());
+        write_bytes(
+            first_bin,
+            BIN_OPEN_ORDER_AMOUNT_OFFSET,
+            122_u64.to_le_bytes(),
+        );
         write_bytes(
             first_bin,
             BIN_TOTAL_PROCESSING_ORDER_AMOUNT_OFFSET,
