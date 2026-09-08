@@ -20,6 +20,8 @@ mod raydium;
 mod registry;
 #[path = "../route.rs"]
 mod route;
+#[path = "../rpc_transport.rs"]
+mod rpc_transport;
 
 use discovery::{parse_raydium_pair_lookup_response, raydium_pair_lookup_requests};
 use futures_util::{SinkExt, StreamExt};
