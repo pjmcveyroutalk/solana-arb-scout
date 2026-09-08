@@ -14,11 +14,11 @@ mod quote;
 mod raydium;
 mod recorder;
 mod registry;
-mod rpc_transport;
 mod route;
-mod ws_transport;
+mod rpc_transport;
 mod runtime_quote;
 mod sizing;
+mod ws_transport;
 
 use discovery::{parse_raydium_pair_lookup_response, raydium_pair_lookup_requests};
 use futures_util::{SinkExt, StreamExt};
@@ -2087,18 +2087,18 @@ async fn fetch_localized_priority_observation(
         footprint.accounts().len()
     );
 
-    let payload =
-        match rpc_transport::post_json(rpc_client, SOLANA_RPC_URL, &request, label).await {
-            Ok(payload) => payload,
-            Err(error) => {
-                let reason = format!(
-                    "localized priority RPC request failed after {} ms: {error}",
-                    started_at.elapsed().as_millis()
-                );
-                println!("rung11c_priority_observation_unavailable: {reason}");
-                return costs::PriorityObservationState::Unavailable(reason);
-            }
-        };
+    let payload = match rpc_transport::post_json(rpc_client, SOLANA_RPC_URL, &request, label).await
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            let reason = format!(
+                "localized priority RPC request failed after {} ms: {error}",
+                started_at.elapsed().as_millis()
+            );
+            println!("rung11c_priority_observation_unavailable: {reason}");
+            return costs::PriorityObservationState::Unavailable(reason);
+        }
+    };
 
     match costs::parse_localized_priority_fee_response(&payload, footprint) {
         Ok(observation) => {
@@ -2194,7 +2194,6 @@ fn unix_time_seconds_now() -> Result<i64, String> {
     i64::try_from(duration.as_secs()).map_err(|_| "Unix timestamp seconds exceeded i64".to_owned())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2227,4 +2226,3 @@ mod tests {
         );
     }
 }
-
