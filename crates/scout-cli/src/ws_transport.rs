@@ -380,7 +380,7 @@ mod tests {
         lifecycle.mark_requested();
         assert!(lifecycle.mark_ready(1).is_err());
 
-        lifecycle.mark_confirmed(1, 8).expect("confirmation");
+        assert!(lifecycle.mark_confirmed(1, 8).is_ok());
         assert!(lifecycle.mark_ready(1).is_err());
     }
 }
