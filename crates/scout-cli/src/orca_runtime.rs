@@ -1,9 +1,8 @@
-use crate::{orca, orca_live};
+use crate::{orca, orca_live, ws_transport};
 use futures_util::StreamExt;
 use reqwest::Client;
-use serde_json::Value;
 use std::collections::BTreeMap;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
 const MAX_ORCA_OBSERVATIONS: usize = 10;
@@ -24,7 +23,9 @@ where
     let mut anchor_candidates = 0usize;
 
     while observed < MAX_ORCA_OBSERVATIONS && prepared_by_pool.is_empty() {
-        let Some(payload) = next_json_message(reader).await? else {
+        let Some(payload) =
+            ws_transport::next_json_message_optional(reader, ORCA_OBSERVATION_TIMEOUT).await?
+        else {
             break;
         };
 
@@ -111,43 +112,4 @@ where
     }
 
     Ok(prepared_by_pool)
-}
-
-async fn next_json_message<S>(reader: &mut S) -> Result<Option<Value>, String>
-where
-    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-{
-    loop {
-        let next = match timeout(ORCA_OBSERVATION_TIMEOUT, reader.next()).await {
-            Ok(next) => next,
-            Err(_) => return Ok(None),
-        };
-
-        let message = match next {
-            Some(Ok(message)) => message,
-            Some(Err(error)) => {
-                return Err(format!("Orca WebSocket read failed: {error}"));
-            }
-            None => {
-                return Err("Orca WebSocket stream ended".to_owned());
-            }
-        };
-
-        match message {
-            Message::Text(text) => {
-                let payload = serde_json::from_str::<Value>(text.as_ref())
-                    .map_err(|error| format!("Orca WebSocket returned invalid JSON: {error}"))?;
-                return Ok(Some(payload));
-            }
-            Message::Binary(bytes) => {
-                let payload = serde_json::from_slice::<Value>(bytes.as_ref())
-                    .map_err(|error| format!("Orca WebSocket returned invalid JSON: {error}"))?;
-                return Ok(Some(payload));
-            }
-            Message::Close(_) => {
-                return Err("Orca WebSocket stream closed".to_owned());
-            }
-            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
-        }
-    }
 }

@@ -1,3 +1,4 @@
+use crate::rpc_transport;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -611,27 +612,14 @@ async fn rpc_request(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    let response = client
-        .post(rpc_url)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 13,
-            "method": method,
-            "params": params,
-        }))
-        .send()
-        .await
-        .map_err(|error| format!("{method} transport failed: {error}"))?;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 13,
+        "method": method,
+        "params": params,
+    });
 
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("{method} HTTP status {status}"));
-    }
-
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("{method} returned invalid JSON: {error}"))?;
+    let payload = rpc_transport::post_json(client, rpc_url, &request, method).await?;
 
     if let Some(error) = payload.get("error") {
         return Err(format!("{method} RPC error: {error}"));

@@ -7,6 +7,7 @@ use crate::quote::{
     orca_quote_readiness_for_pool, OrcaQuoteReadinessEvidence, OrcaQuoteSnapshot, QuoteReadiness,
 };
 use crate::route::{USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
+use crate::rpc_transport;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::Client;
 use scout_core::NormalizedPoolState;
@@ -351,32 +352,7 @@ where
         ]
     });
 
-    post_rpc(rpc_client, rpc_url, &request, label).await
-}
-
-async fn post_rpc(
-    rpc_client: &Client,
-    rpc_url: &str,
-    request: &Value,
-    label: &str,
-) -> Result<Value, String> {
-    let response = rpc_client
-        .post(rpc_url)
-        .json(request)
-        .send()
-        .await
-        .map_err(|error| format!("{label} RPC request failed: {error}"))?;
-
-    let status = response.status();
-
-    if !status.is_success() {
-        return Err(format!("{label} RPC returned HTTP status {status}"));
-    }
-
-    response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("{label} returned invalid JSON: {error}"))
+    rpc_transport::post_json(rpc_client, rpc_url, &request, label).await
 }
 
 fn response_slot(payload: &Value, label: &str) -> Result<u64, String> {

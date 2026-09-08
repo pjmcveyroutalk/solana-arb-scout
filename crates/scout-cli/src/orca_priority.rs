@@ -5,6 +5,7 @@ use crate::costs::{
 use crate::orca_live::PreparedOrca;
 use crate::raydium::RaydiumHydrationSnapshot;
 use crate::route::RouteLeg;
+use crate::rpc_transport;
 use reqwest::Client;
 use scout_core::Venue;
 use serde_json::{json, Value};
@@ -192,32 +193,14 @@ async fn fetch_observation(
         accounts.len()
     );
 
-    let response = rpc_client
-        .post(rpc_url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|error| {
-            format!(
-                "Orca route localized priority RPC request failed after {} ms: {error}",
-                started_at.elapsed().as_millis()
-            )
-        })?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!(
-            "Orca route localized priority RPC returned HTTP status {status} after {} ms",
-            started_at.elapsed().as_millis()
-        ));
-    }
-
-    let payload = response.json::<Value>().await.map_err(|error| {
-        format!(
-            "Orca route localized priority RPC returned invalid JSON after {} ms: {error}",
-            started_at.elapsed().as_millis()
-        )
-    })?;
+    let payload = rpc_transport::post_json(
+        rpc_client,
+        rpc_url,
+        &request,
+        "Orca route localized priority",
+    )
+    .await
+    .map_err(|error| format!("{error} after {} ms", started_at.elapsed().as_millis()))?;
 
     parse_response(&payload, accounts, provenance)
 }
