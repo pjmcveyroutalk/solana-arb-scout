@@ -1,5 +1,4 @@
-pub const METEORA_DLMM_PROGRAM_ID: &str =
-    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
+pub const METEORA_DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 pub const LB_PAIR_ACCOUNT_LEN: usize = 904;
 pub const LB_PAIR_DISCRIMINATOR: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13];
@@ -117,16 +116,10 @@ mod tests {
     #[test]
     fn account_contract_constants_match_m1_profile() {
         assert_eq!(LB_PAIR_ACCOUNT_LEN, 904);
-        assert_eq!(
-            LB_PAIR_DISCRIMINATOR,
-            [33, 11, 49, 98, 181, 101, 177, 13]
-        );
+        assert_eq!(LB_PAIR_DISCRIMINATOR, [33, 11, 49, 98, 181, 101, 177, 13]);
 
         assert_eq!(BIN_ARRAY_ACCOUNT_LEN, 10_136);
-        assert_eq!(
-            BIN_ARRAY_DISCRIMINATOR,
-            [92, 142, 92, 220, 5, 148, 70, 181]
-        );
+        assert_eq!(BIN_ARRAY_DISCRIMINATOR, [92, 142, 92, 220, 5, 148, 70, 181]);
 
         assert_eq!(BITMAP_EXTENSION_ACCOUNT_LEN, 1_576);
         assert_eq!(
