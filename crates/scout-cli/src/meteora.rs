@@ -829,7 +829,10 @@ mod tests {
         set_extension_bitmap_bit(&mut extension.negative_bin_array_bitmap, -6_656, false);
 
         for index in [512_i64, 1_023, 1_024, 6_655, -513, -1_024, -1_025, -6_656] {
-            assert_eq!(bin_array_bitmap_bit(&internal, Some(&extension), index), Ok(true));
+            assert_eq!(
+                bin_array_bitmap_bit(&internal, Some(&extension), index),
+                Ok(true)
+            );
         }
     }
 
@@ -958,8 +961,7 @@ mod tests {
             Ok([9_u8; 32])
         );
         assert_eq!(
-            decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &data)
-                .map(|state| state.bin_array_bitmap[0]),
+            decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &data).map(|state| state.bin_array_bitmap[0]),
             Ok(0x0123_4567_89ab_cdef)
         );
     }
