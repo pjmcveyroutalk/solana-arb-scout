@@ -564,4 +564,164 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_extension_decoder_reads_both_bitmap_re
+    fn bitmap_extension_decoder_reads_both_bitmap_regions() {
+        let data = valid_bitmap_extension_bytes();
+
+        assert_eq!(
+            decode_bitmap_extension(METEORA_DLMM_PROGRAM_ID, &data).map(|state| state.lb_pair),
+            Ok([5_u8; 32])
+        );
+        assert_eq!(
+            decode_bitmap_extension(METEORA_DLMM_PROGRAM_ID, &data)
+                .map(|state| state.positive_bin_array_bitmap[0][0]),
+            Ok(0x1122_3344_5566_7788)
+        );
+        assert_eq!(
+            decode_bitmap_extension(METEORA_DLMM_PROGRAM_ID, &data)
+                .map(|state| state.negative_bin_array_bitmap[11][7]),
+            Ok(0x8877_6655_4433_2211)
+        );
+    }
+
+    #[test]
+    fn bitmap_extension_decoder_rejects_malformed_account() {
+        let mut data = valid_bitmap_extension_bytes();
+        data[0] ^= 0xff;
+
+        assert_eq!(
+            decode_bitmap_extension(METEORA_DLMM_PROGRAM_ID, &data),
+            Err(MeteoraDlmmFailure::InvalidAccountDiscriminator)
+        );
+    }
+
+    fn valid_lb_pair_bytes() -> Vec<u8> {
+        let mut data = vec![0_u8; LB_PAIR_ACCOUNT_LEN];
+
+        write_bytes(&mut data, 0, LB_PAIR_DISCRIMINATOR);
+        write_bytes(&mut data, LB_PAIR_BASE_FACTOR_OFFSET, 25_u16.to_le_bytes());
+        write_bytes(&mut data, LB_PAIR_FILTER_PERIOD_OFFSET, 30_u16.to_le_bytes());
+        write_bytes(&mut data, LB_PAIR_DECAY_PERIOD_OFFSET, 600_u16.to_le_bytes());
+        write_bytes(&mut data, LB_PAIR_REDUCTION_FACTOR_OFFSET, 5_000_u16.to_le_bytes());
+        write_bytes(
+            &mut data,
+            LB_PAIR_VARIABLE_FEE_CONTROL_OFFSET,
+            400_000_u32.to_le_bytes(),
+        );
+        write_bytes(
+            &mut data,
+            LB_PAIR_MAX_VOLATILITY_ACCUMULATOR_OFFSET,
+            350_000_u32.to_le_bytes(),
+        );
+        write_bytes(
+            &mut data,
+            LB_PAIR_PROTOCOL_SHARE_OFFSET,
+            2_500_u16.to_le_bytes(),
+        );
+        data[LB_PAIR_BASE_FEE_POWER_FACTOR_OFFSET] = 1;
+        data[LB_PAIR_COLLECT_FEE_MODE_OFFSET] = 0;
+        write_bytes(
+            &mut data,
+            LB_PAIR_VOLATILITY_ACCUMULATOR_OFFSET,
+            123_u32.to_le_bytes(),
+        );
+        write_bytes(
+            &mut data,
+            LB_PAIR_VOLATILITY_REFERENCE_OFFSET,
+            456_u32.to_le_bytes(),
+        );
+        write_bytes(
+            &mut data,
+            LB_PAIR_INDEX_REFERENCE_OFFSET,
+            (-12_i32).to_le_bytes(),
+        );
+        write_bytes(
+            &mut data,
+            LB_PAIR_LAST_UPDATE_TIMESTAMP_OFFSET,
+            1_700_000_000_i64.to_le_bytes(),
+        );
+        write_bytes(
+            &mut data,
+            LB_PAIR_ACTIVE_ID_OFFSET,
+            (-321_i32).to_le_bytes(),
+        );
+        write_bytes(&mut data, LB_PAIR_BIN_STEP_OFFSET, 10_u16.to_le_bytes());
+        write_bytes(&mut data, LB_PAIR_MINT_X_OFFSET, [7_u8; 32]);
+        write_bytes(&mut data, LB_PAIR_MINT_Y_OFFSET, [9_u8; 32]);
+
+        data
+    }
+
+    fn valid_bin_array_bytes() -> Vec<u8> {
+        let mut data = vec![0_u8; BIN_ARRAY_ACCOUNT_LEN];
+
+        write_bytes(&mut data, 0, BIN_ARRAY_DISCRIMINATOR);
+        write_bytes(&mut data, BIN_ARRAY_INDEX_OFFSET, (-1_i64).to_le_bytes());
+        data[BIN_ARRAY_VERSION_OFFSET] = BIN_ARRAY_VERSION_V3;
+        write_bytes(&mut data, BIN_ARRAY_LB_PAIR_OFFSET, [7_u8; 32]);
+
+        let first_bin =
+            &mut data[BIN_ARRAY_FIRST_BIN_OFFSET..BIN_ARRAY_FIRST_BIN_OFFSET + BIN_STRIDE];
+
+        write_bytes(first_bin, BIN_AMOUNT_X_OFFSET, 11_u64.to_le_bytes());
+        write_bytes(first_bin, BIN_AMOUNT_Y_OFFSET, 22_u64.to_le_bytes());
+        write_bytes(first_bin, BIN_PRICE_OFFSET, 33_u128.to_le_bytes());
+        write_bytes(first_bin, BIN_LIQUIDITY_SUPPLY_OFFSET, 44_u128.to_le_bytes());
+        write_bytes(first_bin, BIN_FULFILLED_ORDER_AMOUNT_X_OFFSET, 55_u64.to_le_bytes());
+        write_bytes(first_bin, BIN_FULFILLED_ORDER_AMOUNT_Y_OFFSET, 66_u64.to_le_bytes());
+        write_bytes(first_bin, BIN_LIMIT_ORDER_FEE_ASK_SIDE_OFFSET, 77_u64.to_le_bytes());
+        write_bytes(first_bin, BIN_LIMIT_ORDER_FEE_BID_SIDE_OFFSET, 88_u64.to_le_bytes());
+        write_bytes(
+            first_bin,
+            BIN_FEE_AMOUNT_X_PER_TOKEN_STORED_OFFSET,
+            99_u128.to_le_bytes(),
+        );
+        write_bytes(
+            first_bin,
+            BIN_FEE_AMOUNT_Y_PER_TOKEN_STORED_OFFSET,
+            111_u128.to_le_bytes(),
+        );
+        write_bytes(first_bin, BIN_OPEN_ORDER_AMOUNT_OFFSET, 122_u64.to_le_bytes());
+        write_bytes(
+            first_bin,
+            BIN_TOTAL_PROCESSING_ORDER_AMOUNT_OFFSET,
+            133_u64.to_le_bytes(),
+        );
+        write_bytes(
+            first_bin,
+            BIN_PROCESSED_ORDER_REMAINING_AMOUNT_OFFSET,
+            144_u64.to_le_bytes(),
+        );
+        write_bytes(first_bin, BIN_ORDER_AGE_OFFSET, 155_u32.to_le_bytes());
+        first_bin[BIN_LIMIT_ORDER_ASK_SIDE_OFFSET] = 1;
+
+        data
+    }
+
+    fn valid_bitmap_extension_bytes() -> Vec<u8> {
+        let mut data = vec![0_u8; BITMAP_EXTENSION_ACCOUNT_LEN];
+
+        write_bytes(&mut data, 0, BITMAP_EXTENSION_DISCRIMINATOR);
+        write_bytes(&mut data, BITMAP_EXTENSION_LB_PAIR_OFFSET, [5_u8; 32]);
+        write_bytes(
+            &mut data,
+            BITMAP_EXTENSION_POSITIVE_OFFSET,
+            0x1122_3344_5566_7788_u64.to_le_bytes(),
+        );
+
+        let last_negative_word_offset = BITMAP_EXTENSION_NEGATIVE_OFFSET
+            + (BITMAP_EXTENSION_CHUNKS * BITMAP_EXTENSION_WORDS - 1) * 8;
+
+        write_bytes(
+            &mut data,
+            last_negative_word_offset,
+            0x8877_6655_4433_2211_u64.to_le_bytes(),
+        );
+
+        data
+    }
+
+    fn write_bytes<const N: usize>(data: &mut [u8], offset: usize, bytes: [u8; N]) {
+        data[offset..offset + N].copy_from_slice(&bytes);
+    }
+}
+
