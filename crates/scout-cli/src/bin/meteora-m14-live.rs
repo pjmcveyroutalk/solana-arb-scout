@@ -1,12 +1,14 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::Client;
 use scout_cli::meteora::{
     bin_id_to_bin_array_index, derive_bin_array_pda, next_initialized_bin_array_index,
-    BIN_ARRAY_MAX_INDEX, BIN_ARRAY_MIN_INDEX,
+    BIN_ARRAY_ACCOUNT_LEN, BIN_ARRAY_DISCRIMINATOR, BIN_ARRAY_MAX_INDEX, BIN_ARRAY_MIN_INDEX,
+    BIN_ARRAY_VERSION_OFFSET, BIN_ARRAY_VERSION_V3, METEORA_DLMM_PROGRAM_ID,
 };
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys, meteora_quote_hydration_account_pubkeys,
     parse_meteora_base_hydration_response, parse_meteora_program_notification,
-    parse_meteora_quote_hydration_response,
+    parse_meteora_quote_hydration_response, MeteoraLiveObservation, MeteoraLivePreparedState,
 };
 use scout_cli::meteora_m13::{
     meteora_m13_pair, MeteoraM13ExactInputQuote, MeteoraM13PreparedQuote,
@@ -19,13 +21,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::Duration;
 
 const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
-const METEORA_M14_POOL: &str = "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6";
+const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const QUOTE_AMOUNT_RAW: u64 = 1_000_000;
 const MAX_BIN_ARRAYS_PER_DIRECTION: usize = 3;
+const MAX_DISCOVERY_CANDIDATES: usize = 64;
+const DISCOVERY_PAGE_SIZE: usize = 250;
+const MIN_DISCOVERY_TVL_USD: u64 = 10_000;
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const M14_EVIDENCE_PATH: &str = "artifacts/m14-meteora/frozen-mainnet.json";
+
+struct QualifiedM14Capture {
+    pool: String,
+    observation: MeteoraLiveObservation,
+    base_source_slot: u64,
+    bin_array_pubkeys: Vec<String>,
+    final_pubkeys: Vec<String>,
+    frozen_payload: Value,
+    prepared: MeteoraLivePreparedState,
+    frozen_hydrated_at_unix_ms: u64,
+    x_to_y: MeteoraM13ExactInputQuote,
+    y_to_x: MeteoraM13ExactInputQuote,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -42,13 +60,183 @@ async fn main() -> Result<(), String> {
         .build()
         .map_err(|error| format!("could not build bounded Solana RPC client: {error}"))?;
 
-    let trigger = fetch_account_info(&rpc_client, METEORA_M14_POOL).await?;
-    let observation = observation_from_account_info(METEORA_M14_POOL, &trigger)?;
+    let candidates = fetch_meteora_m14_candidates(&rpc_client).await?;
+    let mut rejection_count = 0usize;
+    let mut qualified = None;
+
+    for pool in candidates.iter().take(MAX_DISCOVERY_CANDIDATES) {
+        match qualify_m14_candidate(&rpc_client, pool).await {
+            Ok(capture) => {
+                qualified = Some(capture);
+                break;
+            }
+            Err(error) => {
+                rejection_count = rejection_count
+                    .checked_add(1)
+                    .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
+                println!("meteora_m14_candidate_rejected: pool={pool} reason={error}");
+            }
+        }
+    }
+
+    let capture = qualified.ok_or_else(|| {
+        format!(
+            "Meteora M14 found no qualified legacy-SPL v3 target within {} candidates; \\
+             rejected={rejection_count}",
+            candidates.len().min(MAX_DISCOVERY_CANDIDATES)
+        )
+    })?;
+
+    let (mint_x, mint_y) = meteora_m13_pair(&capture.prepared.snapshot);
+    let x_to_y = &capture.x_to_y;
+    let y_to_x = &capture.y_to_x;
+
+    let source = capture.prepared.snapshot.source();
+    let evidence = json!({
+        "schema": "scout.meteora.m14.frozen-mainnet.v1",
+        "scope": "read-only differential certification",
+        "pool": capture.pool.as_str(),
+        "rpc_url": SOLANA_RPC_URL,
+        "discovery": {
+            "source": METEORA_DATA_API_URL,
+            "sort": "pool_created_at:desc",
+            "filter": "is_blacklisted=false && tvl>10000",
+            "max_candidates": MAX_DISCOVERY_CANDIDATES,
+            "rejected_before_selection": rejection_count,
+            "qualification": "legacy SPL mints + frozen v3 plan + bilateral full-fill quote",
+        },
+        "trigger_slot": capture.observation.slot,
+        "base_source_slot": capture.base_source_slot,
+        "source_slot": source.source_slot,
+        "generation_id": source.generation_id,
+        "quote_amount_raw": QUOTE_AMOUNT_RAW,
+        "mint_x": mint_x.as_str(),
+        "mint_y": mint_y.as_str(),
+        "token_x_program": capture.prepared.token_x_program.as_str(),
+        "token_y_program": capture.prepared.token_y_program.as_str(),
+        "bin_array_pubkeys": &capture.bin_array_pubkeys,
+        "frozen_account_pubkeys": &capture.final_pubkeys,
+        "frozen_rpc_payload": &capture.frozen_payload,
+        "scout_quotes": {
+            "x_to_y": quote_json(x_to_y),
+            "y_to_x": quote_json(y_to_x),
+        },
+        "reference": {
+            "repository": "MeteoraAg/dlmm-sdk",
+            "commit": "576919e3e4368e542c402f000b4264724f7f23ec",
+            "function": "commons::quote::quote_exact_in",
+            "rust_toolchain": "1.85.0",
+        },
+        "scout_toolchain": "1.80.0",
+        "captured_at_unix_ms": capture.frozen_hydrated_at_unix_ms,
+    });
+
+    if let Some(parent) = Path::new(M14_EVIDENCE_PATH).parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create M14 evidence directory: {error}"))?;
+    }
+
+    let encoded = serde_json::to_vec_pretty(&evidence)
+        .map_err(|error| format!("could not encode M14 evidence JSON: {error}"))?;
+    fs::write(M14_EVIDENCE_PATH, encoded)
+        .map_err(|error| format!("could not write M14 evidence fixture: {error}"))?;
+
+    println!(
+        "meteora_m14_capture: pool={} trigger_slot={} base_slot={} source_slot={} \\
+         bin_arrays={} rejected_candidates={}",
+        capture.pool,
+        capture.observation.slot,
+        capture.base_source_slot,
+        source.source_slot,
+        capture.bin_array_pubkeys.len(),
+        rejection_count
+    );
+    println!(
+        "meteora_m14_scout_x_to_y: amount_in={} amount_out={} fee={} protocol_fee={}",
+        x_to_y.requested_input_raw,
+        x_to_y.amount_out_raw,
+        x_to_y.trading_fee_raw,
+        x_to_y.protocol_fee_raw
+    );
+    println!(
+        "meteora_m14_scout_y_to_x: amount_in={} amount_out={} fee={} protocol_fee={}",
+        y_to_x.requested_input_raw,
+        y_to_x.amount_out_raw,
+        y_to_x.trading_fee_raw,
+        y_to_x.protocol_fee_raw
+    );
+    println!("meteora_m14_evidence={M14_EVIDENCE_PATH}");
+    println!("READ-ONLY METEORA M14 FROZEN MAINNET CAPTURE PASS");
+
+    Ok(())
+}
+
+async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, String> {
+    let filter = format!(
+        "is_blacklisted=false && tvl>{MIN_DISCOVERY_TVL_USD}"
+    );
+    let response = client
+        .get(METEORA_DATA_API_URL)
+        .query(&[
+            ("page", "1".to_owned()),
+            ("page_size", DISCOVERY_PAGE_SIZE.to_string()),
+            ("sort_by", "pool_created_at:desc".to_owned()),
+            ("filter_by", filter),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Meteora M14 Data API request failed: {error}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Meteora M14 Data API returned HTTP status {status}"));
+    }
+
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Meteora M14 Data API returned invalid JSON: {error}"))?;
+    let pools = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Meteora M14 Data API response missing data array".to_owned())?;
+
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    for pool in pools {
+        let Some(address) = pool.get("address").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen.insert(address.to_owned()) {
+            candidates.push(address.to_owned());
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err("Meteora M14 Data API returned no bounded candidates".to_owned());
+    }
+
+    println!(
+        "meteora_m14_discovery: source={} candidates={} bounded_to={}",
+        METEORA_DATA_API_URL,
+        candidates.len(),
+        candidates.len().min(MAX_DISCOVERY_CANDIDATES)
+    );
+
+    Ok(candidates)
+}
+
+async fn qualify_m14_candidate(
+    client: &Client,
+    pool: &str,
+) -> Result<QualifiedM14Capture, String> {
+    let trigger = fetch_account_info(client, pool).await?;
+    let observation = observation_from_account_info(pool, &trigger)?;
     let trigger_received_at_unix_ms = unix_ms()?;
 
     let base_pubkeys = meteora_base_hydration_account_pubkeys(&observation)?;
     let base_payload = fetch_multiple_accounts(
-        &rpc_client,
+        client,
         &base_pubkeys,
         observation.slot,
         "Meteora M14 base hydration",
@@ -71,12 +259,14 @@ async fn main() -> Result<(), String> {
     let final_pubkeys = meteora_quote_hydration_account_pubkeys(&observation, &bin_array_pubkeys)?;
 
     let frozen_payload = fetch_multiple_accounts_slice(
-        &rpc_client,
+        client,
         &final_pubkeys,
         base_source_slot,
         "Meteora M14 frozen quote hydration",
     )
     .await?;
+
+    require_v3_frozen_bin_array_plan(&frozen_payload, &bin_array_pubkeys)?;
 
     let frozen_hydrated_at_unix_ms = unix_ms()?;
     let prepared = parse_meteora_quote_hydration_response(
@@ -101,79 +291,124 @@ async fn main() -> Result<(), String> {
     let quote_context =
         MeteoraM13PreparedQuote::from_snapshot(&prepared.normalized, &prepared.snapshot)?;
     let (mint_x, mint_y) = meteora_m13_pair(&prepared.snapshot);
-
     let x_to_y = quote_context.quote_exact_input(&mint_x, QUOTE_AMOUNT_RAW)?;
     let y_to_x = quote_context.quote_exact_input(&mint_y, QUOTE_AMOUNT_RAW)?;
 
     require_quote_identity(&x_to_y, &mint_x, &mint_y, true)?;
     require_quote_identity(&y_to_x, &mint_y, &mint_x, false)?;
 
-    let source = prepared.snapshot.source();
-    let evidence = json!({
-        "schema": "scout.meteora.m14.frozen-mainnet.v1",
-        "scope": "read-only differential certification",
-        "pool": METEORA_M14_POOL,
-        "rpc_url": SOLANA_RPC_URL,
-        "trigger_slot": observation.slot,
-        "base_source_slot": base_source_slot,
-        "source_slot": source.source_slot,
-        "generation_id": source.generation_id,
-        "quote_amount_raw": QUOTE_AMOUNT_RAW,
-        "mint_x": mint_x.as_str(),
-        "mint_y": mint_y.as_str(),
-        "token_x_program": prepared.token_x_program.as_str(),
-        "token_y_program": prepared.token_y_program.as_str(),
-        "bin_array_pubkeys": &bin_array_pubkeys,
-        "frozen_account_pubkeys": &final_pubkeys,
-        "frozen_rpc_payload": &frozen_payload,
-        "scout_quotes": {
-            "x_to_y": quote_json(&x_to_y),
-            "y_to_x": quote_json(&y_to_x),
-        },
-        "reference": {
-            "repository": "MeteoraAg/dlmm-sdk",
-            "commit": "576919e3e4368e542c402f000b4264724f7f23ec",
-            "function": "commons::quote::quote_exact_in",
-            "rust_toolchain": "1.85.0",
-        },
-        "scout_toolchain": "1.80.0",
-        "captured_at_unix_ms": frozen_hydrated_at_unix_ms,
-    });
-
-    if let Some(parent) = Path::new(M14_EVIDENCE_PATH).parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("could not create M14 evidence directory: {error}"))?;
-    }
-
-    let encoded = serde_json::to_vec_pretty(&evidence)
-        .map_err(|error| format!("could not encode M14 evidence JSON: {error}"))?;
-    fs::write(M14_EVIDENCE_PATH, encoded)
-        .map_err(|error| format!("could not write M14 evidence fixture: {error}"))?;
-
     println!(
-        "meteora_m14_capture: pool={} trigger_slot={} base_slot={} source_slot={} bin_arrays={}",
-        METEORA_M14_POOL,
-        observation.slot,
-        base_source_slot,
-        source.source_slot,
+        "meteora_m14_candidate_qualified: pool={} source_slot={} bin_arrays={}",
+        pool,
+        prepared.snapshot.source().source_slot,
         bin_array_pubkeys.len()
     );
-    println!(
-        "meteora_m14_scout_x_to_y: amount_in={} amount_out={} fee={} protocol_fee={}",
-        x_to_y.requested_input_raw,
-        x_to_y.amount_out_raw,
-        x_to_y.trading_fee_raw,
-        x_to_y.protocol_fee_raw
-    );
-    println!(
-        "meteora_m14_scout_y_to_x: amount_in={} amount_out={} fee={} protocol_fee={}",
-        y_to_x.requested_input_raw,
-        y_to_x.amount_out_raw,
-        y_to_x.trading_fee_raw,
-        y_to_x.protocol_fee_raw
-    );
-    println!("meteora_m14_evidence={M14_EVIDENCE_PATH}");
-    println!("READ-ONLY METEORA M14 FROZEN MAINNET CAPTURE PASS");
+
+    Ok(QualifiedM14Capture {
+        pool: pool.to_owned(),
+        observation,
+        base_source_slot,
+        bin_array_pubkeys,
+        final_pubkeys,
+        frozen_payload,
+        prepared,
+        frozen_hydrated_at_unix_ms,
+        x_to_y,
+        y_to_x,
+    })
+}
+
+fn require_v3_frozen_bin_array_plan(
+    payload: &Value,
+    expected_bin_array_pubkeys: &[String],
+) -> Result<(), String> {
+    let accounts = payload
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Meteora M14 frozen hydration missing result.value array".to_owned())?;
+    let expected_count = 5_usize
+        .checked_add(expected_bin_array_pubkeys.len())
+        .ok_or_else(|| "Meteora M14 frozen account count overflow".to_owned())?;
+
+    if accounts.len() != expected_count {
+        return Err(format!(
+            "Meteora M14 frozen account count mismatch: expected={expected_count} actual={}",
+            accounts.len()
+        ));
+    }
+
+    for (offset, expected_pubkey) in expected_bin_array_pubkeys.iter().enumerate() {
+        let account_index = 5_usize
+            .checked_add(offset)
+            .ok_or_else(|| "Meteora M14 frozen BinArray index overflow".to_owned())?;
+        let account = accounts
+            .get(account_index)
+            .ok_or_else(|| format!("Meteora M14 frozen BinArray missing: {expected_pubkey}"))?;
+
+        if account.is_null() {
+            return Err(format!("Meteora M14 frozen BinArray does not exist: {expected_pubkey}"));
+        }
+
+        let owner = account
+            .get("owner")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("Meteora M14 frozen BinArray missing owner: {expected_pubkey}")
+            })?;
+        if owner != METEORA_DLMM_PROGRAM_ID {
+            return Err(format!(
+                "Meteora M14 frozen BinArray owner mismatch: pubkey={expected_pubkey} owner={owner}"
+            ));
+        }
+
+        let encoding = account
+            .pointer("/data/1")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("Meteora M14 frozen BinArray missing encoding: {expected_pubkey}")
+            })?;
+        if encoding != "base64" {
+            return Err(format!(
+                "Meteora M14 frozen BinArray encoding mismatch: \\
+                 pubkey={expected_pubkey} encoding={encoding}"
+            ));
+        }
+
+        let encoded = account
+            .pointer("/data/0")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("Meteora M14 frozen BinArray missing base64 data: {expected_pubkey}")
+            })?;
+        let data = BASE64_STANDARD.decode(encoded).map_err(|error| {
+            format!("Meteora M14 frozen BinArray base64 decode failed: {expected_pubkey}: {error}")
+        })?;
+
+        if data.len() != BIN_ARRAY_ACCOUNT_LEN {
+            return Err(format!(
+                "Meteora M14 frozen BinArray length mismatch: pubkey={expected_pubkey} \\
+                 expected={} actual={}",
+                BIN_ARRAY_ACCOUNT_LEN,
+                data.len()
+            ));
+        }
+
+        if data.get(..BIN_ARRAY_DISCRIMINATOR.len()) != Some(BIN_ARRAY_DISCRIMINATOR.as_slice()) {
+            return Err(format!(
+                "Meteora M14 frozen BinArray discriminator mismatch: {expected_pubkey}"
+            ));
+        }
+
+        let version = *data.get(BIN_ARRAY_VERSION_OFFSET).ok_or_else(|| {
+            format!("Meteora M14 frozen BinArray missing version byte: {expected_pubkey}")
+        })?;
+        if version != BIN_ARRAY_VERSION_V3 {
+            return Err(format!(
+                "Meteora M14 frozen BinArray is outside locked v3 profile: \\
+                 pubkey={expected_pubkey} version={version}"
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -255,7 +490,7 @@ async fn rpc_json(client: &Client, request: Value, label: &str) -> Result<Value,
 fn observation_from_account_info(
     pubkey: &str,
     payload: &Value,
-) -> Result<scout_cli::meteora_live::MeteoraLiveObservation, String> {
+) -> Result<MeteoraLiveObservation, String> {
     let slot = payload
         .pointer("/result/context/slot")
         .and_then(Value::as_u64)
