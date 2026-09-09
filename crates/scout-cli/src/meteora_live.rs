@@ -523,10 +523,8 @@ fn parse_optional_bitmap_extension(
         decode_required_rpc_account(account, METEORA_DLMM_PROGRAM_ID, "Meteora bitmap extension")?;
     if data.len() != BITMAP_EXTENSION_ACCOUNT_LEN {
         return Err(format!(
-            concat!(
-                "Meteora bitmap extension length mismatch: ",
-                "expected {BITMAP_EXTENSION_ACCOUNT_LEN}, got {}"
-            ),
+            "Meteora bitmap extension length mismatch: expected {}, got {}",
+            BITMAP_EXTENSION_ACCOUNT_LEN,
             data.len()
         ));
     }
@@ -608,10 +606,9 @@ fn parse_mint_account(
         .ok_or_else(|| format!("{label} missing owner"))?;
     let expected_owner = token_program_from_flag(expected_program_flag)?;
     if owner != expected_owner {
-        return Err(format!(concat!(
-            "{label} owner mismatch: flag={expected_program_flag} ",
-            "expected={expected_owner} got={owner}"
-        )));
+        return Err(format!(
+            "{label} owner mismatch: flag={expected_program_flag} expected={expected_owner} got={owner}"
+        ));
     }
 
     let data = decode_account_data(account, label)?;
