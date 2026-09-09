@@ -13,8 +13,7 @@ use scout_core::{
 use serde_json::{json, Value};
 use solana_pubkey::{pubkey, Pubkey};
 
-const METEORA_DLMM_PROGRAM_PUBKEY: Pubkey =
-    pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+const METEORA_DLMM_PROGRAM_PUBKEY: Pubkey = pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const CLOCK_SYSVAR_ID: &str = "SysvarC1ock11111111111111111111111111111111";
@@ -219,11 +218,7 @@ pub fn parse_meteora_base_hydration_response(
         admission.token_y_program_flag,
         "Meteora token Y mint",
     )?;
-    let clock_data = decode_required_rpc_account(
-        &accounts[3],
-        SYSVAR_OWNER_ID,
-        "Meteora Clock",
-    )?;
+    let clock_data = decode_required_rpc_account(&accounts[3], SYSVAR_OWNER_ID, "Meteora Clock")?;
     let clock = decode_clock(&clock_data)?;
     let bitmap_extension = parse_optional_bitmap_extension(&accounts[4], observation)?;
 
@@ -333,11 +328,7 @@ pub fn parse_meteora_quote_hydration_response(
         admission.token_y_program_flag,
         "Meteora token Y mint",
     )?;
-    let clock_data = decode_required_rpc_account(
-        &accounts[3],
-        SYSVAR_OWNER_ID,
-        "Meteora Clock",
-    )?;
+    let clock_data = decode_required_rpc_account(&accounts[3], SYSVAR_OWNER_ID, "Meteora Clock")?;
     let clock = decode_clock(&clock_data)?;
     let bitmap_extension = parse_optional_bitmap_extension(&accounts[4], observation)?;
     let lb_pair_pubkey = decode_pubkey(&observation.pubkey)?;
@@ -450,9 +441,7 @@ fn decode_admission_state(data: &[u8]) -> Result<MeteoraLiveAdmissionState, Stri
 fn validate_admission_values(state: &MeteoraLiveAdmissionState) -> Result<(), String> {
     if !matches!(
         state.pair_type,
-        PAIR_TYPE_PERMISSIONLESS
-            | PAIR_TYPE_PERMISSION
-            | PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS
+        PAIR_TYPE_PERMISSIONLESS | PAIR_TYPE_PERMISSION | PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS
     ) {
         return Err(format!("unsupported Meteora pair_type {}", state.pair_type));
     }
@@ -530,11 +519,8 @@ fn parse_optional_bitmap_extension(
         return Ok(None);
     }
 
-    let data = decode_required_rpc_account(
-        account,
-        METEORA_DLMM_PROGRAM_ID,
-        "Meteora bitmap extension",
-    )?;
+    let data =
+        decode_required_rpc_account(account, METEORA_DLMM_PROGRAM_ID, "Meteora bitmap extension")?;
     if data.len() != BITMAP_EXTENSION_ACCOUNT_LEN {
         return Err(format!(
             concat!(
@@ -622,12 +608,10 @@ fn parse_mint_account(
         .ok_or_else(|| format!("{label} missing owner"))?;
     let expected_owner = token_program_from_flag(expected_program_flag)?;
     if owner != expected_owner {
-        return Err(format!(
-            concat!(
-                "{label} owner mismatch: flag={expected_program_flag} ",
-                "expected={expected_owner} got={owner}"
-            )
-        ));
+        return Err(format!(concat!(
+            "{label} owner mismatch: flag={expected_program_flag} ",
+            "expected={expected_owner} got={owner}"
+        )));
     }
 
     let data = decode_account_data(account, label)?;
@@ -820,9 +804,7 @@ fn decode_pubkey(encoded: &str) -> Result<[u8; 32], String> {
         .map_err(|error| format!("invalid Solana pubkey {encoded}: {error}"))?;
     let decoded_len = decoded.len();
     decoded.try_into().map_err(|_| {
-        format!(
-            "invalid Solana pubkey length: value={encoded} decoded_len={decoded_len}"
-        )
+        format!("invalid Solana pubkey length: value={encoded} decoded_len={decoded_len}")
     })
 }
 
@@ -898,7 +880,10 @@ mod tests {
 
     #[test]
     fn token_program_flags_map_only_to_locked_programs() {
-        assert_eq!(token_program_from_flag(TOKEN_PROGRAM_FLAG_SPL), Ok(SPL_TOKEN_PROGRAM_ID));
+        assert_eq!(
+            token_program_from_flag(TOKEN_PROGRAM_FLAG_SPL),
+            Ok(SPL_TOKEN_PROGRAM_ID)
+        );
         assert_eq!(
             token_program_from_flag(TOKEN_PROGRAM_FLAG_2022),
             Ok(TOKEN_2022_PROGRAM_ID)
