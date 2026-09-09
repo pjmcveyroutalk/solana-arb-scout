@@ -1,5 +1,9 @@
 use crate::meteora::MeteoraDlmmSnapshot;
 use crate::meteora_m8::meteora_exact_in_traverse;
+use scout_core::{
+    AdapterCapabilities, AuxiliaryStateKind, CapabilityState, ContentionFootprintState,
+    LiquidityModel, NormalizedPoolState, PoolTradingState, QuoteReserveState, Venue,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeteoraM13ExactInputQuote {
@@ -17,6 +21,131 @@ pub struct MeteoraM13ExactInputQuote {
     pub touched_bin_arrays: Vec<i64>,
     pub source_slot: u64,
     pub generation_id: u64,
+}
+
+#[derive(Debug)]
+pub struct MeteoraM13PreparedQuote<'a> {
+    pool_id: String,
+    token_a_mint: String,
+    token_b_mint: String,
+    token_a_decimals: u8,
+    token_b_decimals: u8,
+    snapshot: &'a MeteoraDlmmSnapshot,
+}
+
+impl<'a> MeteoraM13PreparedQuote<'a> {
+    pub fn from_snapshot(
+        pool: &NormalizedPoolState,
+        snapshot: &'a MeteoraDlmmSnapshot,
+    ) -> Result<Self, String> {
+        if pool.venue != Venue::Meteora {
+            return Err(format!(
+                "Meteora prepared quote requires venue=meteora, got {}",
+                pool.venue.label()
+            ));
+        }
+
+        if pool.trading_state != PoolTradingState::Tradable {
+            return Err(format!(
+                "Meteora pool {} is not tradable: state={}",
+                pool.pool_id,
+                pool.trading_state.label()
+            ));
+        }
+
+        if let QuoteReserveState::Available { .. } = &pool.quote_reserves {
+            return Err(format!(
+                "Meteora DLMM pool {} must not fabricate CPMM quote reserves",
+                pool.pool_id
+            ));
+        }
+
+        let snapshot_pool_id = bs58::encode(snapshot.lb_pair_pubkey()).into_string();
+        if pool.pool_id != snapshot_pool_id {
+            return Err(format!(
+                "Meteora pool/snapshot id mismatch: pool={} snapshot={snapshot_pool_id}",
+                pool.pool_id
+            ));
+        }
+
+        let (mint_x, mint_y) = meteora_m13_pair(snapshot);
+        let pair_matches = (pool.token_a.mint == mint_x && pool.token_b.mint == mint_y)
+            || (pool.token_a.mint == mint_y && pool.token_b.mint == mint_x);
+        if !pair_matches {
+            return Err(format!(
+                "Meteora pool/snapshot token pair mismatch for pool {}",
+                pool.pool_id
+            ));
+        }
+
+        let source = snapshot.source();
+        if source.source_slot < pool.source_slot {
+            return Err(format!(
+                "stale Meteora quote snapshot: pool={} pool_slot={} snapshot_slot={}",
+                pool.pool_id, pool.source_slot, source.source_slot
+            ));
+        }
+
+        Ok(Self {
+            pool_id: pool.pool_id.clone(),
+            token_a_mint: pool.token_a.mint.clone(),
+            token_b_mint: pool.token_b.mint.clone(),
+            token_a_decimals: pool.token_a.decimals,
+            token_b_decimals: pool.token_b.decimals,
+            snapshot,
+        })
+    }
+
+    pub fn pool_id(&self) -> &str {
+        self.pool_id.as_str()
+    }
+
+    pub fn source_slot(&self) -> u64 {
+        self.snapshot.source().source_slot
+    }
+
+    pub fn generation_id(&self) -> u64 {
+        self.snapshot.source().generation_id
+    }
+
+    pub fn capabilities(&self) -> AdapterCapabilities {
+        meteora_m13_capabilities()
+    }
+
+    pub fn contains_pair(&self, input_mint: &str, output_mint: &str) -> bool {
+        (self.token_a_mint == input_mint && self.token_b_mint == output_mint)
+            || (self.token_b_mint == input_mint && self.token_a_mint == output_mint)
+    }
+
+    pub fn mint_decimals(&self, mint: &str) -> Result<u8, String> {
+        if mint == self.token_a_mint {
+            Ok(self.token_a_decimals)
+        } else if mint == self.token_b_mint {
+            Ok(self.token_b_decimals)
+        } else {
+            Err(format!("mint {mint} is not in Meteora quote context"))
+        }
+    }
+
+    pub fn quote_exact_input(
+        &self,
+        input_mint: &str,
+        amount_in_raw: u64,
+    ) -> Result<MeteoraM13ExactInputQuote, String> {
+        meteora_m13_quote_exact_input(self.snapshot, input_mint, amount_in_raw)
+    }
+}
+
+pub fn meteora_m13_capabilities() -> AdapterCapabilities {
+    AdapterCapabilities {
+        liquidity_model: LiquidityModel::Dlmm,
+        exact_input_quote: CapabilityState::Supported,
+        spl_token: CapabilityState::Supported,
+        token_2022: CapabilityState::RequiresHydration,
+        transfer_fee: CapabilityState::Unsupported,
+        auxiliary_state: AuxiliaryStateKind::Bins,
+        contention_footprint: ContentionFootprintState::Incomplete,
+    }
 }
 
 pub fn meteora_m13_pair(snapshot: &MeteoraDlmmSnapshot) -> (String, String) {
@@ -112,7 +241,23 @@ fn meteora_m13_direction(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_meteora_mint, meteora_m13_direction};
+    use super::{decode_meteora_mint, meteora_m13_capabilities, meteora_m13_direction};
+    use scout_core::{
+        AuxiliaryStateKind, CapabilityState, ContentionFootprintState, LiquidityModel,
+    };
+
+    #[test]
+    fn meteora_capabilities_are_dlmm_and_fail_closed_for_deferred_transfer_fees() {
+        let capabilities = meteora_m13_capabilities();
+
+        assert_eq!(capabilities.liquidity_model, LiquidityModel::Dlmm);
+        assert_eq!(capabilities.exact_input_quote, CapabilityState::Supported);
+        assert_eq!(capabilities.spl_token, CapabilityState::Supported);
+        assert_eq!(capabilities.token_2022, CapabilityState::RequiresHydration);
+        assert_eq!(capabilities.transfer_fee, CapabilityState::Unsupported);
+        assert_eq!(capabilities.auxiliary_state, AuxiliaryStateKind::Bins);
+        assert_eq!(capabilities.contention_footprint, ContentionFootprintState::Incomplete);
+    }
 
     #[test]
     fn mint_x_input_maps_to_swap_for_y_and_mint_y_output() -> Result<(), String> {
