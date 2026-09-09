@@ -103,10 +103,7 @@ pub fn compile_meteora_swap2_v0(
 
     let mut instruction_account_indices = Vec::with_capacity(ordered_accounts.len());
     for account in &ordered_accounts {
-        instruction_account_indices.push(account_index(
-            &combined_account_keys,
-            account.pubkey,
-        )?);
+        instruction_account_indices.push(account_index(&combined_account_keys, account.pubkey)?);
     }
 
     let required_signatures = lookup_application
@@ -129,8 +126,8 @@ pub fn compile_meteora_swap2_v0(
         .map_err(|_| MeteoraDlmmFailure::AccountFootprintExceeded)?;
     let readonly_signed =
         u8::try_from(readonly_signed).map_err(|_| MeteoraDlmmFailure::AccountFootprintExceeded)?;
-    let readonly_unsigned =
-        u8::try_from(readonly_unsigned).map_err(|_| MeteoraDlmmFailure::AccountFootprintExceeded)?;
+    let readonly_unsigned = u8::try_from(readonly_unsigned)
+        .map_err(|_| MeteoraDlmmFailure::AccountFootprintExceeded)?;
 
     let instruction_data = serialize_swap2_empty_remaining_accounts(amount_in, min_amount_out);
     let message_bytes = serialize_v0_message(
@@ -252,11 +249,9 @@ pub fn parse_meteora_simulation_response(
     }
 
     let units_consumed = match value.get("unitsConsumed") {
-        Some(units) if !units.is_null() => Some(
-            units
-                .as_u64()
-                .ok_or(MeteoraDlmmFailure::SimulationFailed)?,
-        ),
+        Some(units) if !units.is_null() => {
+            Some(units.as_u64().ok_or(MeteoraDlmmFailure::SimulationFailed)?)
+        }
         _ => None,
     };
 
@@ -264,9 +259,7 @@ pub fn parse_meteora_simulation_response(
         Some(Value::Array(entries)) => {
             let mut logs = Vec::with_capacity(entries.len());
             for entry in entries {
-                let log = entry
-                    .as_str()
-                    .ok_or(MeteoraDlmmFailure::SimulationFailed)?;
+                let log = entry.as_str().ok_or(MeteoraDlmmFailure::SimulationFailed)?;
                 logs.push(log.to_owned());
             }
             logs
@@ -391,9 +384,7 @@ fn append_account_class(
         unique
             .iter()
             .copied()
-            .filter(|account| {
-                account.is_signer == is_signer && account.is_writable == is_writable
-            }),
+            .filter(|account| account.is_signer == is_signer && account.is_writable == is_writable),
     );
 }
 
@@ -642,8 +633,18 @@ mod tests {
                 ),
                 planned(MeteoraExecutionAccountKind::ReserveX, key(3), false, true),
                 planned(MeteoraExecutionAccountKind::ReserveY, key(4), false, true),
-                planned(MeteoraExecutionAccountKind::TokenXMint, key(5), false, false),
-                planned(MeteoraExecutionAccountKind::TokenYMint, key(6), false, false),
+                planned(
+                    MeteoraExecutionAccountKind::TokenXMint,
+                    key(5),
+                    false,
+                    false,
+                ),
+                planned(
+                    MeteoraExecutionAccountKind::TokenYMint,
+                    key(6),
+                    false,
+                    false,
+                ),
                 planned(
                     MeteoraExecutionAccountKind::TokenXProgram,
                     token_program,
@@ -670,12 +671,7 @@ mod tests {
                     true,
                 ),
                 planned(MeteoraExecutionAccountKind::Oracle, key(11), false, true),
-                planned(
-                    MeteoraExecutionAccountKind::HostFeeIn,
-                    dlmm,
-                    false,
-                    true,
-                ),
+                planned(MeteoraExecutionAccountKind::HostFeeIn, dlmm, false, true),
                 planned(
                     MeteoraExecutionAccountKind::EventAuthority,
                     key(13),
@@ -709,7 +705,8 @@ mod tests {
     }
 
     #[test]
-    fn no_alt_compiles_deterministic_unsigned_v0_simulation_transaction() -> Result<(), MeteoraDlmmFailure> {
+    fn no_alt_compiles_deterministic_unsigned_v0_simulation_transaction(
+    ) -> Result<(), MeteoraDlmmFailure> {
         let plan = canonical_test_plan();
         let compiled = compile_meteora_swap2_v0(&plan, 1, 2, key(99), None)?;
 
@@ -731,7 +728,8 @@ mod tests {
     }
 
     #[test]
-    fn instruction_indices_preserve_m11_account_order_and_intentional_duplicates() -> Result<(), MeteoraDlmmFailure> {
+    fn instruction_indices_preserve_m11_account_order_and_intentional_duplicates(
+    ) -> Result<(), MeteoraDlmmFailure> {
         let plan = canonical_test_plan();
         let compiled = compile_meteora_swap2_v0(&plan, 1, 2, key(99), None)?;
 
@@ -759,7 +757,8 @@ mod tests {
     }
 
     #[test]
-    fn optional_alt_moves_only_eligible_non_signer_non_program_accounts() -> Result<(), MeteoraDlmmFailure> {
+    fn optional_alt_moves_only_eligible_non_signer_non_program_accounts(
+    ) -> Result<(), MeteoraDlmmFailure> {
         let plan = canonical_test_plan();
         let table = MeteoraValidatedAddressLookupTable {
             account_key: key(220),
@@ -847,7 +846,10 @@ mod tests {
             }
         });
 
-        assert_eq!(parse_meteora_latest_blockhash_response(&payload), Ok(key(77)));
+        assert_eq!(
+            parse_meteora_latest_blockhash_response(&payload),
+            Ok(key(77))
+        );
         assert_eq!(
             parse_meteora_latest_blockhash_response(&json!({
                 "result": {
@@ -861,7 +863,8 @@ mod tests {
     }
 
     #[test]
-    fn simulation_request_is_unsigned_read_only_and_slot_bounded() -> Result<(), MeteoraDlmmFailure> {
+    fn simulation_request_is_unsigned_read_only_and_slot_bounded() -> Result<(), MeteoraDlmmFailure>
+    {
         let plan = canonical_test_plan();
         let compiled = compile_meteora_swap2_v0(&plan, 1, 2, key(99), None)?;
         let request = meteora_simulate_transaction_request(42, &compiled);
