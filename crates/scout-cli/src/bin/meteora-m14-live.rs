@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::Duration;
+use tokio::time::{sleep, Duration};
 
 const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
@@ -30,6 +30,9 @@ const DISCOVERY_PAGE_SIZE: usize = 250;
 const MIN_DISCOVERY_TVL_USD: u64 = 10_000;
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const RPC_MAX_ATTEMPTS: usize = 5;
+const RPC_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+const RPC_CANDIDATE_PACING: Duration = Duration::from_millis(250);
 const M14_EVIDENCE_PATH: &str = "artifacts/m14-meteora/frozen-mainnet.json";
 
 struct QualifiedM14Capture {
@@ -65,10 +68,17 @@ async fn main() -> Result<(), String> {
     let mut qualified = None;
 
     for pool in candidates.iter().take(MAX_DISCOVERY_CANDIDATES) {
+        sleep(RPC_CANDIDATE_PACING).await;
         match qualify_m14_candidate(&rpc_client, pool).await {
             Ok(capture) => {
                 qualified = Some(capture);
                 break;
+            }
+            Err(error) if is_rpc_infrastructure_error(&error) => {
+                return Err(format!(
+                    "Meteora M14 certification infrastructure failure while qualifying \
+                     pool={pool}: {error}"
+                ));
             }
             Err(error) => {
                 rejection_count = rejection_count
@@ -462,28 +472,66 @@ async fn fetch_multiple_accounts_slice(
 }
 
 async fn rpc_json(client: &Client, request: Value, label: &str) -> Result<Value, String> {
-    let response = client
-        .post(SOLANA_RPC_URL)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|error| format!("{label} RPC request failed: {error}"))?;
+    let mut backoff = RPC_INITIAL_BACKOFF;
 
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("{label} RPC returned HTTP status {status}"));
+    for attempt in 1..=RPC_MAX_ATTEMPTS {
+        let response = match client.post(SOLANA_RPC_URL).json(&request).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if attempt == RPC_MAX_ATTEMPTS {
+                    return Err(format!(
+                        "{label} RPC infrastructure request failed after {attempt} attempts: {error}"
+                    ));
+                }
+                println!(
+                    "meteora_m14_rpc_retry: label={label} attempt={attempt} \
+                     reason=request_error backoff_ms={}",
+                    backoff.as_millis()
+                );
+                sleep(backoff).await;
+                backoff = backoff.checked_mul(2).unwrap_or(Duration::from_secs(8));
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if status.as_u16() == 429 || status.is_server_error() {
+            if attempt == RPC_MAX_ATTEMPTS {
+                return Err(format!(
+                    "{label} RPC infrastructure HTTP status {status} after {attempt} attempts"
+                ));
+            }
+            println!(
+                "meteora_m14_rpc_retry: label={label} attempt={attempt} status={status} \
+                 backoff_ms={}",
+                backoff.as_millis()
+            );
+            sleep(backoff).await;
+            backoff = backoff.checked_mul(2).unwrap_or(Duration::from_secs(8));
+            continue;
+        }
+
+        if !status.is_success() {
+            return Err(format!("{label} RPC returned HTTP status {status}"));
+        }
+
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("{label} returned invalid JSON: {error}"))?;
+
+        if let Some(error) = payload.get("error") {
+            return Err(format!("{label} RPC error: {error}"));
+        }
+
+        return Ok(payload);
     }
 
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("{label} returned invalid JSON: {error}"))?;
+    Err(format!("{label} RPC infrastructure retry loop exhausted"))
+}
 
-    if let Some(error) = payload.get("error") {
-        return Err(format!("{label} RPC error: {error}"));
-    }
-
-    Ok(payload)
+fn is_rpc_infrastructure_error(error: &str) -> bool {
+    error.contains("RPC infrastructure ")
 }
 
 fn observation_from_account_info(
