@@ -2,19 +2,9 @@ name: Scout V0 Live Smoke
 
 on:
   workflow_dispatch:
-    inputs:
-      target_ref:
-        description: "Git ref to smoke"
-        required: true
-        default: "scout-dev"
-        type: choice
-        options:
-          - scout-dev
-          - main
   push:
     branches:
       - main
-      - scout-dev
     paths:
       - ".github/workflows/live-smoke.yml"
 
@@ -30,16 +20,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.sha }}
-
-      - name: Show smoke target
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Smoke event: $GITHUB_EVENT_NAME"
-          echo "Smoke checkout: $(git rev-parse HEAD)"
-          echo "Smoke ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.ref_name }}"
 
       - name: Run canonical Rust 1.80 preflight
         shell: bash
@@ -56,8 +36,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.sha }}
 
       - name: Install Rust 1.80
         shell: bash
@@ -116,8 +94,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.sha }}
 
       - name: Install Rust 1.80
         shell: bash
@@ -140,8 +116,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.sha }}
 
       - name: Install Rust 1.80
         shell: bash
@@ -164,8 +138,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.sha }}
 
       - name: Install Rust 1.80
         shell: bash
@@ -188,8 +160,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_ref || github.sha }}
 
       - name: Install Rust 1.80
         shell: bash
