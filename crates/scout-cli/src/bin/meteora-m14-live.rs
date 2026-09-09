@@ -489,9 +489,7 @@ async fn rpc_json(client: &Client, request: Value, label: &str) -> Result<Value,
                     backoff.as_millis()
                 );
                 sleep(backoff).await;
-                backoff = backoff
-                    .checked_mul(2)
-                    .unwrap_or(Duration::from_secs(8));
+                backoff = backoff.checked_mul(2).unwrap_or(Duration::from_secs(8));
                 continue;
             }
         };
@@ -509,9 +507,7 @@ async fn rpc_json(client: &Client, request: Value, label: &str) -> Result<Value,
                 backoff.as_millis()
             );
             sleep(backoff).await;
-            backoff = backoff
-                .checked_mul(2)
-                .unwrap_or(Duration::from_secs(8));
+            backoff = backoff.checked_mul(2).unwrap_or(Duration::from_secs(8));
             continue;
         }
 
