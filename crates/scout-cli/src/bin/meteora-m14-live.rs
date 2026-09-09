@@ -26,8 +26,9 @@ const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const QUOTE_AMOUNT_RAW: u64 = 1_000_000;
 const MAX_BIN_ARRAYS_PER_DIRECTION: usize = 3;
-const MAX_DISCOVERY_CANDIDATES: usize = 64;
+const CANDIDATE_BATCH_SIZE: usize = 64;
 const DISCOVERY_PAGE_SIZE: usize = 250;
+const MAX_DISCOVERY_CANDIDATES: usize = DISCOVERY_PAGE_SIZE;
 const MIN_DISCOVERY_TVL_USD: u64 = 10_000;
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -69,60 +70,83 @@ async fn main() -> Result<(), String> {
         .take(MAX_DISCOVERY_CANDIDATES)
         .cloned()
         .collect::<Vec<_>>();
-    let candidate_payload = fetch_candidate_accounts(&rpc_client, &bounded_candidates).await?;
-    let candidate_slot = candidate_payload
-        .pointer("/result/context/slot")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "Meteora M14 candidate batch missing context slot".to_owned())?;
-    let candidate_accounts = candidate_payload
-        .pointer("/result/value")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "Meteora M14 candidate batch missing result.value array".to_owned())?;
-    if candidate_accounts.len() != bounded_candidates.len() {
-        return Err(format!(
-            "Meteora M14 candidate batch account count mismatch: expected={} actual={}",
-            bounded_candidates.len(),
-            candidate_accounts.len()
-        ));
-    }
-    let trigger_received_at_unix_ms = unix_ms()?;
     let mut rejection_count = 0usize;
+    let mut examined_count = 0usize;
     let mut qualified = None;
 
-    for (pool, account) in bounded_candidates.iter().zip(candidate_accounts) {
-        let result = match observation_from_account(pool, candidate_slot, account) {
-            Ok(observation) => {
-                qualify_m14_candidate(&rpc_client, pool, observation, trigger_received_at_unix_ms)
-                    .await
-            }
-            Err(error) => Err(error),
-        };
+    'candidate_batches: for (batch_index, candidate_batch) in bounded_candidates
+        .chunks(CANDIDATE_BATCH_SIZE)
+        .enumerate()
+    {
+        let candidate_payload = fetch_candidate_accounts(&rpc_client, candidate_batch).await?;
+        let candidate_slot = candidate_payload
+            .pointer("/result/context/slot")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "Meteora M14 candidate batch missing context slot".to_owned())?;
+        let candidate_accounts = candidate_payload
+            .pointer("/result/value")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Meteora M14 candidate batch missing result.value array".to_owned())?;
+        if candidate_accounts.len() != candidate_batch.len() {
+            return Err(format!(
+                "Meteora M14 candidate batch account count mismatch: expected={} actual={}",
+                candidate_batch.len(),
+                candidate_accounts.len()
+            ));
+        }
+        let trigger_received_at_unix_ms = unix_ms()?;
 
-        match result {
-            Ok(capture) => {
-                qualified = Some(capture);
-                break;
-            }
-            Err(error) if is_rpc_infrastructure_error(&error) => {
-                return Err(format!(
-                    "Meteora M14 certification infrastructure failure while qualifying \
-                     pool={pool}: {error}"
-                ));
-            }
-            Err(error) => {
-                rejection_count = rejection_count
-                    .checked_add(1)
-                    .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
-                println!("meteora_m14_candidate_rejected: pool={pool} reason={error}");
+        println!(
+            "meteora_m14_candidate_batch: batch={} candidates={} slot={}",
+            batch_index + 1,
+            candidate_batch.len(),
+            candidate_slot
+        );
+
+        for (pool, account) in candidate_batch.iter().zip(candidate_accounts) {
+            examined_count = examined_count
+                .checked_add(1)
+                .ok_or_else(|| "Meteora M14 examined counter overflow".to_owned())?;
+
+            let result = match observation_from_account(pool, candidate_slot, account) {
+                Ok(observation) => {
+                    qualify_m14_candidate(
+                        &rpc_client,
+                        pool,
+                        observation,
+                        trigger_received_at_unix_ms,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+
+            match result {
+                Ok(capture) => {
+                    qualified = Some(capture);
+                    break 'candidate_batches;
+                }
+                Err(error) if is_rpc_infrastructure_error(&error) => {
+                    return Err(format!(
+                        "Meteora M14 certification infrastructure failure while qualifying \
+                         pool={pool}: {error}"
+                    ));
+                }
+                Err(error) => {
+                    rejection_count = rejection_count
+                        .checked_add(1)
+                        .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
+                    println!("meteora_m14_candidate_rejected: pool={pool} reason={error}");
+                }
             }
         }
     }
 
     let capture = qualified.ok_or_else(|| {
         format!(
-            "Meteora M14 found no qualified legacy-SPL v3 target within {} candidates; \\
+            "Meteora M14 found no qualified legacy-SPL v3 target within {} candidates; \
              rejected={rejection_count}",
-            candidates.len().min(MAX_DISCOVERY_CANDIDATES)
+            examined_count
         )
     })?;
 
@@ -181,7 +205,7 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("could not write M14 evidence fixture: {error}"))?;
 
     println!(
-        "meteora_m14_capture: pool={} trigger_slot={} base_slot={} source_slot={} \\
+        "meteora_m14_capture: pool={} trigger_slot={} base_slot={} source_slot={} \
          bin_arrays={} rejected_candidates={}",
         capture.pool,
         capture.observation.slot,
@@ -408,7 +432,7 @@ fn require_v3_frozen_bin_array_plan(
             })?;
         if encoding != "base64" {
             return Err(format!(
-                "Meteora M14 frozen BinArray encoding mismatch: \\
+                "Meteora M14 frozen BinArray encoding mismatch: \
                  pubkey={expected_pubkey} encoding={encoding}"
             ));
         }
@@ -425,7 +449,7 @@ fn require_v3_frozen_bin_array_plan(
 
         if data.len() != BIN_ARRAY_ACCOUNT_LEN {
             return Err(format!(
-                "Meteora M14 frozen BinArray length mismatch: pubkey={expected_pubkey} \\
+                "Meteora M14 frozen BinArray length mismatch: pubkey={expected_pubkey} \
                  expected={} actual={}",
                 BIN_ARRAY_ACCOUNT_LEN,
                 data.len()
@@ -443,7 +467,7 @@ fn require_v3_frozen_bin_array_plan(
         })?;
         if version != BIN_ARRAY_VERSION_V3 {
             return Err(format!(
-                "Meteora M14 frozen BinArray is outside locked v3 profile: \\
+                "Meteora M14 frozen BinArray is outside locked v3 profile: \
                  pubkey={expected_pubkey} version={version}"
             ));
         }
@@ -753,3 +777,4 @@ fn unix_ms() -> Result<u64, String> {
     u64::try_from(duration.as_millis())
         .map_err(|_| "system clock milliseconds overflow u64".to_owned())
 }
+
