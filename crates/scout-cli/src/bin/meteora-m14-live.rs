@@ -172,9 +172,7 @@ async fn main() -> Result<(), String> {
 }
 
 async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, String> {
-    let filter = format!(
-        "is_blacklisted=false && tvl>{MIN_DISCOVERY_TVL_USD}"
-    );
+    let filter = format!("is_blacklisted=false && tvl>{MIN_DISCOVERY_TVL_USD}");
     let response = client
         .get(METEORA_DATA_API_URL)
         .query(&[
@@ -189,7 +187,9 @@ async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, St
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("Meteora M14 Data API returned HTTP status {status}"));
+        return Err(format!(
+            "Meteora M14 Data API returned HTTP status {status}"
+        ));
     }
 
     let payload = response
@@ -226,10 +226,7 @@ async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, St
     Ok(candidates)
 }
 
-async fn qualify_m14_candidate(
-    client: &Client,
-    pool: &str,
-) -> Result<QualifiedM14Capture, String> {
+async fn qualify_m14_candidate(client: &Client, pool: &str) -> Result<QualifiedM14Capture, String> {
     let trigger = fetch_account_info(client, pool).await?;
     let observation = observation_from_account_info(pool, &trigger)?;
     let trigger_received_at_unix_ms = unix_ms()?;
@@ -346,7 +343,9 @@ fn require_v3_frozen_bin_array_plan(
             .ok_or_else(|| format!("Meteora M14 frozen BinArray missing: {expected_pubkey}"))?;
 
         if account.is_null() {
-            return Err(format!("Meteora M14 frozen BinArray does not exist: {expected_pubkey}"));
+            return Err(format!(
+                "Meteora M14 frozen BinArray does not exist: {expected_pubkey}"
+            ));
         }
 
         let owner = account
