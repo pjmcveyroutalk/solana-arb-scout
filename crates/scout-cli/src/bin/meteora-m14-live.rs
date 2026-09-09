@@ -143,7 +143,7 @@ async fn main() -> Result<(), String> {
 
     let capture = qualified.ok_or_else(|| {
         format!(
-            "Meteora M14 found no qualified legacy-SPL v3 target within {} candidates; \
+            "Meteora M14 found no qualified legacy-SPL v3 target within {} candidates; \\
              rejected={rejection_count}",
             examined_count
         )
@@ -204,7 +204,7 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("could not write M14 evidence fixture: {error}"))?;
 
     println!(
-        "meteora_m14_capture: pool={} trigger_slot={} base_slot={} source_slot={} \
+        "meteora_m14_capture: pool={} trigger_slot={} base_slot={} source_slot={} \\
          bin_arrays={} rejected_candidates={}",
         capture.pool,
         capture.observation.slot,
@@ -431,7 +431,7 @@ fn require_v3_frozen_bin_array_plan(
             })?;
         if encoding != "base64" {
             return Err(format!(
-                "Meteora M14 frozen BinArray encoding mismatch: \
+                "Meteora M14 frozen BinArray encoding mismatch: \\
                  pubkey={expected_pubkey} encoding={encoding}"
             ));
         }
@@ -448,7 +448,7 @@ fn require_v3_frozen_bin_array_plan(
 
         if data.len() != BIN_ARRAY_ACCOUNT_LEN {
             return Err(format!(
-                "Meteora M14 frozen BinArray length mismatch: pubkey={expected_pubkey} \
+                "Meteora M14 frozen BinArray length mismatch: pubkey={expected_pubkey} \\
                  expected={} actual={}",
                 BIN_ARRAY_ACCOUNT_LEN,
                 data.len()
@@ -466,7 +466,7 @@ fn require_v3_frozen_bin_array_plan(
         })?;
         if version != BIN_ARRAY_VERSION_V3 {
             return Err(format!(
-                "Meteora M14 frozen BinArray is outside locked v3 profile: \
+                "Meteora M14 frozen BinArray is outside locked v3 profile: \\
                  pubkey={expected_pubkey} version={version}"
             ));
         }
