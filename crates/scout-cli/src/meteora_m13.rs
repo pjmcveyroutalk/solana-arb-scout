@@ -41,8 +41,8 @@ pub fn meteora_m13_quote_exact_input(
     let (swap_for_y, output_bytes) = meteora_m13_direction(input_bytes, mint_x, mint_y)?;
     let output_mint = bs58::encode(output_bytes).into_string();
 
-    let traversal = meteora_exact_in_traverse(snapshot, amount_in_raw, swap_for_y, true)
-        .map_err(|error| {
+    let traversal =
+        meteora_exact_in_traverse(snapshot, amount_in_raw, swap_for_y, true).map_err(|error| {
             format!(
                 "Meteora authoritative exact-input quote failed: input_mint={input_mint} \
                  amount_in_raw={amount_in_raw} error={error:?}"
@@ -92,9 +92,7 @@ fn decode_meteora_mint(input_mint: &str) -> Result<[u8; 32], String> {
     let decoded_len = decoded.len();
 
     decoded.try_into().map_err(|_| {
-        format!(
-            "invalid Meteora input mint length: mint={input_mint} decoded_len={decoded_len}"
-        )
+        format!("invalid Meteora input mint length: mint={input_mint} decoded_len={decoded_len}")
     })
 }
 
@@ -170,4 +168,3 @@ mod tests {
         Ok(())
     }
 }
-
