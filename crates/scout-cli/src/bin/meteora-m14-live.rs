@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use reqwest::header::RETRY_AFTER;
 use reqwest::Client;
 use scout_cli::meteora::{
     bin_id_to_bin_array_index, derive_bin_array_pda, next_initialized_bin_array_index,
@@ -32,7 +33,6 @@ const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const RPC_MAX_ATTEMPTS: usize = 5;
 const RPC_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-const RPC_CANDIDATE_PACING: Duration = Duration::from_millis(250);
 const M14_EVIDENCE_PATH: &str = "artifacts/m14-meteora/frozen-mainnet.json";
 
 struct QualifiedM14Capture {
@@ -64,12 +64,41 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("could not build bounded Solana RPC client: {error}"))?;
 
     let candidates = fetch_meteora_m14_candidates(&rpc_client).await?;
+    let bounded_candidates = candidates
+        .iter()
+        .take(MAX_DISCOVERY_CANDIDATES)
+        .cloned()
+        .collect::<Vec<_>>();
+    let candidate_payload = fetch_candidate_accounts(&rpc_client, &bounded_candidates).await?;
+    let candidate_slot = candidate_payload
+        .pointer("/result/context/slot")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Meteora M14 candidate batch missing context slot".to_owned())?;
+    let candidate_accounts = candidate_payload
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Meteora M14 candidate batch missing result.value array".to_owned())?;
+    if candidate_accounts.len() != bounded_candidates.len() {
+        return Err(format!(
+            "Meteora M14 candidate batch account count mismatch: expected={} actual={}",
+            bounded_candidates.len(),
+            candidate_accounts.len()
+        ));
+    }
+    let trigger_received_at_unix_ms = unix_ms()?;
     let mut rejection_count = 0usize;
     let mut qualified = None;
 
-    for pool in candidates.iter().take(MAX_DISCOVERY_CANDIDATES) {
-        sleep(RPC_CANDIDATE_PACING).await;
-        match qualify_m14_candidate(&rpc_client, pool).await {
+    for (pool, account) in bounded_candidates.iter().zip(candidate_accounts) {
+        let result = match observation_from_account(pool, candidate_slot, account) {
+            Ok(observation) => {
+                qualify_m14_candidate(&rpc_client, pool, observation, trigger_received_at_unix_ms)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+
+        match result {
             Ok(capture) => {
                 qualified = Some(capture);
                 break;
@@ -236,11 +265,12 @@ async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, St
     Ok(candidates)
 }
 
-async fn qualify_m14_candidate(client: &Client, pool: &str) -> Result<QualifiedM14Capture, String> {
-    let trigger = fetch_account_info(client, pool).await?;
-    let observation = observation_from_account_info(pool, &trigger)?;
-    let trigger_received_at_unix_ms = unix_ms()?;
-
+async fn qualify_m14_candidate(
+    client: &Client,
+    pool: &str,
+    observation: MeteoraLiveObservation,
+    trigger_received_at_unix_ms: u64,
+) -> Result<QualifiedM14Capture, String> {
     let base_pubkeys = meteora_base_hydration_account_pubkeys(&observation)?;
     let base_payload = fetch_multiple_accounts(
         client,
@@ -422,13 +452,13 @@ fn require_v3_frozen_bin_array_plan(
     Ok(())
 }
 
-async fn fetch_account_info(client: &Client, pubkey: &str) -> Result<Value, String> {
+async fn fetch_candidate_accounts(client: &Client, pubkeys: &[String]) -> Result<Value, String> {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1401,
-        "method": "getAccountInfo",
+        "method": "getMultipleAccounts",
         "params": [
-            pubkey,
+            pubkeys,
             {
                 "commitment": "processed",
                 "encoding": "base64"
@@ -436,7 +466,7 @@ async fn fetch_account_info(client: &Client, pubkey: &str) -> Result<Value, Stri
         ]
     });
 
-    rpc_json(client, request, "Meteora M14 getAccountInfo").await
+    rpc_json(client, request, "Meteora M14 candidate batch").await
 }
 
 async fn fetch_multiple_accounts<const N: usize>(
@@ -501,12 +531,25 @@ async fn rpc_json(client: &Client, request: Value, label: &str) -> Result<Value,
                     "{label} RPC infrastructure HTTP status {status} after {attempt} attempts"
                 ));
             }
+            let retry_after = if status.as_u16() == 429 {
+                response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+            } else {
+                None
+            };
+            let retry_delay = retry_after.map_or(backoff, |server_delay| server_delay.max(backoff));
             println!(
                 "meteora_m14_rpc_retry: label={label} attempt={attempt} status={status} \
-                 backoff_ms={}",
-                backoff.as_millis()
+                 backoff_ms={} retry_after_ms={} wait_ms={}",
+                backoff.as_millis(),
+                retry_after.map_or(0, |delay| delay.as_millis()),
+                retry_delay.as_millis()
             );
-            sleep(backoff).await;
+            sleep(retry_delay).await;
             backoff = backoff.checked_mul(2).unwrap_or(Duration::from_secs(8));
             continue;
         }
@@ -534,19 +577,11 @@ fn is_rpc_infrastructure_error(error: &str) -> bool {
     error.contains("RPC infrastructure ")
 }
 
-fn observation_from_account_info(
+fn observation_from_account(
     pubkey: &str,
-    payload: &Value,
+    slot: u64,
+    account: &Value,
 ) -> Result<MeteoraLiveObservation, String> {
-    let slot = payload
-        .pointer("/result/context/slot")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "Meteora M14 getAccountInfo missing context slot".to_owned())?;
-    let account = payload
-        .pointer("/result/value")
-        .cloned()
-        .ok_or_else(|| "Meteora M14 getAccountInfo missing account".to_owned())?;
-
     if account.is_null() {
         return Err(format!("Meteora M14 pool account {pubkey} does not exist"));
     }
