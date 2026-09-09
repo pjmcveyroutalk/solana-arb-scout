@@ -506,11 +506,12 @@ fn serialize_v0_message(
     instruction_data: &[u8],
     lookup: Option<&MeteoraV0AddressTableLookup>,
 ) -> Vec<u8> {
-    let mut message = Vec::new();
-    message.push(VERSIONED_MESSAGE_V0_PREFIX);
-    message.push(required_signatures);
-    message.push(readonly_signed);
-    message.push(readonly_unsigned);
+    let mut message = vec![
+        VERSIONED_MESSAGE_V0_PREFIX,
+        required_signatures,
+        readonly_signed,
+        readonly_unsigned,
+    ];
 
     append_shortvec(&mut message, static_accounts.len());
     for account in static_accounts {
