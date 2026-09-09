@@ -925,8 +925,7 @@ mod tests {
 
     #[test]
     fn customizable_pair_honors_timestamp_activation() -> Result<(), String> {
-        let mut admission =
-            test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_TIMESTAMP, 1_000);
+        let mut admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_TIMESTAMP, 1_000);
         admission.pair_type = PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS;
         let state = trading_state(&admission, test_clock(100, 1_000))?;
 
