@@ -92,13 +92,8 @@ async fn main() -> Result<(), String> {
     for (pool, account) in bounded_candidates.iter().zip(candidate_accounts) {
         let result = match observation_from_account(pool, candidate_slot, account) {
             Ok(observation) => {
-                qualify_m14_candidate(
-                    &rpc_client,
-                    pool,
-                    observation,
-                    trigger_received_at_unix_ms,
-                )
-                .await
+                qualify_m14_candidate(&rpc_client, pool, observation, trigger_received_at_unix_ms)
+                    .await
             }
             Err(error) => Err(error),
         };
