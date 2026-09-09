@@ -33,12 +33,15 @@ const CLOCK_EPOCH_OFFSET: usize = 16;
 const CLOCK_LEADER_SCHEDULE_EPOCH_OFFSET: usize = 24;
 const CLOCK_UNIX_TIMESTAMP_OFFSET: usize = 32;
 
+const LB_PAIR_FUNCTION_TYPE_OFFSET: usize = 35;
 const LB_PAIR_PAIR_TYPE_OFFSET: usize = 75;
 const LB_PAIR_STATUS_OFFSET: usize = 82;
 const LB_PAIR_ACTIVATION_TYPE_OFFSET: usize = 86;
 const LB_PAIR_CREATOR_POOL_ON_OFF_CONTROL_OFFSET: usize = 87;
 const LB_PAIR_RESERVE_X_OFFSET: usize = 152;
 const LB_PAIR_RESERVE_Y_OFFSET: usize = 184;
+const LB_PAIR_REWARD_MINT_0_OFFSET: usize = 264;
+const LB_PAIR_REWARD_MINT_1_OFFSET: usize = 408;
 const LB_PAIR_ORACLE_OFFSET: usize = 552;
 const LB_PAIR_ACTIVATION_POINT_OFFSET: usize = 816;
 const LB_PAIR_TOKEN_X_PROGRAM_FLAG_OFFSET: usize = 880;
@@ -50,6 +53,10 @@ const PAIR_STATUS_DISABLED: u8 = 1;
 const PAIR_TYPE_PERMISSIONLESS: u8 = 0;
 const PAIR_TYPE_PERMISSION: u8 = 1;
 const PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS: u8 = 2;
+const PAIR_TYPE_PERMISSIONLESS_V2: u8 = 3;
+const FUNCTION_TYPE_UNDETERMINED: u8 = 0;
+const FUNCTION_TYPE_LIQUIDITY_MINING: u8 = 1;
+const FUNCTION_TYPE_LIMIT_ORDER: u8 = 2;
 const ACTIVATION_TYPE_SLOT: u8 = 0;
 const ACTIVATION_TYPE_TIMESTAMP: u8 = 1;
 const TOKEN_PROGRAM_FLAG_SPL: u8 = 0;
@@ -57,12 +64,15 @@ const TOKEN_PROGRAM_FLAG_2022: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeteoraLiveAdmissionState {
+    pub function_type: u8,
     pub pair_type: u8,
     pub status: u8,
     pub activation_type: u8,
     pub creator_pool_on_off_control: u8,
     pub reserve_x: [u8; 32],
     pub reserve_y: [u8; 32],
+    pub reward_mint_0: [u8; 32],
+    pub reward_mint_1: [u8; 32],
     pub oracle: [u8; 32],
     pub activation_point: u64,
     pub token_x_program_flag: u8,
@@ -409,6 +419,7 @@ fn decode_admission_state(data: &[u8]) -> Result<MeteoraLiveAdmissionState, Stri
     }
 
     let state = MeteoraLiveAdmissionState {
+        function_type: read_u8(data, LB_PAIR_FUNCTION_TYPE_OFFSET, "function_type")?,
         pair_type: read_u8(data, LB_PAIR_PAIR_TYPE_OFFSET, "pair_type")?,
         status: read_u8(data, LB_PAIR_STATUS_OFFSET, "status")?,
         activation_type: read_u8(data, LB_PAIR_ACTIVATION_TYPE_OFFSET, "activation_type")?,
@@ -419,6 +430,8 @@ fn decode_admission_state(data: &[u8]) -> Result<MeteoraLiveAdmissionState, Stri
         )?,
         reserve_x: read_array::<32>(data, LB_PAIR_RESERVE_X_OFFSET, "reserve_x")?,
         reserve_y: read_array::<32>(data, LB_PAIR_RESERVE_Y_OFFSET, "reserve_y")?,
+        reward_mint_0: read_array::<32>(data, LB_PAIR_REWARD_MINT_0_OFFSET, "reward_mint_0")?,
+        reward_mint_1: read_array::<32>(data, LB_PAIR_REWARD_MINT_1_OFFSET, "reward_mint_1")?,
         oracle: read_array::<32>(data, LB_PAIR_ORACLE_OFFSET, "oracle")?,
         activation_point: read_u64(data, LB_PAIR_ACTIVATION_POINT_OFFSET, "activation_point")?,
         token_x_program_flag: read_u8(
@@ -441,25 +454,51 @@ fn decode_admission_state(data: &[u8]) -> Result<MeteoraLiveAdmissionState, Stri
 fn validate_admission_values(state: &MeteoraLiveAdmissionState) -> Result<(), String> {
     if !matches!(
         state.pair_type,
-        PAIR_TYPE_PERMISSIONLESS | PAIR_TYPE_PERMISSION | PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS
+        PAIR_TYPE_PERMISSIONLESS
+            | PAIR_TYPE_PERMISSION
+            | PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS
+            | PAIR_TYPE_PERMISSIONLESS_V2
     ) {
         return Err(format!("unsupported Meteora pair_type {}", state.pair_type));
     }
     if !matches!(state.status, PAIR_STATUS_ENABLED | PAIR_STATUS_DISABLED) {
         return Err(format!("invalid Meteora pair status {}", state.status));
     }
-    if !matches!(
-        state.activation_type,
-        ACTIVATION_TYPE_SLOT | ACTIVATION_TYPE_TIMESTAMP
-    ) {
+    let activation_gated = matches!(
+        state.pair_type,
+        PAIR_TYPE_PERMISSION | PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS
+    );
+    if activation_gated
+        && !matches!(
+            state.activation_type,
+            ACTIVATION_TYPE_SLOT | ACTIVATION_TYPE_TIMESTAMP
+        )
+    {
         return Err(format!(
             "unsupported Meteora activation_type {}",
             state.activation_type
         ));
     }
+    if !supports_limit_order_profile(state)? {
+        return Err(format!(
+            "unsupported Meteora function profile for sealed M13 quote path: function_type={}",
+            state.function_type
+        ));
+    }
     validate_token_program_flag(state.token_x_program_flag, "token X")?;
     validate_token_program_flag(state.token_y_program_flag, "token Y")?;
     Ok(())
+}
+
+fn supports_limit_order_profile(state: &MeteoraLiveAdmissionState) -> Result<bool, String> {
+    match state.function_type {
+        FUNCTION_TYPE_LIMIT_ORDER => Ok(true),
+        FUNCTION_TYPE_LIQUIDITY_MINING => Ok(false),
+        FUNCTION_TYPE_UNDETERMINED => {
+            Ok(state.reward_mint_0 == [0_u8; 32] && state.reward_mint_1 == [0_u8; 32])
+        }
+        value => Err(format!("unsupported Meteora function_type {value}")),
+    }
 }
 
 fn validate_admission_identity(
@@ -495,8 +534,16 @@ fn verify_stable_identity(
     if snapshot.mint_y != observation.lb_pair.mint_y {
         return Err("Meteora hydration mint_y changed".to_owned());
     }
+    if admission.function_type != observation.admission.function_type {
+        return Err("Meteora hydration function_type changed".to_owned());
+    }
     if admission.pair_type != observation.admission.pair_type {
         return Err("Meteora hydration pair_type changed".to_owned());
+    }
+    if admission.reward_mint_0 != observation.admission.reward_mint_0
+        || admission.reward_mint_1 != observation.admission.reward_mint_1
+    {
+        return Err("Meteora hydration reward profile changed".to_owned());
     }
     if admission.reserve_x != observation.admission.reserve_x {
         return Err("Meteora hydration reserve_x changed".to_owned());
@@ -577,6 +624,15 @@ fn trading_state(
     if admission.status != PAIR_STATUS_ENABLED {
         return Err(format!("invalid Meteora pair status {}", admission.status));
     }
+
+    match admission.pair_type {
+        PAIR_TYPE_PERMISSIONLESS | PAIR_TYPE_PERMISSIONLESS_V2 => {
+            return Ok(PoolTradingState::Tradable);
+        }
+        PAIR_TYPE_PERMISSION | PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS => {}
+        value => return Err(format!("unsupported Meteora pair_type {value}")),
+    }
+
     if admission.activation_point == 0 {
         return Ok(PoolTradingState::Tradable);
     }
@@ -858,8 +914,9 @@ mod tests {
     }
 
     #[test]
-    fn slot_activation_is_not_tradable_before_activation() -> Result<(), String> {
-        let admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_SLOT, 101);
+    fn permission_pair_honors_slot_activation() -> Result<(), String> {
+        let mut admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_SLOT, 101);
+        admission.pair_type = PAIR_TYPE_PERMISSION;
         let state = trading_state(&admission, test_clock(100, 1_000))?;
 
         assert_eq!(state, PoolTradingState::NotYetOpen);
@@ -867,12 +924,70 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_activation_becomes_tradable_at_activation() -> Result<(), String> {
-        let admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_TIMESTAMP, 1_000);
+    fn customizable_pair_honors_timestamp_activation() -> Result<(), String> {
+        let mut admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_TIMESTAMP, 1_000);
+        admission.pair_type = PAIR_TYPE_CUSTOMIZABLE_PERMISSIONLESS;
         let state = trading_state(&admission, test_clock(100, 1_000))?;
 
         assert_eq!(state, PoolTradingState::Tradable);
         Ok(())
+    }
+
+    #[test]
+    fn permissionless_pair_ignores_future_activation_point() -> Result<(), String> {
+        let admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_SLOT, 101);
+        let state = trading_state(&admission, test_clock(100, 1_000))?;
+
+        assert_eq!(state, PoolTradingState::Tradable);
+        Ok(())
+    }
+
+    #[test]
+    fn permissionless_v2_ignores_activation_point() -> Result<(), String> {
+        let mut admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_SLOT, 101);
+        admission.pair_type = PAIR_TYPE_PERMISSIONLESS_V2;
+
+        validate_admission_values(&admission)?;
+        let state = trading_state(&admission, test_clock(100, 1_000))?;
+
+        assert_eq!(state, PoolTradingState::Tradable);
+        Ok(())
+    }
+
+    #[test]
+    fn function_profile_matches_pinned_v0_12_limit_order_rules() -> Result<(), String> {
+        let mut admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_SLOT, 0);
+
+        admission.function_type = FUNCTION_TYPE_LIMIT_ORDER;
+        admission.reward_mint_0 = [7_u8; 32];
+        admission.reward_mint_1 = [8_u8; 32];
+        assert!(supports_limit_order_profile(&admission)?);
+
+        admission.function_type = FUNCTION_TYPE_LIQUIDITY_MINING;
+        assert!(!supports_limit_order_profile(&admission)?);
+
+        admission.function_type = FUNCTION_TYPE_UNDETERMINED;
+        admission.reward_mint_0 = [0_u8; 32];
+        admission.reward_mint_1 = [0_u8; 32];
+        assert!(supports_limit_order_profile(&admission)?);
+
+        admission.reward_mint_1 = [9_u8; 32];
+        assert!(!supports_limit_order_profile(&admission)?);
+
+        admission.function_type = 3;
+        assert!(supports_limit_order_profile(&admission).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn admission_rejects_unknown_pair_type() {
+        let mut admission = test_admission(PAIR_STATUS_ENABLED, ACTIVATION_TYPE_SLOT, 0);
+        admission.pair_type = 4;
+
+        assert!(matches!(
+            validate_admission_values(&admission),
+            Err(error) if error.contains("unsupported Meteora pair_type 4")
+        ));
     }
 
     #[test]
@@ -894,12 +1009,15 @@ mod tests {
         activation_point: u64,
     ) -> MeteoraLiveAdmissionState {
         MeteoraLiveAdmissionState {
+            function_type: FUNCTION_TYPE_LIMIT_ORDER,
             pair_type: PAIR_TYPE_PERMISSIONLESS,
             status,
             activation_type,
             creator_pool_on_off_control: 0,
             reserve_x: [1_u8; 32],
             reserve_y: [2_u8; 32],
+            reward_mint_0: [0_u8; 32],
+            reward_mint_1: [0_u8; 32],
             oracle: [3_u8; 32],
             activation_point,
             token_x_program_flag: TOKEN_PROGRAM_FLAG_SPL,
