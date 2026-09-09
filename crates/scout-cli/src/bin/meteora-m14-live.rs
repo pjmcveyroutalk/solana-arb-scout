@@ -74,9 +74,8 @@ async fn main() -> Result<(), String> {
     let mut examined_count = 0usize;
     let mut qualified = None;
 
-    'candidate_batches: for (batch_index, candidate_batch) in bounded_candidates
-        .chunks(CANDIDATE_BATCH_SIZE)
-        .enumerate()
+    'candidate_batches: for (batch_index, candidate_batch) in
+        bounded_candidates.chunks(CANDIDATE_BATCH_SIZE).enumerate()
     {
         let candidate_payload = fetch_candidate_accounts(&rpc_client, candidate_batch).await?;
         let candidate_slot = candidate_payload
