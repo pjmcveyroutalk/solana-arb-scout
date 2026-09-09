@@ -172,4 +172,3 @@ jobs:
         run: |
           set -euo pipefail
           timeout 240s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-priority-live
-
