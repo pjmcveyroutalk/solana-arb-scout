@@ -1,4 +1,4 @@
-use crate::meteora_m13::MeteoraM13PreparedQuote;
+use scout_cli::meteora_m13::MeteoraM13PreparedQuote;
 use crate::pumpswap::{self, PumpSwapHydrationSnapshot};
 use crate::raydium::{self, RaydiumHydrationSnapshot};
 use crate::route::{RouteLeg, TwoLegRouteCandidate};
