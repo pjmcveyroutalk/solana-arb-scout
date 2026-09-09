@@ -403,23 +403,57 @@ fn validate_duplicate_account_construction(
         .chain(remaining_accounts.iter())
         .copied()
         .collect();
-    let dlmm_program = METEORA_DLMM_PROGRAM_PUBKEY.to_bytes();
 
     for left in 0..ordered.len() {
         for right in (left + 1)..ordered.len() {
             if ordered[left].pubkey != ordered[right].pubkey {
                 continue;
             }
-            if ordered[left].pubkey == dlmm_program {
-                continue;
-            }
-            if !ordered[left].is_writable && !ordered[right].is_writable {
+            if duplicate_account_pair_is_intentional(ordered[left], ordered[right]) {
                 continue;
             }
             return Err(MeteoraDlmmFailure::InvalidLayout);
         }
     }
     Ok(())
+}
+
+fn duplicate_account_pair_is_intentional(
+    left: MeteoraPlannedAccount,
+    right: MeteoraPlannedAccount,
+) -> bool {
+    let token_program_pair = matches!(
+        (left.kind, right.kind),
+        (
+            MeteoraExecutionAccountKind::TokenXProgram,
+            MeteoraExecutionAccountKind::TokenYProgram,
+        ) | (
+            MeteoraExecutionAccountKind::TokenYProgram,
+            MeteoraExecutionAccountKind::TokenXProgram,
+        )
+    );
+    if token_program_pair {
+        return true;
+    }
+
+    if left.pubkey != METEORA_DLMM_PROGRAM_PUBKEY.to_bytes() {
+        return false;
+    }
+
+    let left_is_sentinel = matches!(
+        left.kind,
+        MeteoraExecutionAccountKind::BinArrayBitmapExtension
+            | MeteoraExecutionAccountKind::HostFeeIn
+            | MeteoraExecutionAccountKind::Program
+    ) && left.provenance == MeteoraAccountProvenance::Derived;
+    let right_is_sentinel = matches!(
+        right.kind,
+        MeteoraExecutionAccountKind::BinArrayBitmapExtension
+            | MeteoraExecutionAccountKind::HostFeeIn
+            | MeteoraExecutionAccountKind::Program
+    ) && right.provenance == MeteoraAccountProvenance::Derived;
+
+    left_is_sentinel && right_is_sentinel
 }
 
 fn build_contention_writable_accounts(
@@ -643,6 +677,36 @@ mod tests {
     }
 
     #[test]
+    fn execution_provided_dlmm_program_collision_fails_closed() -> Result<(), MeteoraDlmmFailure> {
+        let snapshot = test_snapshot(&[0], false, source(106, 11))?;
+        let hydration = hydration_plan(&[0], source(106, 11), false)?;
+        let quote = executable_quote(vec![0]);
+        let mut provided = provided_accounts();
+        provided.oracle = METEORA_DLMM_PROGRAM_PUBKEY.to_bytes();
+
+        assert_eq!(
+            meteora_execution_account_plan(&snapshot, &hydration, &quote, false, provided, &[],),
+            Err(MeteoraDlmmFailure::InvalidLayout)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unexpected_readonly_duplicate_fails_closed() -> Result<(), MeteoraDlmmFailure> {
+        let snapshot = test_snapshot(&[0], false, source(107, 12))?;
+        let hydration = hydration_plan(&[0], source(107, 12), false)?;
+        let quote = executable_quote(vec![0]);
+        let mut provided = provided_accounts();
+        provided.user = SPL_TOKEN_PROGRAM_PUBKEY.to_bytes();
+
+        assert_eq!(
+            meteora_execution_account_plan(&snapshot, &hydration, &quote, false, provided, &[],),
+            Err(MeteoraDlmmFailure::InvalidLayout)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn contention_is_unique_and_excludes_program_sentinels() -> Result<(), MeteoraDlmmFailure> {
         let snapshot = test_snapshot(&[0], false, source(106, 11))?;
         let hydration = hydration_plan(&[0], source(106, 11), false)?;
@@ -823,3 +887,4 @@ mod tests {
         }
     }
 }
+
