@@ -208,20 +208,6 @@ fn build_fixed_accounts(
             MeteoraAccountProvenance::ExecutionProvided,
         ),
         planned_account(
-            MeteoraExecutionAccountKind::UserTokenIn,
-            provided.user_token_in,
-            false,
-            true,
-            MeteoraAccountProvenance::ExecutionProvided,
-        ),
-        planned_account(
-            MeteoraExecutionAccountKind::UserTokenOut,
-            provided.user_token_out,
-            false,
-            true,
-            MeteoraAccountProvenance::ExecutionProvided,
-        ),
-        planned_account(
             MeteoraExecutionAccountKind::TokenXMint,
             snapshot.mint_x(),
             false,
@@ -234,27 +220,6 @@ fn build_fixed_accounts(
             false,
             false,
             MeteoraAccountProvenance::HydratedValidated,
-        ),
-        planned_account(
-            MeteoraExecutionAccountKind::Oracle,
-            provided.oracle,
-            false,
-            true,
-            MeteoraAccountProvenance::ExecutionProvided,
-        ),
-        planned_account(
-            MeteoraExecutionAccountKind::HostFeeIn,
-            dlmm_program,
-            false,
-            true,
-            MeteoraAccountProvenance::Derived,
-        ),
-        planned_account(
-            MeteoraExecutionAccountKind::User,
-            provided.user,
-            true,
-            false,
-            MeteoraAccountProvenance::ExecutionProvided,
         ),
         planned_account(
             MeteoraExecutionAccountKind::TokenXProgram,
@@ -271,10 +236,38 @@ fn build_fixed_accounts(
             MeteoraAccountProvenance::ExecutionProvided,
         ),
         planned_account(
-            MeteoraExecutionAccountKind::MemoProgram,
-            SPL_MEMO_PROGRAM_PUBKEY.to_bytes(),
+            MeteoraExecutionAccountKind::User,
+            provided.user,
+            true,
             false,
+            MeteoraAccountProvenance::ExecutionProvided,
+        ),
+        planned_account(
+            MeteoraExecutionAccountKind::UserTokenIn,
+            provided.user_token_in,
             false,
+            true,
+            MeteoraAccountProvenance::ExecutionProvided,
+        ),
+        planned_account(
+            MeteoraExecutionAccountKind::UserTokenOut,
+            provided.user_token_out,
+            false,
+            true,
+            MeteoraAccountProvenance::ExecutionProvided,
+        ),
+        planned_account(
+            MeteoraExecutionAccountKind::Oracle,
+            provided.oracle,
+            false,
+            true,
+            MeteoraAccountProvenance::ExecutionProvided,
+        ),
+        planned_account(
+            MeteoraExecutionAccountKind::HostFeeIn,
+            dlmm_program,
+            false,
+            true,
             MeteoraAccountProvenance::Derived,
         ),
         planned_account(
@@ -287,6 +280,13 @@ fn build_fixed_accounts(
         planned_account(
             MeteoraExecutionAccountKind::Program,
             dlmm_program,
+            false,
+            false,
+            MeteoraAccountProvenance::Derived,
+        ),
+        planned_account(
+            MeteoraExecutionAccountKind::MemoProgram,
+            SPL_MEMO_PROGRAM_PUBKEY.to_bytes(),
             false,
             false,
             MeteoraAccountProvenance::Derived,
@@ -511,18 +511,18 @@ mod tests {
                 MeteoraExecutionAccountKind::BinArrayBitmapExtension,
                 MeteoraExecutionAccountKind::ReserveX,
                 MeteoraExecutionAccountKind::ReserveY,
-                MeteoraExecutionAccountKind::UserTokenIn,
-                MeteoraExecutionAccountKind::UserTokenOut,
                 MeteoraExecutionAccountKind::TokenXMint,
                 MeteoraExecutionAccountKind::TokenYMint,
-                MeteoraExecutionAccountKind::Oracle,
-                MeteoraExecutionAccountKind::HostFeeIn,
-                MeteoraExecutionAccountKind::User,
                 MeteoraExecutionAccountKind::TokenXProgram,
                 MeteoraExecutionAccountKind::TokenYProgram,
-                MeteoraExecutionAccountKind::MemoProgram,
+                MeteoraExecutionAccountKind::User,
+                MeteoraExecutionAccountKind::UserTokenIn,
+                MeteoraExecutionAccountKind::UserTokenOut,
+                MeteoraExecutionAccountKind::Oracle,
+                MeteoraExecutionAccountKind::HostFeeIn,
                 MeteoraExecutionAccountKind::EventAuthority,
                 MeteoraExecutionAccountKind::Program,
+                MeteoraExecutionAccountKind::MemoProgram,
             ]
         );
         assert_eq!(
@@ -530,7 +530,7 @@ mod tests {
             METEORA_DLMM_PROGRAM_PUBKEY.to_bytes()
         );
         assert_eq!(
-            plan.fixed_accounts[9].pubkey,
+            plan.fixed_accounts[12].pubkey,
             METEORA_DLMM_PROGRAM_PUBKEY.to_bytes()
         );
         Ok(())
