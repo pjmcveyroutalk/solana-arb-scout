@@ -163,6 +163,24 @@ pub struct QuoteReadiness {
 }
 
 impl QuoteReadiness {
+    pub(crate) fn from_validated_source(
+        pool: &NormalizedPoolState,
+        source_slot: u64,
+        capabilities: AdapterCapabilities,
+    ) -> Result<Self, String> {
+        let readiness = Self {
+            venue: pool.venue,
+            pool_id: pool.pool_id.clone(),
+            token_a_mint: pool.token_a.mint.clone(),
+            token_b_mint: pool.token_b.mint.clone(),
+            source_slot,
+            capabilities,
+        };
+
+        readiness.validate_for_pool(pool)?;
+        Ok(readiness)
+    }
+
     pub(crate) fn validate_for_pool(&self, pool: &NormalizedPoolState) -> Result<(), String> {
         if pool.trading_state != PoolTradingState::Tradable {
             return Err(format!(
@@ -1005,17 +1023,7 @@ pub fn quote_readiness_for_pool(
             }
         }
 
-        let readiness = QuoteReadiness {
-            venue: pool.venue,
-            pool_id: pool.pool_id.clone(),
-            token_a_mint: pool.token_a.mint.clone(),
-            token_b_mint: pool.token_b.mint.clone(),
-            source_slot: adapter.source_slot(),
-            capabilities,
-        };
-
-        readiness.validate_for_pool(pool)?;
-        Ok(readiness)
+        QuoteReadiness::from_validated_source(pool, adapter.source_slot(), capabilities)
     })
 }
 
