@@ -172,3 +172,45 @@ jobs:
         run: |
           set -euo pipefail
           timeout 240s rustup run 1.80.0 cargo run --locked -p scout-cli --bin orca-priority-live
+  meteora-m14-live:
+    name: Meteora M14 Frozen Mainnet Differential
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Scout Rust 1.80
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.80.0 --profile minimal
+
+      - name: Capture frozen Meteora M14 evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 180s rustup run 1.80.0 cargo run --locked -p scout-cli --bin meteora-m14-live
+
+      - name: Validate Meteora M14 reference runner syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/meteora-m14-reference.sh
+
+      - name: Run pinned Meteora differential reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600s bash scripts/meteora-m14-reference.sh artifacts/m14-meteora/frozen-mainnet.json
+
+      - name: Upload Meteora M14 frozen evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meteora-m14-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/m14-meteora/frozen-mainnet.json
+          if-no-files-found: error
+          retention-days: 14
