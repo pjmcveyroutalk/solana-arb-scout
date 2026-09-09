@@ -256,7 +256,10 @@ mod tests {
         assert_eq!(capabilities.token_2022, CapabilityState::RequiresHydration);
         assert_eq!(capabilities.transfer_fee, CapabilityState::Unsupported);
         assert_eq!(capabilities.auxiliary_state, AuxiliaryStateKind::Bins);
-        assert_eq!(capabilities.contention_footprint, ContentionFootprintState::Incomplete);
+        assert_eq!(
+            capabilities.contention_footprint,
+            ContentionFootprintState::Incomplete
+        );
     }
 
     #[test]
