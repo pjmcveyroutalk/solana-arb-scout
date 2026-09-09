@@ -6,14 +6,40 @@ use crate::quote::{
 };
 use crate::raydium;
 use crate::route::{RouteLeg, TwoLegRouteCandidate};
+use scout_cli::meteora::MeteoraDlmmSnapshot;
+use scout_cli::meteora_m13::MeteoraM13PreparedQuote;
 use scout_core::{NormalizedPoolState, Venue};
 use std::collections::BTreeMap;
+
+#[derive(Debug)]
+pub struct MeteoraRuntimeQuoteState {
+    pub normalized: NormalizedPoolState,
+    pub snapshot: MeteoraDlmmSnapshot,
+}
 
 pub fn readiness_for_pool(
     pool: &NormalizedPoolState,
     raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
     orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
+) -> Option<QuoteReadiness> {
+    let meteora_runtime = BTreeMap::new();
+
+    readiness_for_pool_with_meteora(
+        pool,
+        raydium_quote_contexts,
+        pumpswap_quote_contexts,
+        orca_prepared,
+        &meteora_runtime,
+    )
+}
+
+pub fn readiness_for_pool_with_meteora(
+    pool: &NormalizedPoolState,
+    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
+    meteora_runtime: &BTreeMap<String, MeteoraRuntimeQuoteState>,
 ) -> Option<QuoteReadiness> {
     let result = match pool.venue {
         Venue::RaydiumCpmm => {
@@ -66,8 +92,33 @@ pub fn readiness_for_pool(
             };
         }
         Venue::Meteora => {
-            log_missing(pool, "Meteora runtime quote path is not enabled");
-            return None;
+            let runtime = match meteora_runtime.get(&pool.pool_id) {
+                Some(runtime) => runtime,
+                None => {
+                    log_missing(pool, "missing prepared Meteora runtime state");
+                    return None;
+                }
+            };
+
+            let prepared = match MeteoraM13PreparedQuote::from_snapshot(pool, &runtime.snapshot) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    log_missing(pool, &error);
+                    return None;
+                }
+            };
+
+            return match QuoteReadiness::from_validated_source(
+                pool,
+                prepared.source_slot(),
+                prepared.capabilities(),
+            ) {
+                Ok(readiness) => Some(readiness),
+                Err(error) => {
+                    log_missing(pool, &error);
+                    None
+                }
+            };
         }
     };
 
@@ -87,17 +138,39 @@ pub fn quote_route_exact_input(
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
     orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
 ) -> Result<TwoLegRouteQuote, String> {
+    let meteora_runtime = BTreeMap::new();
+
+    quote_route_exact_input_with_meteora(
+        route,
+        amount_in_raw,
+        raydium_quote_contexts,
+        pumpswap_quote_contexts,
+        orca_prepared,
+        &meteora_runtime,
+    )
+}
+
+pub fn quote_route_exact_input_with_meteora(
+    route: &TwoLegRouteCandidate,
+    amount_in_raw: u64,
+    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
+    meteora_runtime: &BTreeMap<String, MeteoraRuntimeQuoteState>,
+) -> Result<TwoLegRouteQuote, String> {
     with_leg_adapter(
         route.leg_1(),
         raydium_quote_contexts,
         pumpswap_quote_contexts,
         orca_prepared,
+        meteora_runtime,
         |leg_1_adapter| {
             with_leg_adapter(
                 route.leg_2(),
                 raydium_quote_contexts,
                 pumpswap_quote_contexts,
                 orca_prepared,
+                meteora_runtime,
                 |leg_2_adapter| {
                     quote_two_leg_exact_input(route, amount_in_raw, leg_1_adapter, leg_2_adapter)
                 },
@@ -139,6 +212,7 @@ fn with_leg_adapter<T>(
     raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
     orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
+    meteora_runtime: &BTreeMap<String, MeteoraRuntimeQuoteState>,
     operation: impl FnOnce(&dyn ExactInputQuoteAdapter) -> Result<T, String>,
 ) -> Result<T, String> {
     match leg.venue() {
@@ -177,10 +251,17 @@ fn with_leg_adapter<T>(
             })?;
             operation(&prepared.quote_snapshot)
         }
-        Venue::Meteora => Err(format!(
-            "Meteora runtime quote path is not enabled for route pool {}",
-            leg.pool_id()
-        )),
+        Venue::Meteora => {
+            let runtime = meteora_runtime.get(leg.pool_id()).ok_or_else(|| {
+                format!(
+                    "missing prepared Meteora runtime state for route pool {}",
+                    leg.pool_id()
+                )
+            })?;
+            let prepared =
+                MeteoraM13PreparedQuote::from_snapshot(&runtime.normalized, &runtime.snapshot)?;
+            operation(&prepared)
+        }
     }
 }
 

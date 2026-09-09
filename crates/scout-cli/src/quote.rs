@@ -5,6 +5,7 @@ use orca_whirlpools_core::{
     swap_quote_by_input_token, ExactInSwapQuote, OracleFacade, TickArrayFacade, TickArrays,
     TransferFee, WhirlpoolFacade,
 };
+use scout_cli::meteora_m13::MeteoraM13PreparedQuote;
 use scout_core::{
     AdapterCapabilities, AuxiliaryStateKind, CapabilityState, ContentionFootprintState,
     LiquidityModel, NormalizedPoolState, PoolTradingState, QuoteReserveState, Venue,
@@ -27,6 +28,12 @@ pub enum VenueFeeComponents {
         trade_fee_raw: u64,
         trade_fee_rate_min: u32,
         trade_fee_rate_max: u32,
+    },
+    Meteora {
+        trading_fee_raw: u64,
+        protocol_fee_raw: u64,
+        user_fee_raw: u64,
+        fee_on_input: bool,
     },
 }
 
@@ -57,6 +64,15 @@ impl VenueFeeComponents {
             } => format!(
                 "trade_fee_raw={trade_fee_raw} trade_fee_rate_min={trade_fee_rate_min} \
                  trade_fee_rate_max={trade_fee_rate_max}"
+            ),
+            Self::Meteora {
+                trading_fee_raw,
+                protocol_fee_raw,
+                user_fee_raw,
+                fee_on_input,
+            } => format!(
+                "trading_fee_raw={trading_fee_raw} protocol_fee_raw={protocol_fee_raw} \
+                 user_fee_raw={user_fee_raw} fee_on_input={fee_on_input}"
             ),
         }
     }
@@ -147,6 +163,24 @@ pub struct QuoteReadiness {
 }
 
 impl QuoteReadiness {
+    pub(crate) fn from_validated_source(
+        pool: &NormalizedPoolState,
+        source_slot: u64,
+        capabilities: AdapterCapabilities,
+    ) -> Result<Self, String> {
+        let readiness = Self {
+            venue: pool.venue,
+            pool_id: pool.pool_id.clone(),
+            token_a_mint: pool.token_a.mint.clone(),
+            token_b_mint: pool.token_b.mint.clone(),
+            source_slot,
+            capabilities,
+        };
+
+        readiness.validate_for_pool(pool)?;
+        Ok(readiness)
+    }
+
     pub(crate) fn validate_for_pool(&self, pool: &NormalizedPoolState) -> Result<(), String> {
         if pool.trading_state != PoolTradingState::Tradable {
             return Err(format!(
@@ -697,6 +731,57 @@ impl ExactInputQuoteAdapter for VenueQuoteContext<'_> {
     }
 }
 
+impl ExactInputQuoteAdapter for MeteoraM13PreparedQuote<'_> {
+    fn venue(&self) -> Venue {
+        Venue::Meteora
+    }
+
+    fn pool_id(&self) -> &str {
+        MeteoraM13PreparedQuote::pool_id(self)
+    }
+
+    fn source_slot(&self) -> u64 {
+        MeteoraM13PreparedQuote::source_slot(self)
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        MeteoraM13PreparedQuote::capabilities(self)
+    }
+
+    fn contains_pair(&self, input_mint: &str, output_mint: &str) -> bool {
+        MeteoraM13PreparedQuote::contains_pair(self, input_mint, output_mint)
+    }
+
+    #[cfg(test)]
+    fn mint_decimals(&self, mint: &str) -> Result<u8, String> {
+        MeteoraM13PreparedQuote::mint_decimals(self, mint)
+    }
+
+    fn quote_exact_input(
+        &self,
+        input_mint: &str,
+        amount_in_raw: u64,
+    ) -> Result<VenueLegQuote, String> {
+        let quote = MeteoraM13PreparedQuote::quote_exact_input(self, input_mint, amount_in_raw)?;
+
+        Ok(VenueLegQuote {
+            venue: Venue::Meteora,
+            pool_id: MeteoraM13PreparedQuote::pool_id(self).to_owned(),
+            amount_in_requested_raw: quote.requested_input_raw,
+            amount_in_consumed_raw: quote.consumed_input_raw,
+            amount_in_unspent_raw: quote.unspent_input_raw,
+            amount_out_raw: quote.amount_out_raw,
+            fees: VenueFeeComponents::Meteora {
+                trading_fee_raw: quote.trading_fee_raw,
+                protocol_fee_raw: quote.protocol_fee_raw,
+                user_fee_raw: quote.user_fee_raw,
+                fee_on_input: quote.fee_on_input,
+            },
+            quote_source_slot: quote.source_slot,
+        })
+    }
+}
+
 #[allow(dead_code)]
 impl ExactInputQuoteAdapter for OrcaQuoteSnapshot {
     fn venue(&self) -> Venue {
@@ -938,17 +1023,7 @@ pub fn quote_readiness_for_pool(
             }
         }
 
-        let readiness = QuoteReadiness {
-            venue: pool.venue,
-            pool_id: pool.pool_id.clone(),
-            token_a_mint: pool.token_a.mint.clone(),
-            token_b_mint: pool.token_b.mint.clone(),
-            source_slot: adapter.source_slot(),
-            capabilities,
-        };
-
-        readiness.validate_for_pool(pool)?;
-        Ok(readiness)
+        QuoteReadiness::from_validated_source(pool, adapter.source_slot(), capabilities)
     })
 }
 
