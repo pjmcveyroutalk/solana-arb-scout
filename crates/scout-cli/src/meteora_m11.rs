@@ -100,12 +100,8 @@ pub fn meteora_execution_account_plan(
     validate_snapshot_and_hydration(snapshot, hydration_plan, swap_for_y)?;
     validate_execution_provided_accounts(snapshot, provided)?;
 
-    let remaining_accounts = build_remaining_accounts(
-        snapshot,
-        hydration_plan,
-        quote,
-        execution_buffer_indexes,
-    )?;
+    let remaining_accounts =
+        build_remaining_accounts(snapshot, hydration_plan, quote, execution_buffer_indexes)?;
     let fixed_accounts = build_fixed_accounts(snapshot, provided);
 
     validate_duplicate_account_construction(&fixed_accounts, &remaining_accounts)?;
@@ -335,7 +331,12 @@ fn build_remaining_accounts(
     }
 
     let mut remaining_accounts = Vec::with_capacity(selected_count);
-    for (position, target) in hydration_plan.targets.iter().take(selected_count).enumerate() {
+    for (position, target) in hydration_plan
+        .targets
+        .iter()
+        .take(selected_count)
+        .enumerate()
+    {
         let hydrated = snapshot
             .bin_array_by_index(target.index)?
             .ok_or(MeteoraDlmmFailure::InsufficientHydration)?;
@@ -465,10 +466,8 @@ fn derive_bitmap_extension(lb_pair: [u8; 32]) -> ([u8; 32], u8) {
 }
 
 fn derive_event_authority() -> ([u8; 32], u8) {
-    let (pubkey, bump) = Pubkey::find_program_address(
-        &[EVENT_AUTHORITY_SEED],
-        &METEORA_DLMM_PROGRAM_PUBKEY,
-    );
+    let (pubkey, bump) =
+        Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &METEORA_DLMM_PROGRAM_PUBKEY);
     (pubkey.to_bytes(), bump)
 }
 
@@ -493,17 +492,14 @@ mod tests {
         let quote = executable_quote(vec![0]);
         let provided = provided_accounts();
 
-        let plan = meteora_execution_account_plan(
-            &snapshot,
-            &hydration,
-            &quote,
-            false,
-            provided,
-            &[],
-        )?;
+        let plan =
+            meteora_execution_account_plan(&snapshot, &hydration, &quote, false, provided, &[])?;
 
-        let kinds: Vec<MeteoraExecutionAccountKind> =
-            plan.fixed_accounts.iter().map(|account| account.kind).collect();
+        let kinds: Vec<MeteoraExecutionAccountKind> = plan
+            .fixed_accounts
+            .iter()
+            .map(|account| account.kind)
+            .collect();
         assert_eq!(
             kinds,
             vec![
@@ -551,7 +547,10 @@ mod tests {
             &[],
         )?;
 
-        assert_eq!(plan.fixed_accounts[1].pubkey, derive_bitmap_extension(LB_PAIR).0);
+        assert_eq!(
+            plan.fixed_accounts[1].pubkey,
+            derive_bitmap_extension(LB_PAIR).0
+        );
         assert_eq!(
             plan.fixed_accounts[1].provenance,
             MeteoraAccountProvenance::HydratedValidated
@@ -637,14 +636,7 @@ mod tests {
         provided.oracle = provided.reserve_x;
 
         assert_eq!(
-            meteora_execution_account_plan(
-                &snapshot,
-                &hydration,
-                &quote,
-                false,
-                provided,
-                &[],
-            ),
+            meteora_execution_account_plan(&snapshot, &hydration, &quote, false, provided, &[],),
             Err(MeteoraDlmmFailure::InvalidLayout)
         );
         Ok(())
