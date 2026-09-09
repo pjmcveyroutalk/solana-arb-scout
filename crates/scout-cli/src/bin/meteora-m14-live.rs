@@ -68,8 +68,7 @@ async fn main() -> Result<(), String> {
 
     let base_source_slot = base.snapshot.source().source_slot;
     let bin_array_pubkeys = bounded_directional_bin_array_pubkeys(&base.snapshot)?;
-    let final_pubkeys =
-        meteora_quote_hydration_account_pubkeys(&observation, &bin_array_pubkeys)?;
+    let final_pubkeys = meteora_quote_hydration_account_pubkeys(&observation, &bin_array_pubkeys)?;
 
     let frozen_payload = fetch_multiple_accounts_slice(
         &rpc_client,
