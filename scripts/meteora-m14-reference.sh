@@ -6,6 +6,7 @@ readonly SDK_REPOSITORY="https://github.com/MeteoraAg/dlmm-sdk.git"
 readonly SDK_COMMIT="576919e3e4368e542c402f000b4264724f7f23ec"
 readonly SDK_TOOLCHAIN="1.85.0"
 readonly SPL_TOKEN_PROGRAM_ID="TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+readonly TOKEN_2022_PROGRAM_ID="TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 readonly DLMM_PROGRAM_ID="LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
 readonly SYSVAR_OWNER_ID="Sysvar1111111111111111111111111111111111111"
 
@@ -28,7 +29,8 @@ readonly MANIFEST_PATH="${WORK_DIR}/reference-input.json"
 readonly REFERENCE_OUTPUT="${WORK_DIR}/reference-output.log"
 
 python3 - "$FIXTURE_PATH" "$WORK_DIR" "$MANIFEST_PATH" \
-  "$SDK_COMMIT" "$SPL_TOKEN_PROGRAM_ID" "$DLMM_PROGRAM_ID" "$SYSVAR_OWNER_ID" <<'PY'
+  "$SDK_COMMIT" "$SPL_TOKEN_PROGRAM_ID" "$TOKEN_2022_PROGRAM_ID" \
+  "$DLMM_PROGRAM_ID" "$SYSVAR_OWNER_ID" <<'PY'
 import base64
 import json
 import pathlib
@@ -39,8 +41,9 @@ work_dir = pathlib.Path(sys.argv[2])
 manifest_path = pathlib.Path(sys.argv[3])
 expected_commit = sys.argv[4]
 spl_token_program = sys.argv[5]
-dlmm_program = sys.argv[6]
-sysvar_owner = sys.argv[7]
+token_2022_program = sys.argv[6]
+dlmm_program = sys.argv[7]
+sysvar_owner = sys.argv[8]
 
 fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
 
@@ -55,8 +58,12 @@ require(reference.get("commit") == expected_commit, "fixture reference commit mi
 require(reference.get("function") == "commons::quote::quote_exact_in", "fixture reference function mismatch")
 require(reference.get("rust_toolchain") == "1.85.0", "fixture reference toolchain mismatch")
 require(fixture.get("scout_toolchain") == "1.80.0", "fixture Scout toolchain mismatch")
-require(fixture.get("token_x_program") == spl_token_program, "token X is not legacy SPL Token")
-require(fixture.get("token_y_program") == spl_token_program, "token Y is not legacy SPL Token")
+
+supported_token_programs = {spl_token_program, token_2022_program}
+token_x_program = fixture.get("token_x_program")
+token_y_program = fixture.get("token_y_program")
+require(token_x_program in supported_token_programs, "token X is outside Scout-admitted token programs")
+require(token_y_program in supported_token_programs, "token Y is outside Scout-admitted token programs")
 
 payload = fixture.get("frozen_rpc_payload") or {}
 result = payload.get("result") or {}
@@ -108,8 +115,8 @@ for index, (pubkey, account) in enumerate(zip(pubkeys, accounts)):
     })
 
 require(processed[0]["account"]["owner"] == dlmm_program, "LB pair owner mismatch")
-require(processed[1]["account"]["owner"] == spl_token_program, "mint X owner mismatch")
-require(processed[2]["account"]["owner"] == spl_token_program, "mint Y owner mismatch")
+require(processed[1]["account"]["owner"] == token_x_program, "mint X owner/program mismatch")
+require(processed[2]["account"]["owner"] == token_y_program, "mint Y owner/program mismatch")
 require(processed[3]["account"]["owner"] == sysvar_owner, "Clock owner mismatch")
 if processed[4]["account"] is not None:
     require(processed[4]["account"]["owner"] == dlmm_program, "bitmap extension owner mismatch")
@@ -122,6 +129,8 @@ manifest = {
     "quote_amount_raw": fixture["quote_amount_raw"],
     "mint_x": fixture["mint_x"],
     "mint_y": fixture["mint_y"],
+    "token_x_program": token_x_program,
+    "token_y_program": token_y_program,
     "bin_array_pubkeys": bin_pubkeys,
     "accounts": processed,
 }
@@ -153,6 +162,9 @@ use std::env;
 use std::fs;
 use std::str::FromStr;
 
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
 fn main() -> anyhow::Result<()> {
     let manifest_path = env::args()
         .nth(1)
@@ -162,6 +174,8 @@ fn main() -> anyhow::Result<()> {
     let pool = parse_pubkey(required_str(&manifest, "pool")?)?;
     let mint_x = parse_pubkey(required_str(&manifest, "mint_x")?)?;
     let mint_y = parse_pubkey(required_str(&manifest, "mint_y")?)?;
+    let token_x_program = parse_pubkey(required_str(&manifest, "token_x_program")?)?;
+    let token_y_program = parse_pubkey(required_str(&manifest, "token_y_program")?)?;
     let quote_amount_raw = required_u64(&manifest, "quote_amount_raw")?;
     let accounts = manifest["accounts"]
         .as_array()
@@ -175,16 +189,27 @@ fn main() -> anyhow::Result<()> {
     anyhow::ensure!(lb_pair.token_x_mint == mint_x, "LB pair mint X mismatch");
     anyhow::ensure!(lb_pair.token_y_mint == mint_y, "LB pair mint Y mismatch");
 
+    let spl_token_program = parse_pubkey(SPL_TOKEN_PROGRAM_ID)?;
+    let token_2022_program = parse_pubkey(TOKEN_2022_PROGRAM_ID)?;
+    anyhow::ensure!(
+        token_x_program == spl_token_program || token_x_program == token_2022_program,
+        "token X program is outside Scout-admitted token programs"
+    );
+    anyhow::ensure!(
+        token_y_program == spl_token_program || token_y_program == token_2022_program,
+        "token Y program is outside Scout-admitted token programs"
+    );
+
     let mint_x_account = account_at(accounts, 1)?;
     let mint_y_account = account_at(accounts, 2)?;
     let clock_account = account_at(accounts, 3)?;
     anyhow::ensure!(
-        mint_x_account.owner == anchor_spl::token::spl_token::ID,
-        "mint X is not legacy SPL Token"
+        mint_x_account.owner == token_x_program,
+        "mint X owner/program mismatch"
     );
     anyhow::ensure!(
-        mint_y_account.owner == anchor_spl::token::spl_token::ID,
-        "mint Y is not legacy SPL Token"
+        mint_y_account.owner == token_y_program,
+        "mint Y owner/program mismatch"
     );
     let clock: Clock = bincode::deserialize(clock_account.data.as_ref())?;
 
