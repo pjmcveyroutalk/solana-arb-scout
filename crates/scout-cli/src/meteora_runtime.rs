@@ -588,4 +588,3 @@ mod tests {
         bitmap[word_index] |= 1_u64 << bit_index;
     }
 }
-
