@@ -6,7 +6,8 @@ use reqwest::Client;
 use scout_cli::meteora::{
     bin_array_bitmap_bit, bin_id_to_bin_array_index, derive_bin_array_pda,
     MeteoraBitmapExtensionState, MeteoraDlmmSnapshot, MeteoraInternalBitmap, BIN_ARRAY_MAX_INDEX,
-    BIN_ARRAY_MIN_INDEX, INTERNAL_BITMAP_MAX_INDEX, INTERNAL_BITMAP_MIN_INDEX,
+    BIN_ARRAY_MIN_INDEX, INTERNAL_BITMAP_MAX_INDEX, INTERNAL_BITMAP_MIN_INDEX, LB_PAIR_ACCOUNT_LEN,
+    LB_PAIR_DISCRIMINATOR, METEORA_DLMM_PROGRAM_ID,
 };
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys,
@@ -24,6 +25,11 @@ use tokio_tungstenite::tungstenite::Message;
 const MAX_BIN_ARRAYS_PER_DIRECTION: usize = 3;
 const BASE_HYDRATION_REQUEST_ID: u64 = 61;
 const QUOTE_HYDRATION_REQUEST_ID: u64 = 62;
+const EXACT_PAIR_FORWARD_REQUEST_ID: u64 = 63;
+const EXACT_PAIR_REVERSE_REQUEST_ID: u64 = 64;
+const METEORA_MINT_X_OFFSET: usize = 88;
+const METEORA_MINT_Y_OFFSET: usize = 120;
+const MAX_EXACT_PAIR_CANDIDATES_PER_ORIENTATION: usize = 5;
 
 pub fn program_subscribe_request() -> Value {
     live_program_subscribe_request()
@@ -146,6 +152,181 @@ where
     }
 
     Ok(prepared)
+}
+
+pub async fn prepare_exact_pair(
+    rpc_client: &Client,
+    rpc_url: &str,
+    anchor_mint: &str,
+    intermediate_mint: &str,
+    generation_id_start: u64,
+) -> Result<Option<MeteoraRuntimeQuoteState>, String> {
+    let quote_generation_id = generation_id_start
+        .checked_add(1)
+        .ok_or_else(|| "Meteora exact-pair generation id overflow".to_owned())?;
+    let mut incomplete_reason = None;
+
+    for request in exact_pair_lookup_requests(anchor_mint, intermediate_mint) {
+        let label = format!(
+            "Meteora exact-pair lookup anchor={} intermediate={}",
+            anchor_mint, intermediate_mint
+        );
+        let payload = match rpc_transport::post_json(rpc_client, rpc_url, &request, &label).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                incomplete_reason = Some(format!("{label} RPC request failed: {error}"));
+                continue;
+            }
+        };
+        let observations = match parse_exact_pair_lookup_response(&payload) {
+            Ok(observations) => observations,
+            Err(error) => {
+                incomplete_reason = Some(error);
+                continue;
+            }
+        };
+
+        for observation in observations
+            .into_iter()
+            .take(MAX_EXACT_PAIR_CANDIDATES_PER_ORIENTATION)
+        {
+            if !observation_matches_pair(&observation, anchor_mint, intermediate_mint) {
+                return Err(format!(
+                    "Meteora exact-pair candidate pair mismatch: pool={}",
+                    observation.pubkey
+                ));
+            }
+
+            let received_at = crate::unix_time_ms_now()?;
+            match hydrate_observation(
+                rpc_client,
+                rpc_url,
+                &observation,
+                received_at,
+                generation_id_start,
+                quote_generation_id,
+            )
+            .await
+            {
+                Ok(runtime) => return Ok(Some(runtime)),
+                Err(error) => {
+                    incomplete_reason = Some(format!(
+                        "Meteora exact-pair hydration failed: pool={} error={}",
+                        observation.pubkey, error
+                    ));
+                }
+            }
+        }
+    }
+
+    match incomplete_reason {
+        Some(reason) => Err(reason),
+        None => Ok(None),
+    }
+}
+
+fn exact_pair_lookup_requests(anchor_mint: &str, intermediate_mint: &str) -> [Value; 2] {
+    [
+        exact_pair_lookup_request(
+            EXACT_PAIR_FORWARD_REQUEST_ID,
+            anchor_mint,
+            intermediate_mint,
+        ),
+        exact_pair_lookup_request(
+            EXACT_PAIR_REVERSE_REQUEST_ID,
+            intermediate_mint,
+            anchor_mint,
+        ),
+    ]
+}
+
+fn exact_pair_lookup_request(request_id: u64, mint_x: &str, mint_y: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "getProgramAccounts",
+        "params": [
+            METEORA_DLMM_PROGRAM_ID,
+            {
+                "commitment": "processed",
+                "encoding": "base64",
+                "withContext": true,
+                "filters": [
+                    {"dataSize": LB_PAIR_ACCOUNT_LEN},
+                    {
+                        "memcmp": {
+                            "offset": 0,
+                            "bytes": bs58::encode(LB_PAIR_DISCRIMINATOR).into_string()
+                        }
+                    },
+                    {"memcmp": {"offset": METEORA_MINT_X_OFFSET, "bytes": mint_x}},
+                    {"memcmp": {"offset": METEORA_MINT_Y_OFFSET, "bytes": mint_y}}
+                ]
+            }
+        ]
+    })
+}
+
+fn parse_exact_pair_lookup_response(
+    payload: &Value,
+) -> Result<Vec<MeteoraLiveObservation>, String> {
+    if let Some(error) = payload.get("error") {
+        return Err(format!(
+            "Meteora exact-pair getProgramAccounts returned an RPC error: {error}"
+        ));
+    }
+
+    let slot = payload
+        .pointer("/result/context/slot")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Meteora exact-pair response missing context slot".to_owned())?;
+    let accounts = payload
+        .pointer("/result/value")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Meteora exact-pair response missing account array".to_owned())?;
+    let mut observations = Vec::with_capacity(accounts.len());
+
+    for entry in accounts {
+        let pubkey = entry
+            .get("pubkey")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Meteora exact-pair entry missing pubkey".to_owned())?;
+        let account = entry
+            .get("account")
+            .ok_or_else(|| "Meteora exact-pair entry missing account".to_owned())?;
+        let notification = json!({
+            "method": "programNotification",
+            "params": {
+                "result": {
+                    "context": {"slot": slot},
+                    "value": {"pubkey": pubkey, "account": account}
+                }
+            }
+        });
+        let observation = parse_meteora_program_notification(&notification)?
+            .ok_or_else(|| "Meteora exact-pair account did not decode".to_owned())?;
+
+        if observations
+            .iter()
+            .all(|existing: &MeteoraLiveObservation| existing.pubkey != observation.pubkey)
+        {
+            observations.push(observation);
+        }
+    }
+
+    Ok(observations)
+}
+
+fn observation_matches_pair(
+    observation: &MeteoraLiveObservation,
+    anchor_mint: &str,
+    intermediate_mint: &str,
+) -> bool {
+    let mint_x = bs58::encode(observation.lb_pair.mint_x).into_string();
+    let mint_y = bs58::encode(observation.lb_pair.mint_y).into_string();
+
+    (mint_x == anchor_mint && mint_y == intermediate_mint)
+        || (mint_y == anchor_mint && mint_x == intermediate_mint)
 }
 
 async fn hydrate_observation(
@@ -584,4 +765,60 @@ mod tests {
         let bit_index = (offset % 64) as u32;
         bitmap[word_index] |= 1_u64 << bit_index;
     }
+    #[test]
+    fn exact_pair_lookup_requests_are_bidirectional_and_exact() {
+        let anchor = "anchor";
+        let intermediate = "intermediate";
+        let requests = exact_pair_lookup_requests(anchor, intermediate);
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].pointer("/params/0").and_then(Value::as_str),
+            Some(METEORA_DLMM_PROGRAM_ID)
+        );
+        assert_eq!(
+            requests[0]
+                .pointer("/params/1/filters/0/dataSize")
+                .and_then(Value::as_u64),
+            u64::try_from(LB_PAIR_ACCOUNT_LEN).ok()
+        );
+        assert_eq!(
+            requests[0]
+                .pointer("/params/1/filters/1/memcmp/bytes")
+                .and_then(Value::as_str),
+            Some("6XZoLajBWVJ")
+        );
+        assert_eq!(
+            requests[0]
+                .pointer("/params/1/filters/2/memcmp/bytes")
+                .and_then(Value::as_str),
+            Some(anchor)
+        );
+        assert_eq!(
+            requests[0]
+                .pointer("/params/1/filters/3/memcmp/bytes")
+                .and_then(Value::as_str),
+            Some(intermediate)
+        );
+        assert_eq!(
+            requests[1]
+                .pointer("/params/1/filters/2/memcmp/bytes")
+                .and_then(Value::as_str),
+            Some(intermediate)
+        );
+        assert_eq!(
+            requests[1]
+                .pointer("/params/1/filters/3/memcmp/bytes")
+                .and_then(Value::as_str),
+            Some(anchor)
+        );
+    }
+
+    #[test]
+    fn exact_pair_parser_rejects_rpc_error() {
+        let payload = json!({"error": {"code": -32000, "message": "test"}});
+        assert!(parse_exact_pair_lookup_response(&payload).is_err());
+    }
+
 }
+
