@@ -2,9 +2,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::header::RETRY_AFTER;
 use reqwest::Client;
 use scout_cli::meteora::{
-    bin_id_to_bin_array_index, derive_bin_array_pda, next_initialized_bin_array_index,
-    MeteoraDlmmFailure, BIN_ARRAY_ACCOUNT_LEN, BIN_ARRAY_DISCRIMINATOR, BIN_ARRAY_MAX_INDEX,
-    BIN_ARRAY_MIN_INDEX, BIN_ARRAY_VERSION_OFFSET, BIN_ARRAY_VERSION_V3, METEORA_DLMM_PROGRAM_ID,
+    bin_array_bitmap_bit, bin_id_to_bin_array_index, derive_bin_array_pda, BIN_ARRAY_ACCOUNT_LEN,
+    BIN_ARRAY_DISCRIMINATOR, BIN_ARRAY_MAX_INDEX, BIN_ARRAY_MIN_INDEX, BIN_ARRAY_VERSION_OFFSET,
+    BIN_ARRAY_VERSION_V3, INTERNAL_BITMAP_MAX_INDEX, INTERNAL_BITMAP_MIN_INDEX,
+    METEORA_DLMM_PROGRAM_ID,
 };
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys, meteora_quote_hydration_account_pubkeys,
@@ -142,7 +143,7 @@ async fn main() -> Result<(), String> {
 
     let capture = qualified.ok_or_else(|| {
         format!(
-            "Meteora M14 found no qualified pinned-reference/legacy-SOL-USDC v3 target within {} \\
+            "Meteora M14 found no qualified pinned-reference/legacy-SOL-USDC v3 target within {} \
              candidates; rejected={rejection_count}",
             examined_count
         )
@@ -195,6 +196,7 @@ async fn main() -> Result<(), String> {
             "repository": "MeteoraAg/dlmm-sdk",
             "commit": "576919e3e4368e542c402f000b4264724f7f23ec",
             "function": "commons::quote::quote_exact_in",
+            "selector": "commons::quote::get_bin_array_pubkeys_for_swap",
             "rust_toolchain": "1.85.0",
         },
         "scout_toolchain": "1.80.0",
@@ -212,7 +214,7 @@ async fn main() -> Result<(), String> {
         .map_err(|error| format!("could not write M14 evidence fixture: {error}"))?;
 
     println!(
-        "meteora_m14_capture: pool={} trigger_slot={} base_slot={} source_slot={} \\
+        "meteora_m14_capture: pool={} trigger_slot={} base_slot={} source_slot={} \
          bin_arrays={} rejected_candidates={}",
         capture.pool,
         capture.observation.slot,
@@ -287,16 +289,10 @@ async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, St
         let Some(address) = pool.get("address").and_then(Value::as_str) else {
             continue;
         };
-        let Some(token_x) = pool
-            .pointer("/token_x/address")
-            .and_then(Value::as_str)
-        else {
+        let Some(token_x) = pool.pointer("/token_x/address").and_then(Value::as_str) else {
             continue;
         };
-        let Some(token_y) = pool
-            .pointer("/token_y/address")
-            .and_then(Value::as_str)
-        else {
+        let Some(token_y) = pool.pointer("/token_y/address").and_then(Value::as_str) else {
             continue;
         };
 
@@ -352,7 +348,7 @@ async fn qualify_m14_candidate(
     require_legacy_spl_token_programs(&base.token_x_program, &base.token_y_program)?;
 
     let base_source_slot = base.snapshot.source().source_slot;
-    let bin_array_pubkeys = bounded_directional_bin_array_pubkeys(&base.snapshot)?;
+    let bin_array_pubkeys = official_semantics_directional_bin_array_pubkeys(&base.snapshot)?;
     let final_pubkeys = meteora_quote_hydration_account_pubkeys(&observation, &bin_array_pubkeys)?;
 
     let frozen_payload = fetch_multiple_accounts_slice(
@@ -377,10 +373,11 @@ async fn qualify_m14_candidate(
 
     require_legacy_spl_token_programs(&prepared.token_x_program, &prepared.token_y_program)?;
 
-    let frozen_bin_array_pubkeys = bounded_directional_bin_array_pubkeys(&prepared.snapshot)?;
+    let frozen_bin_array_pubkeys =
+        official_semantics_directional_bin_array_pubkeys(&prepared.snapshot)?;
     if frozen_bin_array_pubkeys != bin_array_pubkeys {
         return Err(format!(
-            "Meteora M14 BinArray plan changed between base and frozen snapshots: \
+            "Meteora M14 official-semantics BinArray plan changed between base and frozen snapshots: \
              base={bin_array_pubkeys:?} frozen={frozen_bin_array_pubkeys:?}"
         ));
     }
@@ -468,7 +465,7 @@ fn require_v3_frozen_bin_array_plan(
             })?;
         if encoding != "base64" {
             return Err(format!(
-                "Meteora M14 frozen BinArray encoding mismatch: \\
+                "Meteora M14 frozen BinArray encoding mismatch: \
                  pubkey={expected_pubkey} encoding={encoding}"
             ));
         }
@@ -485,7 +482,7 @@ fn require_v3_frozen_bin_array_plan(
 
         if data.len() != BIN_ARRAY_ACCOUNT_LEN {
             return Err(format!(
-                "Meteora M14 frozen BinArray length mismatch: pubkey={expected_pubkey} \\
+                "Meteora M14 frozen BinArray length mismatch: pubkey={expected_pubkey} \
                  expected={} actual={}",
                 BIN_ARRAY_ACCOUNT_LEN,
                 data.len()
@@ -503,7 +500,7 @@ fn require_v3_frozen_bin_array_plan(
         })?;
         if version != BIN_ARRAY_VERSION_V3 {
             return Err(format!(
-                "Meteora M14 frozen BinArray is outside locked v3 profile: \\
+                "Meteora M14 frozen BinArray is outside locked v3 profile: \
                  pubkey={expected_pubkey} version={version}"
             ));
         }
@@ -665,7 +662,11 @@ fn observation_from_account(
         .ok_or_else(|| "Meteora M14 target was not admitted as a DLMM observation".to_owned())
 }
 
-fn bounded_directional_bin_array_pubkeys(
+// M14 capture must select the frozen BinArray input set using the semantics of
+// MeteoraAg/dlmm-sdk@576919e3e4368e542c402f000b4264724f7f23ec
+// commons::quote::get_bin_array_pubkeys_for_swap. The pinned SDK reference
+// runner independently recomputes the same selection before quote comparison.
+fn official_semantics_directional_bin_array_pubkeys(
     snapshot: &scout_cli::meteora::MeteoraDlmmSnapshot,
 ) -> Result<Vec<String>, String> {
     let start_index = bin_id_to_bin_array_index(snapshot.lb_pair().active_id)
@@ -680,50 +681,51 @@ fn bounded_directional_bin_array_pubkeys(
             BIN_ARRAY_MAX_INDEX
         };
         let step = if swap_for_y { -1_i64 } else { 1_i64 };
-        let mut search_index = start_index;
+        let mut index = start_index;
         let mut taken = 0usize;
 
         while taken < MAX_BIN_ARRAYS_PER_DIRECTION {
-            let extension_confirmed_absent = snapshot.bitmap_extension().is_none();
-            let next = match next_initialized_bin_array_index(
-                &snapshot.lb_pair().bin_array_bitmap,
-                snapshot.bitmap_extension(),
-                search_index,
-                swap_for_y,
-            ) {
-                Ok(next) => next,
-                Err(MeteoraDlmmFailure::BitmapExtensionRequired) if extension_confirmed_absent => {
-                    None
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "Meteora M14 directional BinArray search failed: direction={} \
-                         start={} error={error:?}",
-                        direction_label(swap_for_y),
-                        search_index
-                    ));
-                }
-            };
+            let outside_internal =
+                !(INTERNAL_BITMAP_MIN_INDEX..=INTERNAL_BITMAP_MAX_INDEX).contains(&index);
 
-            let Some(index) = next else {
+            // The pinned Meteora selector breaks normally when traversal leaves
+            // the default bitmap and no bitmap-extension account exists.
+            if outside_internal && snapshot.bitmap_extension().is_none() {
                 break;
-            };
-
-            let (pubkey, _) = derive_bin_array_pda(snapshot.lb_pair_pubkey(), index)
-                .map_err(|error| format!("Meteora M14 BinArray PDA failed: {error:?}"))?;
-            let encoded = bs58::encode(pubkey).into_string();
-
-            if seen.insert(encoded.clone()) {
-                ordered.push(encoded);
             }
 
-            taken += 1;
+            let initialized = bin_array_bitmap_bit(
+                &snapshot.lb_pair().bin_array_bitmap,
+                snapshot.bitmap_extension(),
+                index,
+            )
+            .map_err(|error| {
+                format!(
+                    "Meteora M14 official-semantics BinArray search failed: direction={} \
+                     index={} error={error:?}",
+                    direction_label(swap_for_y),
+                    index
+                )
+            })?;
+
+            if initialized {
+                let (pubkey, _) = derive_bin_array_pda(snapshot.lb_pair_pubkey(), index)
+                    .map_err(|error| format!("Meteora M14 BinArray PDA failed: {error:?}"))?;
+                let encoded = bs58::encode(pubkey).into_string();
+
+                if seen.insert(encoded.clone()) {
+                    ordered.push(encoded);
+                }
+                taken = taken
+                    .checked_add(1)
+                    .ok_or_else(|| "Meteora M14 BinArray take counter overflow".to_owned())?;
+            }
 
             if index == terminal {
                 break;
             }
 
-            search_index = index.checked_add(step).ok_or_else(|| {
+            index = index.checked_add(step).ok_or_else(|| {
                 format!(
                     "Meteora M14 directional BinArray index overflow: direction={} index={index}",
                     direction_label(swap_for_y)
@@ -819,3 +821,4 @@ fn unix_ms() -> Result<u64, String> {
     u64::try_from(duration.as_millis())
         .map_err(|_| "system clock milliseconds overflow u64".to_owned())
 }
+
