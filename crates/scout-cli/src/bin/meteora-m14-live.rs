@@ -838,9 +838,9 @@ fn scout_version_gate_probe_payload(
         let account_index = 5_usize
             .checked_add(offset)
             .ok_or_else(|| "Meteora M14 Scout probe BinArray index overflow".to_owned())?;
-        let account = accounts
-            .get_mut(account_index)
-            .ok_or_else(|| format!("Meteora M14 Scout probe BinArray missing: {expected_pubkey}"))?;
+        let account = accounts.get_mut(account_index).ok_or_else(|| {
+            format!("Meteora M14 Scout probe BinArray missing: {expected_pubkey}")
+        })?;
 
         let encoded = account
             .pointer("/data/0")
@@ -885,11 +885,9 @@ fn scout_version_gate_probe_payload(
             }
         }
 
-        let data_field = account
-            .pointer_mut("/data/0")
-            .ok_or_else(|| {
-                format!("Meteora M14 Scout probe BinArray data field missing: {expected_pubkey}")
-            })?;
+        let data_field = account.pointer_mut("/data/0").ok_or_else(|| {
+            format!("Meteora M14 Scout probe BinArray data field missing: {expected_pubkey}")
+        })?;
         *data_field = Value::String(BASE64_STANDARD.encode(data));
     }
 
