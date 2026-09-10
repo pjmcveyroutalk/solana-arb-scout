@@ -5,9 +5,8 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use scout_cli::meteora::{
     bin_array_bitmap_bit, bin_id_to_bin_array_index, derive_bin_array_pda,
-    MeteoraBitmapExtensionState, MeteoraDlmmSnapshot, MeteoraInternalBitmap,
-    BIN_ARRAY_MAX_INDEX, BIN_ARRAY_MIN_INDEX, INTERNAL_BITMAP_MAX_INDEX,
-    INTERNAL_BITMAP_MIN_INDEX,
+    MeteoraBitmapExtensionState, MeteoraDlmmSnapshot, MeteoraInternalBitmap, BIN_ARRAY_MAX_INDEX,
+    BIN_ARRAY_MIN_INDEX, INTERNAL_BITMAP_MAX_INDEX, INTERNAL_BITMAP_MIN_INDEX,
 };
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys,
@@ -60,8 +59,7 @@ where
             break;
         }
 
-        let Some(payload) =
-            ws_transport::next_json_message_optional(reader, remaining).await?
+        let Some(payload) = ws_transport::next_json_message_optional(reader, remaining).await?
         else {
             break;
         };
@@ -139,12 +137,10 @@ where
     );
 
     if prepared.is_empty() {
-        println!(
-            concat!(
-                "meteora_production_admission_unavailable: ",
-                "no bounded runtime-ready Meteora pool observed"
-            )
-        );
+        println!(concat!(
+            "meteora_production_admission_unavailable: ",
+            "no bounded runtime-ready Meteora pool observed"
+        ));
     } else {
         println!("READ-ONLY METEORA PRODUCTION ADMISSION PASS");
     }
@@ -205,12 +201,10 @@ async fn hydrate_observation(
 
     let quote_plan = certified_directional_bin_array_pubkeys(&prepared.snapshot)?;
     if quote_plan != bin_array_pubkeys {
-        return Err(format!(
-            concat!(
-                "Meteora runtime BinArray plan changed between base and quote hydration: ",
-                "base={bin_array_pubkeys:?} quote={quote_plan:?}"
-            )
-        ));
+        return Err(format!(concat!(
+            "Meteora runtime BinArray plan changed between base and quote hydration: ",
+            "base={bin_array_pubkeys:?} quote={quote_plan:?}"
+        )));
     }
 
     let snapshot_source_slot = prepared.snapshot.source().source_slot;
@@ -445,8 +439,8 @@ mod tests {
     }
 
     #[test]
-    fn certified_selector_stops_cleanly_without_bitmap_extension(
-    ) -> Result<(), MeteoraDlmmFailure> {
+    fn certified_selector_stops_cleanly_without_bitmap_extension() -> Result<(), MeteoraDlmmFailure>
+    {
         let mut lb_pair = test_lb_pair(511 * MAX_BIN_PER_ARRAY);
         set_internal_bit(&mut lb_pair.bin_array_bitmap, 511);
         let snapshot = test_snapshot(lb_pair, None)?;
@@ -468,8 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_meteora_runtime_state_produces_quote_readiness(
-    ) -> Result<(), MeteoraDlmmFailure> {
+    fn prepared_meteora_runtime_state_produces_quote_readiness() -> Result<(), MeteoraDlmmFailure> {
         let snapshot = test_snapshot(test_lb_pair(0), None)?;
         let normalized = test_normalized_pool(&snapshot);
         let mut meteora_runtime = BTreeMap::new();
@@ -494,8 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_meteora_runtime_state_fails_readiness_closed(
-    ) -> Result<(), MeteoraDlmmFailure> {
+    fn missing_meteora_runtime_state_fails_readiness_closed() -> Result<(), MeteoraDlmmFailure> {
         let snapshot = test_snapshot(test_lb_pair(0), None)?;
         let normalized = test_normalized_pool(&snapshot);
 
