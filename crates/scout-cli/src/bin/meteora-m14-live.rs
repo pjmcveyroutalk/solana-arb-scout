@@ -25,6 +25,7 @@ use tokio::time::{sleep, Duration};
 const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const QUOTE_AMOUNT_RAW: u64 = 1_000_000;
 const MAX_BIN_ARRAYS_PER_DIRECTION: usize = 3;
 const CANDIDATE_BATCH_SIZE: usize = 64;
@@ -139,7 +140,7 @@ async fn main() -> Result<(), String> {
 
     let capture = qualified.ok_or_else(|| {
         format!(
-            "Meteora M14 found no qualified legacy-SPL v3 target within {} candidates; \
+            "Meteora M14 found no qualified Scout-admitted-token v3 target within {} candidates; \
              rejected={rejection_count}",
             examined_count
         )
@@ -156,14 +157,14 @@ async fn main() -> Result<(), String> {
         "pool": capture.pool.as_str(),
         "rpc_url": SOLANA_RPC_URL,
         "discovery": {
-            "strategy": "bounded recent-pool discovery from official Meteora Data API; authoritative legacy-SPL/v3 qualification from frozen RPC state",
+            "strategy": "bounded recent-pool discovery from official Meteora Data API; authoritative Scout-admitted SPL/Token-2022 + v3 qualification from frozen RPC state",
             "source": METEORA_DATA_API_URL,
             "sort": "pool_created_at:desc",
             "filter": "is_blacklisted=false && tvl>10000",
             "max_candidates": MAX_DISCOVERY_CANDIDATES,
             "rejected_before_selection": rejection_count,
             "selected_provenance": "official-data-api-bounded-recent-pool",
-            "qualification": "legacy SPL mints + frozen v3 plan + bilateral full-fill quote",
+            "qualification": "Scout-admitted SPL/Token-2022 mints + frozen v3 plan + bilateral full-fill quote",
         },
         "trigger_slot": capture.observation.slot,
         "base_source_slot": capture.base_source_slot,
@@ -317,7 +318,7 @@ async fn qualify_m14_candidate(
         base_hydrated_at_unix_ms,
     )?;
 
-    require_legacy_spl_token_programs(&base.token_x_program, &base.token_y_program)?;
+    require_m14_supported_token_programs(&base.token_x_program, &base.token_y_program)?;
 
     let base_source_slot = base.snapshot.source().source_slot;
     let bin_array_pubkeys = official_semantics_directional_bin_array_pubkeys(&base.snapshot)?;
@@ -343,7 +344,7 @@ async fn qualify_m14_candidate(
         frozen_hydrated_at_unix_ms,
     )?;
 
-    require_legacy_spl_token_programs(&prepared.token_x_program, &prepared.token_y_program)?;
+    require_m14_supported_token_programs(&prepared.token_x_program, &prepared.token_y_program)?;
 
     let frozen_bin_array_pubkeys =
         official_semantics_directional_bin_array_pubkeys(&prepared.snapshot)?;
@@ -713,15 +714,19 @@ fn official_semantics_directional_bin_array_pubkeys(
     Ok(ordered)
 }
 
-fn require_legacy_spl_token_programs(
+fn require_m14_supported_token_programs(
     token_x_program: &str,
     token_y_program: &str,
 ) -> Result<(), String> {
-    if token_x_program != SPL_TOKEN_PROGRAM_ID || token_y_program != SPL_TOKEN_PROGRAM_ID {
-        return Err(format!(
-            "Meteora M14 certification target must use legacy SPL Token on both mints: \
-             token_x_program={token_x_program} token_y_program={token_y_program}"
-        ));
+    for (label, program) in [
+        ("token_x_program", token_x_program),
+        ("token_y_program", token_y_program),
+    ] {
+        if program != SPL_TOKEN_PROGRAM_ID && program != TOKEN_2022_PROGRAM_ID {
+            return Err(format!(
+                "Meteora M14 {label} is outside Scout-admitted token programs: {program}"
+            ));
+        }
     }
 
     Ok(())
