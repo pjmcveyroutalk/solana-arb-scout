@@ -5,8 +5,8 @@ use scout_cli::meteora::{
     bin_array_bitmap_bit, bin_id_to_bin_array_index, decode_bitmap_extension, derive_bin_array_pda,
     MeteoraBitmapExtensionState, MeteoraInternalBitmap, BIN_ARRAY_ACCOUNT_LEN,
     BIN_ARRAY_DISCRIMINATOR, BIN_ARRAY_MAX_INDEX, BIN_ARRAY_MIN_INDEX, BIN_ARRAY_VERSION_OFFSET,
-    BIN_ARRAY_VERSION_V3, BITMAP_EXTENSION_ACCOUNT_LEN, INTERNAL_BITMAP_MAX_INDEX,
-    INTERNAL_BITMAP_MIN_INDEX, METEORA_DLMM_PROGRAM_ID,
+    BIN_ARRAY_VERSION_V2, BIN_ARRAY_VERSION_V3, BITMAP_EXTENSION_ACCOUNT_LEN,
+    INTERNAL_BITMAP_MAX_INDEX, INTERNAL_BITMAP_MIN_INDEX, METEORA_DLMM_PROGRAM_ID,
 };
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys, meteora_quote_hydration_account_pubkeys,
@@ -28,7 +28,6 @@ const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-const BIN_ARRAY_VERSION_V2: u8 = 2;
 const TOKEN_PROGRAM_FLAG_SPL: u8 = 0;
 const PAIR_STATUS_ENABLED: u8 = 0;
 const METEORA_DLMM_PROGRAM_PUBKEY: Pubkey = pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
@@ -220,7 +219,7 @@ async fn main() -> Result<(), String> {
             "max_candidates": MAX_DISCOVERY_CANDIDATES,
             "rejected_before_selection": rejection_count,
             "selected_provenance": "official-data-api-bounded-recent-pool",
-            "qualification": "batched v2/v3 prefilter, then Scout-admitted SPL/Token-2022 mints + frozen raw-version plan + bilateral full-fill quote",
+            "qualification": "batched v2/v3 prefilter, then native Scout-admitted SPL/Token-2022 + untouched frozen v2/v3 hydration + bilateral full-fill quote",
         },
         "trigger_slot": capture.observation.slot,
         "base_source_slot": capture.base_source_slot,
@@ -233,11 +232,11 @@ async fn main() -> Result<(), String> {
         "token_y_program": capture.prepared.token_y_program.as_str(),
         "bin_array_pubkeys": &capture.bin_array_pubkeys,
         "bin_array_versions": &capture.bin_array_versions,
-        "scout_version_gate_probe": {
-            "purpose": "differential-only neutralization of Scout's current v3-only admission guard",
-            "raw_payload_preserved": true,
-            "rewrite": "Scout-only parse clone rewrites BinArray version byte 2->3; v3 stays unchanged; no other bytes are modified",
-            "production_behavior_changed": false,
+        "native_version_admission": {
+            "profile": "DlmmProtocolProfile::V0_12",
+            "accepted_bin_array_versions": [BIN_ARRAY_VERSION_V2, BIN_ARRAY_VERSION_V3],
+            "frozen_payload_passed_to_scout_unchanged": true,
+            "version_byte_rewrite": false,
         },
         "frozen_account_pubkeys": &capture.final_pubkeys,
         "frozen_rpc_payload": &capture.frozen_payload,
@@ -464,12 +463,12 @@ async fn filter_supported_version_discovery_candidates(
         let mut versions = Vec::with_capacity(candidate.bin_array_pubkeys.len());
         for pubkey in &candidate.bin_array_pubkeys {
             match header_versions.get(pubkey) {
-                Some(Ok(version)) if is_supported_probe_bin_array_version(*version) => {
+                Some(Ok(version)) if is_supported_certified_bin_array_version(*version) => {
                     versions.push(*version);
                 }
                 Some(Ok(version)) => {
                     failure = Some(format!(
-                        "BinArray {pubkey} is outside differential v2/v3 probe scope: version={version}"
+                        "BinArray {pubkey} is outside certified v2/v3 scope: version={version}"
                     ));
                     break;
                 }
@@ -564,7 +563,7 @@ fn parse_discovery_bitmap_extension(
     Ok(Some(extension))
 }
 
-fn is_supported_probe_bin_array_version(version: u8) -> bool {
+fn is_supported_certified_bin_array_version(version: u8) -> bool {
     matches!(version, BIN_ARRAY_VERSION_V2 | BIN_ARRAY_VERSION_V3)
 }
 
@@ -658,14 +657,12 @@ async fn qualify_m14_candidate(
 
     let bin_array_versions =
         require_supported_frozen_bin_array_plan(&frozen_payload, &bin_array_pubkeys)?;
-    let scout_probe_payload =
-        scout_version_gate_probe_payload(&frozen_payload, &bin_array_pubkeys)?;
 
     let frozen_hydrated_at_unix_ms = unix_ms()?;
     let prepared = parse_meteora_quote_hydration_response(
         &observation,
         &bin_array_pubkeys,
-        &scout_probe_payload,
+        &frozen_payload,
         2,
         trigger_received_at_unix_ms,
         frozen_hydrated_at_unix_ms,
@@ -802,9 +799,9 @@ fn require_supported_frozen_bin_array_plan(
         let version = *data.get(BIN_ARRAY_VERSION_OFFSET).ok_or_else(|| {
             format!("Meteora M14 frozen BinArray missing version byte: {expected_pubkey}")
         })?;
-        if !is_supported_probe_bin_array_version(version) {
+        if !is_supported_certified_bin_array_version(version) {
             return Err(format!(
-                "Meteora M14 frozen BinArray is outside differential v2/v3 probe scope: \
+                "Meteora M14 frozen BinArray is outside certified v2/v3 scope: \
                  pubkey={expected_pubkey} version={version}"
             ));
         }
@@ -812,86 +809,6 @@ fn require_supported_frozen_bin_array_plan(
     }
 
     Ok(versions)
-}
-
-fn scout_version_gate_probe_payload(
-    raw_payload: &Value,
-    expected_bin_array_pubkeys: &[String],
-) -> Result<Value, String> {
-    let mut probe_payload = raw_payload.clone();
-    let accounts = probe_payload
-        .pointer_mut("/result/value")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| "Meteora M14 Scout probe missing result.value array".to_owned())?;
-    let expected_count = 5_usize
-        .checked_add(expected_bin_array_pubkeys.len())
-        .ok_or_else(|| "Meteora M14 Scout probe account count overflow".to_owned())?;
-
-    if accounts.len() != expected_count {
-        return Err(format!(
-            "Meteora M14 Scout probe account count mismatch: expected={expected_count} actual={}",
-            accounts.len()
-        ));
-    }
-
-    for (offset, expected_pubkey) in expected_bin_array_pubkeys.iter().enumerate() {
-        let account_index = 5_usize
-            .checked_add(offset)
-            .ok_or_else(|| "Meteora M14 Scout probe BinArray index overflow".to_owned())?;
-        let account = accounts.get_mut(account_index).ok_or_else(|| {
-            format!("Meteora M14 Scout probe BinArray missing: {expected_pubkey}")
-        })?;
-
-        let encoded = account
-            .pointer("/data/0")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!("Meteora M14 Scout probe BinArray missing base64 data: {expected_pubkey}")
-            })?
-            .to_owned();
-        let mut data = BASE64_STANDARD.decode(encoded).map_err(|error| {
-            format!(
-                "Meteora M14 Scout probe BinArray base64 decode failed: {expected_pubkey}: {error}"
-            )
-        })?;
-
-        if data.len() != BIN_ARRAY_ACCOUNT_LEN {
-            return Err(format!(
-                "Meteora M14 Scout probe BinArray length mismatch: pubkey={expected_pubkey} \
-                 expected={} actual={}",
-                BIN_ARRAY_ACCOUNT_LEN,
-                data.len()
-            ));
-        }
-        if data.get(..BIN_ARRAY_DISCRIMINATOR.len()) != Some(BIN_ARRAY_DISCRIMINATOR.as_slice()) {
-            return Err(format!(
-                "Meteora M14 Scout probe BinArray discriminator mismatch: {expected_pubkey}"
-            ));
-        }
-
-        let version = *data.get(BIN_ARRAY_VERSION_OFFSET).ok_or_else(|| {
-            format!("Meteora M14 Scout probe BinArray missing version byte: {expected_pubkey}")
-        })?;
-        match version {
-            BIN_ARRAY_VERSION_V2 => {
-                data[BIN_ARRAY_VERSION_OFFSET] = BIN_ARRAY_VERSION_V3;
-            }
-            BIN_ARRAY_VERSION_V3 => {}
-            _ => {
-                return Err(format!(
-                    "Meteora M14 Scout probe encountered unsupported BinArray version: \
-                     pubkey={expected_pubkey} version={version}"
-                ));
-            }
-        }
-
-        let data_field = account.pointer_mut("/data/0").ok_or_else(|| {
-            format!("Meteora M14 Scout probe BinArray data field missing: {expected_pubkey}")
-        })?;
-        *data_field = Value::String(BASE64_STANDARD.encode(data));
-    }
-
-    Ok(probe_payload)
 }
 
 async fn fetch_candidate_accounts(client: &Client, pubkeys: &[String]) -> Result<Value, String> {
