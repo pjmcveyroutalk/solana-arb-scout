@@ -821,4 +821,3 @@ fn unix_ms() -> Result<u64, String> {
     u64::try_from(duration.as_millis())
         .map_err(|_| "system clock milliseconds overflow u64".to_owned())
 }
-
