@@ -3,8 +3,8 @@ use reqwest::header::RETRY_AFTER;
 use reqwest::Client;
 use scout_cli::meteora::{
     bin_id_to_bin_array_index, derive_bin_array_pda, next_initialized_bin_array_index,
-    BIN_ARRAY_ACCOUNT_LEN, BIN_ARRAY_DISCRIMINATOR, BIN_ARRAY_MAX_INDEX, BIN_ARRAY_MIN_INDEX,
-    BIN_ARRAY_VERSION_OFFSET, BIN_ARRAY_VERSION_V3, METEORA_DLMM_PROGRAM_ID,
+    MeteoraDlmmFailure, BIN_ARRAY_ACCOUNT_LEN, BIN_ARRAY_DISCRIMINATOR, BIN_ARRAY_MAX_INDEX,
+    BIN_ARRAY_MIN_INDEX, BIN_ARRAY_VERSION_OFFSET, BIN_ARRAY_VERSION_V3, METEORA_DLMM_PROGRAM_ID,
 };
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys, meteora_quote_hydration_account_pubkeys,
@@ -24,11 +24,15 @@ use tokio::time::{sleep, Duration};
 const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const REFERENCE_MAINNET_POOL: &str = "HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR";
+const REFERENCE_WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const REFERENCE_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const REFERENCE_DISCOVERY_QUERY: &str = "SOL";
 const QUOTE_AMOUNT_RAW: u64 = 1_000_000;
 const MAX_BIN_ARRAYS_PER_DIRECTION: usize = 3;
 const CANDIDATE_BATCH_SIZE: usize = 64;
-const DISCOVERY_PAGE_SIZE: usize = 250;
-const MAX_DISCOVERY_CANDIDATES: usize = DISCOVERY_PAGE_SIZE;
+const DISCOVERY_PAGE_SIZE: usize = 1_000;
+const MAX_DISCOVERY_CANDIDATES: usize = 64;
 const MIN_DISCOVERY_TVL_USD: u64 = 10_000;
 const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -64,12 +68,7 @@ async fn main() -> Result<(), String> {
         .build()
         .map_err(|error| format!("could not build bounded Solana RPC client: {error}"))?;
 
-    let candidates = fetch_meteora_m14_candidates(&rpc_client).await?;
-    let bounded_candidates = candidates
-        .iter()
-        .take(MAX_DISCOVERY_CANDIDATES)
-        .cloned()
-        .collect::<Vec<_>>();
+    let bounded_candidates = fetch_meteora_m14_candidates(&rpc_client).await?;
     let mut rejection_count = 0usize;
     let mut examined_count = 0usize;
     let mut qualified = None;
@@ -143,8 +142,8 @@ async fn main() -> Result<(), String> {
 
     let capture = qualified.ok_or_else(|| {
         format!(
-            "Meteora M14 found no qualified legacy-SPL v3 target within {} candidates; \\
-             rejected={rejection_count}",
+            "Meteora M14 found no qualified pinned-reference/legacy-SOL-USDC v3 target within {} \\
+             candidates; rejected={rejection_count}",
             examined_count
         )
     })?;
@@ -160,11 +159,20 @@ async fn main() -> Result<(), String> {
         "pool": capture.pool.as_str(),
         "rpc_url": SOLANA_RPC_URL,
         "discovery": {
-            "source": METEORA_DATA_API_URL,
-            "sort": "pool_created_at:desc",
-            "filter": "is_blacklisted=false && tvl>10000",
+            "strategy": "pinned Meteora reference specimen first; exact legacy SOL/USDC TVL-ranked fallback",
+            "primary_pool": REFERENCE_MAINNET_POOL,
+            "primary_provenance": "MeteoraAg/dlmm-sdk@576919e3e4368e542c402f000b4264724f7f23ec commons/src/quote.rs mainnet quote test",
+            "fallback_source": METEORA_DATA_API_URL,
+            "fallback_query": REFERENCE_DISCOVERY_QUERY,
+            "fallback_sort": "tvl:desc",
+            "fallback_filter": "is_blacklisted=false && tvl>10000; exact mint pair WSOL/USDC enforced locally",
             "max_candidates": MAX_DISCOVERY_CANDIDATES,
             "rejected_before_selection": rejection_count,
+            "selected_provenance": if capture.pool == REFERENCE_MAINNET_POOL {
+                "pinned-reference-primary"
+            } else {
+                "official-data-api-legacy-sol-usdc-fallback"
+            },
             "qualification": "legacy SPL mints + frozen v3 plan + bilateral full-fill quote",
         },
         "trigger_slot": capture.observation.slot,
@@ -240,7 +248,8 @@ async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, St
         .query(&[
             ("page", "1".to_owned()),
             ("page_size", DISCOVERY_PAGE_SIZE.to_string()),
-            ("sort_by", "pool_created_at:desc".to_owned()),
+            ("query", REFERENCE_DISCOVERY_QUERY.to_owned()),
+            ("sort_by", "tvl:desc".to_owned()),
             ("filter_by", filter),
         ])
         .send()
@@ -263,26 +272,54 @@ async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, St
         .and_then(Value::as_array)
         .ok_or_else(|| "Meteora M14 Data API response missing data array".to_owned())?;
 
-    let mut candidates = Vec::new();
+    let mut candidates = vec![REFERENCE_MAINNET_POOL.to_owned()];
     let mut seen = BTreeSet::new();
+    seen.insert(REFERENCE_MAINNET_POOL.to_owned());
+    let fallback_limit = MAX_DISCOVERY_CANDIDATES
+        .checked_sub(1)
+        .ok_or_else(|| "Meteora M14 candidate limit underflow".to_owned())?;
+
     for pool in pools {
+        if candidates.len() >= MAX_DISCOVERY_CANDIDATES {
+            break;
+        }
+
         let Some(address) = pool.get("address").and_then(Value::as_str) else {
             continue;
         };
+        let Some(token_x) = pool
+            .pointer("/token_x/address")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(token_y) = pool
+            .pointer("/token_y/address")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+
+        let is_reference_pair = (token_x == REFERENCE_WSOL_MINT && token_y == REFERENCE_USDC_MINT)
+            || (token_x == REFERENCE_USDC_MINT && token_y == REFERENCE_WSOL_MINT);
+        if !is_reference_pair {
+            continue;
+        }
+
         if seen.insert(address.to_owned()) {
             candidates.push(address.to_owned());
         }
     }
 
-    if candidates.is_empty() {
-        return Err("Meteora M14 Data API returned no bounded candidates".to_owned());
-    }
-
     println!(
-        "meteora_m14_discovery: source={} candidates={} bounded_to={}",
+        "meteora_m14_discovery: primary={} fallback_source={} fallback_pair={}/{} \
+         fallback_limit={} candidates={}",
+        REFERENCE_MAINNET_POOL,
         METEORA_DATA_API_URL,
-        candidates.len(),
-        candidates.len().min(MAX_DISCOVERY_CANDIDATES)
+        REFERENCE_WSOL_MINT,
+        REFERENCE_USDC_MINT,
+        fallback_limit,
+        candidates.len()
     );
 
     Ok(candidates)
@@ -647,20 +684,26 @@ fn bounded_directional_bin_array_pubkeys(
         let mut taken = 0usize;
 
         while taken < MAX_BIN_ARRAYS_PER_DIRECTION {
-            let next = next_initialized_bin_array_index(
+            let extension_confirmed_absent = snapshot.bitmap_extension().is_none();
+            let next = match next_initialized_bin_array_index(
                 &snapshot.lb_pair().bin_array_bitmap,
                 snapshot.bitmap_extension(),
                 search_index,
                 swap_for_y,
-            )
-            .map_err(|error| {
-                format!(
-                    "Meteora M14 directional BinArray search failed: direction={} \
-                     start={} error={error:?}",
-                    direction_label(swap_for_y),
-                    search_index
-                )
-            })?;
+            ) {
+                Ok(next) => next,
+                Err(MeteoraDlmmFailure::BitmapExtensionRequired) if extension_confirmed_absent => {
+                    None
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Meteora M14 directional BinArray search failed: direction={} \
+                         start={} error={error:?}",
+                        direction_label(swap_for_y),
+                        search_index
+                    ));
+                }
+            };
 
             let Some(index) = next else {
                 break;
