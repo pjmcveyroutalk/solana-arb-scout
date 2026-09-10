@@ -819,6 +819,4 @@ mod tests {
         let payload = json!({"error": {"code": -32000, "message": "test"}});
         assert!(parse_exact_pair_lookup_response(&payload).is_err());
     }
-
 }
-
