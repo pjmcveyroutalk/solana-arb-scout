@@ -1277,6 +1277,21 @@ fn venue_fee_value(venue: Venue, fees: &VenueFeeComponents) -> Result<Value, Str
             "trade_fee_rate_min": trade_fee_rate_min,
             "trade_fee_rate_max": trade_fee_rate_max,
         })),
+        (
+            Venue::Meteora,
+            VenueFeeComponents::Meteora {
+                trading_fee_raw,
+                protocol_fee_raw,
+                user_fee_raw,
+                fee_on_input,
+            },
+        ) => Ok(json!({
+            "kind": "meteora",
+            "trading_fee_raw": trading_fee_raw,
+            "protocol_fee_raw": protocol_fee_raw,
+            "user_fee_raw": user_fee_raw,
+            "fee_on_input": fee_on_input,
+        })),
         (actual_venue, actual_fees) => Err(format!(
             "R12 fee serializer has no verified structured mapping for venue={} components={:?}",
             actual_venue.label(),
@@ -1548,6 +1563,26 @@ mod tests {
     }
 
     #[test]
+    fn fee_serializer_preserves_meteora_fee_evidence() -> Result<(), String> {
+        let fees = VenueFeeComponents::Meteora {
+            trading_fee_raw: 40,
+            protocol_fee_raw: 8,
+            user_fee_raw: 0,
+            fee_on_input: true,
+        };
+
+        let value = venue_fee_value(Venue::Meteora, &fees)?;
+
+        assert_eq!(value["kind"], "meteora");
+        assert_eq!(value["trading_fee_raw"], 40);
+        assert_eq!(value["protocol_fee_raw"], 8);
+        assert_eq!(value["user_fee_raw"], 0);
+        assert_eq!(value["fee_on_input"], json!(true));
+
+        Ok(())
+    }
+
+    #[test]
     fn fee_serializer_rejects_mismatched_venue_components() {
         let fees = VenueFeeComponents::PumpSwap {
             lp_fee_raw: 5,
@@ -1772,3 +1807,4 @@ mod tests {
         Ok(())
     }
 }
+
