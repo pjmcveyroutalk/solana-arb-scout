@@ -1652,8 +1652,8 @@ async fn validate_registry_routes_and_sizes(
             rpc_client,
             route_candidate.leg_1(),
             route_candidate.leg_2(),
-            raydium_quote_contexts,
-            orca_prepared,
+            quote_contexts.raydium,
+            quote_contexts.orca,
             &mut priority_cache,
         )
         .await;
