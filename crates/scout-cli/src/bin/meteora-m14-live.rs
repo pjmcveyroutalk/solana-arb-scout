@@ -2,10 +2,11 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::header::RETRY_AFTER;
 use reqwest::Client;
 use scout_cli::meteora::{
-    bin_array_bitmap_bit, bin_id_to_bin_array_index, derive_bin_array_pda, BIN_ARRAY_ACCOUNT_LEN,
+    bin_array_bitmap_bit, bin_id_to_bin_array_index, decode_bitmap_extension, derive_bin_array_pda,
+    MeteoraBitmapExtensionState, MeteoraInternalBitmap, BIN_ARRAY_ACCOUNT_LEN,
     BIN_ARRAY_DISCRIMINATOR, BIN_ARRAY_MAX_INDEX, BIN_ARRAY_MIN_INDEX, BIN_ARRAY_VERSION_OFFSET,
-    BIN_ARRAY_VERSION_V3, INTERNAL_BITMAP_MAX_INDEX, INTERNAL_BITMAP_MIN_INDEX,
-    METEORA_DLMM_PROGRAM_ID,
+    BIN_ARRAY_VERSION_V3, BITMAP_EXTENSION_ACCOUNT_LEN, INTERNAL_BITMAP_MAX_INDEX,
+    INTERNAL_BITMAP_MIN_INDEX, METEORA_DLMM_PROGRAM_ID,
 };
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys, meteora_quote_hydration_account_pubkeys,
@@ -16,7 +17,8 @@ use scout_cli::meteora_m13::{
     meteora_m13_pair, MeteoraM13ExactInputQuote, MeteoraM13PreparedQuote,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use solana_pubkey::{pubkey, Pubkey};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,9 +28,14 @@ const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const METEORA_DLMM_PROGRAM_PUBKEY: Pubkey =
+    pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+const BIN_ARRAY_BITMAP_SEED: &[u8] = b"bitmap";
 const QUOTE_AMOUNT_RAW: u64 = 1_000_000;
 const MAX_BIN_ARRAYS_PER_DIRECTION: usize = 3;
 const CANDIDATE_BATCH_SIZE: usize = 64;
+const DISCOVERY_PROBE_BATCH_SIZE: usize = 100;
+const BIN_ARRAY_HEADER_LEN: usize = BIN_ARRAY_VERSION_OFFSET + 1;
 const DISCOVERY_PAGE_SIZE: usize = 250;
 const MAX_DISCOVERY_CANDIDATES: usize = DISCOVERY_PAGE_SIZE;
 const MIN_DISCOVERY_TVL_USD: u64 = 10_000;
@@ -37,6 +44,19 @@ const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const RPC_MAX_ATTEMPTS: usize = 5;
 const RPC_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 const M14_EVIDENCE_PATH: &str = "artifacts/m14-meteora/frozen-mainnet.json";
+
+struct ObservedM14Candidate {
+    pool: String,
+    observation: MeteoraLiveObservation,
+    trigger_received_at_unix_ms: u64,
+}
+
+struct DiscoveryM14Candidate {
+    pool: String,
+    observation: MeteoraLiveObservation,
+    trigger_received_at_unix_ms: u64,
+    bin_array_pubkeys: Vec<String>,
+}
 
 struct QualifiedM14Capture {
     pool: String,
@@ -69,10 +89,11 @@ async fn main() -> Result<(), String> {
     let bounded_candidates = fetch_meteora_m14_candidates(&rpc_client).await?;
     let mut rejection_count = 0usize;
     let mut examined_count = 0usize;
-    let mut qualified = None;
+    let mut observed_candidates = Vec::new();
 
-    'candidate_batches: for (batch_index, candidate_batch) in
-        bounded_candidates.chunks(CANDIDATE_BATCH_SIZE).enumerate()
+    for (batch_index, candidate_batch) in bounded_candidates
+        .chunks(CANDIDATE_BATCH_SIZE)
+        .enumerate()
     {
         let candidate_payload = fetch_candidate_accounts(&rpc_client, candidate_batch).await?;
         let candidate_slot = candidate_payload
@@ -104,36 +125,69 @@ async fn main() -> Result<(), String> {
                 .checked_add(1)
                 .ok_or_else(|| "Meteora M14 examined counter overflow".to_owned())?;
 
-            let result = match observation_from_account(pool, candidate_slot, account) {
-                Ok(observation) => {
-                    qualify_m14_candidate(
-                        &rpc_client,
-                        pool,
-                        observation,
-                        trigger_received_at_unix_ms,
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
-
-            match result {
-                Ok(capture) => {
-                    qualified = Some(capture);
-                    break 'candidate_batches;
-                }
-                Err(error) if is_rpc_infrastructure_error(&error) => {
-                    return Err(format!(
-                        "Meteora M14 certification infrastructure failure while qualifying \
-                         pool={pool}: {error}"
-                    ));
-                }
+            match observation_from_account(pool, candidate_slot, account) {
+                Ok(observation) => observed_candidates.push(ObservedM14Candidate {
+                    pool: pool.clone(),
+                    observation,
+                    trigger_received_at_unix_ms,
+                }),
                 Err(error) => {
                     rejection_count = rejection_count
                         .checked_add(1)
                         .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
                     println!("meteora_m14_candidate_rejected: pool={pool} reason={error}");
                 }
+            }
+        }
+    }
+
+    let observed_count = observed_candidates.len();
+    let (planned_candidates, planning_rejections) =
+        plan_discovery_candidates(&rpc_client, observed_candidates).await?;
+    rejection_count = rejection_count
+        .checked_add(planning_rejections)
+        .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
+    let planned_count = planned_candidates.len();
+
+    let (v3_candidates, header_rejections) =
+        filter_v3_discovery_candidates(&rpc_client, planned_candidates).await?;
+    rejection_count = rejection_count
+        .checked_add(header_rejections)
+        .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
+    let v3_count = v3_candidates.len();
+
+    println!(
+        "meteora_m14_prefilter: examined={} admitted={} planned={} v3_candidates={} rejected={}",
+        examined_count, observed_count, planned_count, v3_count, rejection_count
+    );
+
+    let mut qualified = None;
+    for candidate in v3_candidates {
+        let pool = candidate.pool.clone();
+        let result = qualify_m14_candidate(
+            &rpc_client,
+            &pool,
+            candidate.observation,
+            candidate.trigger_received_at_unix_ms,
+        )
+        .await;
+
+        match result {
+            Ok(capture) => {
+                qualified = Some(capture);
+                break;
+            }
+            Err(error) if is_rpc_infrastructure_error(&error) => {
+                return Err(format!(
+                    "Meteora M14 certification infrastructure failure while qualifying \
+                     pool={pool}: {error}"
+                ));
+            }
+            Err(error) => {
+                rejection_count = rejection_count
+                    .checked_add(1)
+                    .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
+                println!("meteora_m14_candidate_rejected: pool={pool} reason={error}");
             }
         }
     }
@@ -157,14 +211,14 @@ async fn main() -> Result<(), String> {
         "pool": capture.pool.as_str(),
         "rpc_url": SOLANA_RPC_URL,
         "discovery": {
-            "strategy": "bounded recent-pool discovery from official Meteora Data API; authoritative Scout-admitted SPL/Token-2022 + v3 qualification from frozen RPC state",
+            "strategy": "bounded recent-pool discovery from official Meteora Data API; batched bitmap-extension and 17-byte BinArray-header v3 prefilter; authoritative Scout-admitted SPL/Token-2022 + frozen v3 qualification from final RPC state",
             "source": METEORA_DATA_API_URL,
             "sort": "pool_created_at:desc",
             "filter": "is_blacklisted=false && tvl>10000",
             "max_candidates": MAX_DISCOVERY_CANDIDATES,
             "rejected_before_selection": rejection_count,
             "selected_provenance": "official-data-api-bounded-recent-pool",
-            "qualification": "Scout-admitted SPL/Token-2022 mints + frozen v3 plan + bilateral full-fill quote",
+            "qualification": "batched v3 prefilter, then Scout-admitted SPL/Token-2022 mints + frozen v3 plan + bilateral full-fill quote",
         },
         "trigger_slot": capture.observation.slot,
         "base_source_slot": capture.base_source_slot,
@@ -292,6 +346,246 @@ async fn fetch_meteora_m14_candidates(client: &Client) -> Result<Vec<String>, St
     );
 
     Ok(candidates)
+}
+
+async fn plan_discovery_candidates(
+    client: &Client,
+    observed_candidates: Vec<ObservedM14Candidate>,
+) -> Result<(Vec<DiscoveryM14Candidate>, usize), String> {
+    let mut planned_candidates = Vec::new();
+    let mut rejection_count = 0usize;
+
+    for candidate_chunk in observed_candidates.chunks(DISCOVERY_PROBE_BATCH_SIZE) {
+        let extension_pubkeys = candidate_chunk
+            .iter()
+            .map(|candidate| derive_bitmap_extension_pubkey(&candidate.pool))
+            .collect::<Result<Vec<_>, _>>()?;
+        let payload = fetch_discovery_accounts(
+            client,
+            &extension_pubkeys,
+            "Meteora M14 bitmap-extension discovery batch",
+        )
+        .await?;
+        let accounts = payload
+            .pointer("/result/value")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                "Meteora M14 bitmap-extension discovery missing result.value array".to_owned()
+            })?;
+        if accounts.len() != candidate_chunk.len() {
+            return Err(format!(
+                "Meteora M14 bitmap-extension discovery account count mismatch: expected={} actual={}",
+                candidate_chunk.len(),
+                accounts.len()
+            ));
+        }
+
+        for (candidate, account) in candidate_chunk.iter().zip(accounts) {
+            let result = parse_discovery_bitmap_extension(account, &candidate.pool).and_then(
+                |bitmap_extension| {
+                    official_semantics_directional_bin_array_pubkeys_from_parts(
+                        decode_pubkey(&candidate.pool)?,
+                        candidate.observation.lb_pair.active_id,
+                        &candidate.observation.lb_pair.bin_array_bitmap,
+                        bitmap_extension.as_ref(),
+                    )
+                },
+            );
+
+            match result {
+                Ok(bin_array_pubkeys) => planned_candidates.push(DiscoveryM14Candidate {
+                    pool: candidate.pool.clone(),
+                    observation: candidate.observation.clone(),
+                    trigger_received_at_unix_ms: candidate.trigger_received_at_unix_ms,
+                    bin_array_pubkeys,
+                }),
+                Err(error) => {
+                    rejection_count = rejection_count.checked_add(1).ok_or_else(|| {
+                        "Meteora M14 discovery rejection counter overflow".to_owned()
+                    })?;
+                    println!(
+                        "meteora_m14_candidate_rejected: pool={} reason=discovery prefilter: {}",
+                        candidate.pool, error
+                    );
+                }
+            }
+        }
+    }
+
+    Ok((planned_candidates, rejection_count))
+}
+
+async fn filter_v3_discovery_candidates(
+    client: &Client,
+    planned_candidates: Vec<DiscoveryM14Candidate>,
+) -> Result<(Vec<DiscoveryM14Candidate>, usize), String> {
+    let mut unique_pubkeys = BTreeSet::new();
+    for candidate in &planned_candidates {
+        unique_pubkeys.extend(candidate.bin_array_pubkeys.iter().cloned());
+    }
+    let unique_pubkeys = unique_pubkeys.into_iter().collect::<Vec<_>>();
+    let mut header_versions = BTreeMap::new();
+
+    for pubkey_batch in unique_pubkeys.chunks(DISCOVERY_PROBE_BATCH_SIZE) {
+        let payload = fetch_bin_array_headers(client, pubkey_batch).await?;
+        let accounts = payload
+            .pointer("/result/value")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Meteora M14 BinArray header probe missing result.value array".to_owned())?;
+        if accounts.len() != pubkey_batch.len() {
+            return Err(format!(
+                "Meteora M14 BinArray header account count mismatch: expected={} actual={}",
+                pubkey_batch.len(),
+                accounts.len()
+            ));
+        }
+
+        for (pubkey, account) in pubkey_batch.iter().zip(accounts) {
+            header_versions.insert(pubkey.clone(), parse_bin_array_header(account, pubkey));
+        }
+    }
+
+    let mut v3_candidates = Vec::new();
+    let mut rejection_count = 0usize;
+
+    for candidate in planned_candidates {
+        let mut failure = None;
+        for pubkey in &candidate.bin_array_pubkeys {
+            match header_versions.get(pubkey) {
+                Some(Ok(version)) if *version == BIN_ARRAY_VERSION_V3 => {}
+                Some(Ok(version)) => {
+                    failure = Some(format!(
+                        "BinArray {pubkey} is outside locked v3 profile: version={version}"
+                    ));
+                    break;
+                }
+                Some(Err(error)) => {
+                    failure = Some(error.clone());
+                    break;
+                }
+                None => {
+                    failure = Some(format!("BinArray {pubkey} was not included in header probe"));
+                    break;
+                }
+            }
+        }
+
+        if let Some(error) = failure {
+            rejection_count = rejection_count.checked_add(1).ok_or_else(|| {
+                "Meteora M14 header rejection counter overflow".to_owned()
+            })?;
+            println!(
+                "meteora_m14_candidate_rejected: pool={} reason=batched v3 prefilter: {}",
+                candidate.pool, error
+            );
+        } else {
+            println!(
+                "meteora_m14_v3_prefilter_pass: pool={} bin_arrays={}",
+                candidate.pool,
+                candidate.bin_array_pubkeys.len()
+            );
+            v3_candidates.push(candidate);
+        }
+    }
+
+    Ok((v3_candidates, rejection_count))
+}
+
+fn derive_bitmap_extension_pubkey(pool: &str) -> Result<String, String> {
+    let lb_pair = decode_pubkey(pool)?;
+    let (pubkey, _) = Pubkey::find_program_address(
+        &[BIN_ARRAY_BITMAP_SEED, &lb_pair],
+        &METEORA_DLMM_PROGRAM_PUBKEY,
+    );
+    Ok(bs58::encode(pubkey.to_bytes()).into_string())
+}
+
+fn parse_discovery_bitmap_extension(
+    account: &Value,
+    pool: &str,
+) -> Result<Option<MeteoraBitmapExtensionState>, String> {
+    if account.is_null() {
+        return Ok(None);
+    }
+
+    let owner = account
+        .get("owner")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Meteora M14 bitmap extension missing owner".to_owned())?;
+    if owner != METEORA_DLMM_PROGRAM_ID {
+        return Err(format!(
+            "Meteora M14 bitmap extension owner mismatch: pool={pool} owner={owner}"
+        ));
+    }
+
+    let data = decode_discovery_account_data(account, "Meteora M14 bitmap extension")?;
+    if data.len() != BITMAP_EXTENSION_ACCOUNT_LEN {
+        return Err(format!(
+            "Meteora M14 bitmap extension length mismatch: pool={pool} expected={} actual={}",
+            BITMAP_EXTENSION_ACCOUNT_LEN,
+            data.len()
+        ));
+    }
+
+    let extension = decode_bitmap_extension(METEORA_DLMM_PROGRAM_ID, &data)
+        .map_err(|error| format!("Meteora M14 bitmap extension decode failed: {error:?}"))?;
+    if extension.lb_pair != decode_pubkey(pool)? {
+        return Err(format!(
+            "Meteora M14 bitmap extension points to a different pool: pool={pool}"
+        ));
+    }
+
+    Ok(Some(extension))
+}
+
+fn parse_bin_array_header(account: &Value, pubkey: &str) -> Result<u8, String> {
+    if account.is_null() {
+        return Err(format!("BinArray {pubkey} does not exist"));
+    }
+
+    let owner = account
+        .get("owner")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("BinArray {pubkey} header probe missing owner"))?;
+    if owner != METEORA_DLMM_PROGRAM_ID {
+        return Err(format!(
+            "BinArray {pubkey} header probe owner mismatch: owner={owner}"
+        ));
+    }
+
+    let data = decode_discovery_account_data(account, "Meteora M14 BinArray header")?;
+    if data.len() != BIN_ARRAY_HEADER_LEN {
+        return Err(format!(
+            "BinArray {pubkey} header probe length mismatch: expected={} actual={}",
+            BIN_ARRAY_HEADER_LEN,
+            data.len()
+        ));
+    }
+    if data.get(..BIN_ARRAY_DISCRIMINATOR.len()) != Some(BIN_ARRAY_DISCRIMINATOR.as_slice()) {
+        return Err(format!("BinArray {pubkey} header discriminator mismatch"));
+    }
+
+    data.get(BIN_ARRAY_VERSION_OFFSET)
+        .copied()
+        .ok_or_else(|| format!("BinArray {pubkey} header missing version byte"))
+}
+
+fn decode_discovery_account_data(account: &Value, label: &str) -> Result<Vec<u8>, String> {
+    let encoded = account
+        .pointer("/data/0")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label} missing base64 data"))?;
+    let encoding = account
+        .pointer("/data/1")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label} missing data encoding"))?;
+    if encoding != "base64" {
+        return Err(format!("{label} unexpected data encoding {encoding}"));
+    }
+
+    BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("{label} invalid base64 data: {error}"))
 }
 
 async fn qualify_m14_candidate(
@@ -483,6 +777,14 @@ fn require_v3_frozen_bin_array_plan(
 }
 
 async fn fetch_candidate_accounts(client: &Client, pubkeys: &[String]) -> Result<Value, String> {
+    fetch_discovery_accounts(client, pubkeys, "Meteora M14 candidate batch").await
+}
+
+async fn fetch_discovery_accounts(
+    client: &Client,
+    pubkeys: &[String],
+    label: &str,
+) -> Result<Value, String> {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1401,
@@ -496,7 +798,28 @@ async fn fetch_candidate_accounts(client: &Client, pubkeys: &[String]) -> Result
         ]
     });
 
-    rpc_json(client, request, "Meteora M14 candidate batch").await
+    rpc_json(client, request, label).await
+}
+
+async fn fetch_bin_array_headers(client: &Client, pubkeys: &[String]) -> Result<Value, String> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1403,
+        "method": "getMultipleAccounts",
+        "params": [
+            pubkeys,
+            {
+                "commitment": "processed",
+                "encoding": "base64",
+                "dataSlice": {
+                    "offset": 0,
+                    "length": BIN_ARRAY_HEADER_LEN
+                }
+            }
+        ]
+    });
+
+    rpc_json(client, request, "Meteora M14 BinArray header probe batch").await
 }
 
 async fn fetch_multiple_accounts<const N: usize>(
@@ -642,7 +965,21 @@ fn observation_from_account(
 fn official_semantics_directional_bin_array_pubkeys(
     snapshot: &scout_cli::meteora::MeteoraDlmmSnapshot,
 ) -> Result<Vec<String>, String> {
-    let start_index = bin_id_to_bin_array_index(snapshot.lb_pair().active_id)
+    official_semantics_directional_bin_array_pubkeys_from_parts(
+        snapshot.lb_pair_pubkey(),
+        snapshot.lb_pair().active_id,
+        &snapshot.lb_pair().bin_array_bitmap,
+        snapshot.bitmap_extension(),
+    )
+}
+
+fn official_semantics_directional_bin_array_pubkeys_from_parts(
+    lb_pair_pubkey: [u8; 32],
+    active_id: i32,
+    bin_array_bitmap: &MeteoraInternalBitmap,
+    bitmap_extension: Option<&MeteoraBitmapExtensionState>,
+) -> Result<Vec<String>, String> {
+    let start_index = bin_id_to_bin_array_index(active_id)
         .map_err(|error| format!("Meteora M14 active BinArray index failed: {error:?}"))?;
     let mut ordered = Vec::new();
     let mut seen = BTreeSet::new();
@@ -663,26 +1000,22 @@ fn official_semantics_directional_bin_array_pubkeys(
 
             // The pinned Meteora selector breaks normally when traversal leaves
             // the default bitmap and no bitmap-extension account exists.
-            if outside_internal && snapshot.bitmap_extension().is_none() {
+            if outside_internal && bitmap_extension.is_none() {
                 break;
             }
 
-            let initialized = bin_array_bitmap_bit(
-                &snapshot.lb_pair().bin_array_bitmap,
-                snapshot.bitmap_extension(),
-                index,
-            )
-            .map_err(|error| {
-                format!(
-                    "Meteora M14 official-semantics BinArray search failed: direction={} \
-                     index={} error={error:?}",
-                    direction_label(swap_for_y),
-                    index
-                )
-            })?;
+            let initialized = bin_array_bitmap_bit(bin_array_bitmap, bitmap_extension, index)
+                .map_err(|error| {
+                    format!(
+                        "Meteora M14 official-semantics BinArray search failed: direction={} \
+                         index={} error={error:?}",
+                        direction_label(swap_for_y),
+                        index
+                    )
+                })?;
 
             if initialized {
-                let (pubkey, _) = derive_bin_array_pda(snapshot.lb_pair_pubkey(), index)
+                let (pubkey, _) = derive_bin_array_pda(lb_pair_pubkey, index)
                     .map_err(|error| format!("Meteora M14 BinArray PDA failed: {error:?}"))?;
                 let encoded = bs58::encode(pubkey).into_string();
 
@@ -780,6 +1113,16 @@ fn quote_json(quote: &MeteoraM13ExactInputQuote) -> Value {
         "touched_bin_arrays": &quote.touched_bin_arrays,
         "source_slot": quote.source_slot,
         "generation_id": quote.generation_id,
+    })
+}
+
+fn decode_pubkey(encoded: &str) -> Result<[u8; 32], String> {
+    let decoded = bs58::decode(encoded)
+        .into_vec()
+        .map_err(|error| format!("invalid Solana pubkey {encoded}: {error}"))?;
+    let decoded_len = decoded.len();
+    decoded.try_into().map_err(|_| {
+        format!("invalid Solana pubkey length: value={encoded} decoded_len={decoded_len}")
     })
 }
 
