@@ -28,6 +28,9 @@ const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+const BIN_ARRAY_VERSION_V2: u8 = 2;
+const TOKEN_PROGRAM_FLAG_SPL: u8 = 0;
+const PAIR_STATUS_ENABLED: u8 = 0;
 const METEORA_DLMM_PROGRAM_PUBKEY: Pubkey = pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const BIN_ARRAY_BITMAP_SEED: &[u8] = b"bitmap";
 const QUOTE_AMOUNT_RAW: u64 = 1_000_000;
@@ -62,6 +65,7 @@ struct QualifiedM14Capture {
     observation: MeteoraLiveObservation,
     base_source_slot: u64,
     bin_array_pubkeys: Vec<String>,
+    bin_array_versions: Vec<u8>,
     final_pubkeys: Vec<String>,
     frozen_payload: Value,
     prepared: MeteoraLivePreparedState,
@@ -147,20 +151,20 @@ async fn main() -> Result<(), String> {
         .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
     let planned_count = planned_candidates.len();
 
-    let (v3_candidates, header_rejections) =
-        filter_v3_discovery_candidates(&rpc_client, planned_candidates).await?;
+    let (version_candidates, header_rejections) =
+        filter_supported_version_discovery_candidates(&rpc_client, planned_candidates).await?;
     rejection_count = rejection_count
         .checked_add(header_rejections)
         .ok_or_else(|| "Meteora M14 rejection counter overflow".to_owned())?;
-    let v3_count = v3_candidates.len();
+    let version_candidate_count = version_candidates.len();
 
     println!(
-        "meteora_m14_prefilter: examined={} admitted={} planned={} v3_candidates={} rejected={}",
-        examined_count, observed_count, planned_count, v3_count, rejection_count
+        "meteora_m14_prefilter: examined={} admitted={} planned={} version_candidates={} rejected={}",
+        examined_count, observed_count, planned_count, version_candidate_count, rejection_count
     );
 
     let mut qualified = None;
-    for candidate in v3_candidates {
+    for candidate in version_candidates {
         let pool = candidate.pool.clone();
         let result = qualify_m14_candidate(
             &rpc_client,
@@ -192,7 +196,7 @@ async fn main() -> Result<(), String> {
 
     let capture = qualified.ok_or_else(|| {
         format!(
-            "Meteora M14 found no qualified Scout-admitted-token v3 target within {} candidates; \
+            "Meteora M14 found no qualified Scout-admitted-token v2/v3 target within {} candidates; \
              rejected={rejection_count}",
             examined_count
         )
@@ -209,14 +213,14 @@ async fn main() -> Result<(), String> {
         "pool": capture.pool.as_str(),
         "rpc_url": SOLANA_RPC_URL,
         "discovery": {
-            "strategy": "bounded recent-pool discovery from official Meteora Data API; batched bitmap-extension and 17-byte BinArray-header v3 prefilter; authoritative Scout-admitted SPL/Token-2022 + frozen v3 qualification from final RPC state",
+            "strategy": "bounded recent-pool discovery from official Meteora Data API; batched bitmap-extension and 17-byte BinArray-header v2/v3 prefilter; enabled legacy-SPL candidates tried first without narrowing scope; authoritative Scout-admitted SPL/Token-2022 + frozen raw-version qualification from final RPC state",
             "source": METEORA_DATA_API_URL,
             "sort": "pool_created_at:desc",
             "filter": "is_blacklisted=false && tvl>10000",
             "max_candidates": MAX_DISCOVERY_CANDIDATES,
             "rejected_before_selection": rejection_count,
             "selected_provenance": "official-data-api-bounded-recent-pool",
-            "qualification": "batched v3 prefilter, then Scout-admitted SPL/Token-2022 mints + frozen v3 plan + bilateral full-fill quote",
+            "qualification": "batched v2/v3 prefilter, then Scout-admitted SPL/Token-2022 mints + frozen raw-version plan + bilateral full-fill quote",
         },
         "trigger_slot": capture.observation.slot,
         "base_source_slot": capture.base_source_slot,
@@ -228,6 +232,13 @@ async fn main() -> Result<(), String> {
         "token_x_program": capture.prepared.token_x_program.as_str(),
         "token_y_program": capture.prepared.token_y_program.as_str(),
         "bin_array_pubkeys": &capture.bin_array_pubkeys,
+        "bin_array_versions": &capture.bin_array_versions,
+        "scout_version_gate_probe": {
+            "purpose": "differential-only neutralization of Scout's current v3-only admission guard",
+            "raw_payload_preserved": true,
+            "rewrite": "Scout-only parse clone rewrites BinArray version byte 2->3; v3 stays unchanged; no other bytes are modified",
+            "production_behavior_changed": false,
+        },
         "frozen_account_pubkeys": &capture.final_pubkeys,
         "frozen_rpc_payload": &capture.frozen_payload,
         "scout_quotes": {
@@ -413,7 +424,7 @@ async fn plan_discovery_candidates(
     Ok((planned_candidates, rejection_count))
 }
 
-async fn filter_v3_discovery_candidates(
+async fn filter_supported_version_discovery_candidates(
     client: &Client,
     planned_candidates: Vec<DiscoveryM14Candidate>,
 ) -> Result<(Vec<DiscoveryM14Candidate>, usize), String> {
@@ -445,17 +456,20 @@ async fn filter_v3_discovery_candidates(
         }
     }
 
-    let mut v3_candidates = Vec::new();
+    let mut supported_candidates = Vec::new();
     let mut rejection_count = 0usize;
 
     for candidate in planned_candidates {
         let mut failure = None;
+        let mut versions = Vec::with_capacity(candidate.bin_array_pubkeys.len());
         for pubkey in &candidate.bin_array_pubkeys {
             match header_versions.get(pubkey) {
-                Some(Ok(version)) if *version == BIN_ARRAY_VERSION_V3 => {}
+                Some(Ok(version)) if is_supported_probe_bin_array_version(*version) => {
+                    versions.push(*version);
+                }
                 Some(Ok(version)) => {
                     failure = Some(format!(
-                        "BinArray {pubkey} is outside locked v3 profile: version={version}"
+                        "BinArray {pubkey} is outside differential v2/v3 probe scope: version={version}"
                     ));
                     break;
                 }
@@ -477,20 +491,30 @@ async fn filter_v3_discovery_candidates(
                 .checked_add(1)
                 .ok_or_else(|| "Meteora M14 header rejection counter overflow".to_owned())?;
             println!(
-                "meteora_m14_candidate_rejected: pool={} reason=batched v3 prefilter: {}",
+                "meteora_m14_candidate_rejected: pool={} reason=batched v2/v3 prefilter: {}",
                 candidate.pool, error
             );
         } else {
             println!(
-                "meteora_m14_v3_prefilter_pass: pool={} bin_arrays={}",
+                "meteora_m14_version_prefilter_pass: pool={} bin_arrays={} versions={:?}",
                 candidate.pool,
-                candidate.bin_array_pubkeys.len()
+                candidate.bin_array_pubkeys.len(),
+                versions
             );
-            v3_candidates.push(candidate);
+            supported_candidates.push(candidate);
         }
     }
 
-    Ok((v3_candidates, rejection_count))
+    supported_candidates.sort_by_key(|candidate| {
+        let admission = &candidate.observation.admission;
+        (
+            admission.status != PAIR_STATUS_ENABLED,
+            !(admission.token_x_program_flag == TOKEN_PROGRAM_FLAG_SPL
+                && admission.token_y_program_flag == TOKEN_PROGRAM_FLAG_SPL),
+        )
+    });
+
+    Ok((supported_candidates, rejection_count))
 }
 
 fn derive_bitmap_extension_pubkey(pool: &str) -> Result<String, String> {
@@ -538,6 +562,10 @@ fn parse_discovery_bitmap_extension(
     }
 
     Ok(Some(extension))
+}
+
+fn is_supported_probe_bin_array_version(version: u8) -> bool {
+    matches!(version, BIN_ARRAY_VERSION_V2 | BIN_ARRAY_VERSION_V3)
 }
 
 fn parse_bin_array_header(account: &Value, pubkey: &str) -> Result<u8, String> {
@@ -628,13 +656,16 @@ async fn qualify_m14_candidate(
     )
     .await?;
 
-    require_v3_frozen_bin_array_plan(&frozen_payload, &bin_array_pubkeys)?;
+    let bin_array_versions =
+        require_supported_frozen_bin_array_plan(&frozen_payload, &bin_array_pubkeys)?;
+    let scout_probe_payload =
+        scout_version_gate_probe_payload(&frozen_payload, &bin_array_pubkeys)?;
 
     let frozen_hydrated_at_unix_ms = unix_ms()?;
     let prepared = parse_meteora_quote_hydration_response(
         &observation,
         &bin_array_pubkeys,
-        &frozen_payload,
+        &scout_probe_payload,
         2,
         trigger_received_at_unix_ms,
         frozen_hydrated_at_unix_ms,
@@ -661,10 +692,11 @@ async fn qualify_m14_candidate(
     require_quote_identity(&y_to_x, &mint_y, &mint_x, false)?;
 
     println!(
-        "meteora_m14_candidate_qualified: pool={} source_slot={} bin_arrays={}",
+        "meteora_m14_candidate_qualified: pool={} source_slot={} bin_arrays={} raw_versions={:?}",
         pool,
         prepared.snapshot.source().source_slot,
-        bin_array_pubkeys.len()
+        bin_array_pubkeys.len(),
+        bin_array_versions
     );
 
     Ok(QualifiedM14Capture {
@@ -672,6 +704,7 @@ async fn qualify_m14_candidate(
         observation,
         base_source_slot,
         bin_array_pubkeys,
+        bin_array_versions,
         final_pubkeys,
         frozen_payload,
         prepared,
@@ -681,10 +714,10 @@ async fn qualify_m14_candidate(
     })
 }
 
-fn require_v3_frozen_bin_array_plan(
+fn require_supported_frozen_bin_array_plan(
     payload: &Value,
     expected_bin_array_pubkeys: &[String],
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let accounts = payload
         .pointer("/result/value")
         .and_then(Value::as_array)
@@ -699,6 +732,8 @@ fn require_v3_frozen_bin_array_plan(
             accounts.len()
         ));
     }
+
+    let mut versions = Vec::with_capacity(expected_bin_array_pubkeys.len());
 
     for (offset, expected_pubkey) in expected_bin_array_pubkeys.iter().enumerate() {
         let account_index = 5_usize
@@ -767,15 +802,98 @@ fn require_v3_frozen_bin_array_plan(
         let version = *data.get(BIN_ARRAY_VERSION_OFFSET).ok_or_else(|| {
             format!("Meteora M14 frozen BinArray missing version byte: {expected_pubkey}")
         })?;
-        if version != BIN_ARRAY_VERSION_V3 {
+        if !is_supported_probe_bin_array_version(version) {
             return Err(format!(
-                "Meteora M14 frozen BinArray is outside locked v3 profile: \
+                "Meteora M14 frozen BinArray is outside differential v2/v3 probe scope: \
                  pubkey={expected_pubkey} version={version}"
             ));
         }
+        versions.push(version);
     }
 
-    Ok(())
+    Ok(versions)
+}
+
+fn scout_version_gate_probe_payload(
+    raw_payload: &Value,
+    expected_bin_array_pubkeys: &[String],
+) -> Result<Value, String> {
+    let mut probe_payload = raw_payload.clone();
+    let accounts = probe_payload
+        .pointer_mut("/result/value")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "Meteora M14 Scout probe missing result.value array".to_owned())?;
+    let expected_count = 5_usize
+        .checked_add(expected_bin_array_pubkeys.len())
+        .ok_or_else(|| "Meteora M14 Scout probe account count overflow".to_owned())?;
+
+    if accounts.len() != expected_count {
+        return Err(format!(
+            "Meteora M14 Scout probe account count mismatch: expected={expected_count} actual={}",
+            accounts.len()
+        ));
+    }
+
+    for (offset, expected_pubkey) in expected_bin_array_pubkeys.iter().enumerate() {
+        let account_index = 5_usize
+            .checked_add(offset)
+            .ok_or_else(|| "Meteora M14 Scout probe BinArray index overflow".to_owned())?;
+        let account = accounts
+            .get_mut(account_index)
+            .ok_or_else(|| format!("Meteora M14 Scout probe BinArray missing: {expected_pubkey}"))?;
+
+        let encoded = account
+            .pointer("/data/0")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("Meteora M14 Scout probe BinArray missing base64 data: {expected_pubkey}")
+            })?
+            .to_owned();
+        let mut data = BASE64_STANDARD.decode(encoded).map_err(|error| {
+            format!(
+                "Meteora M14 Scout probe BinArray base64 decode failed: {expected_pubkey}: {error}"
+            )
+        })?;
+
+        if data.len() != BIN_ARRAY_ACCOUNT_LEN {
+            return Err(format!(
+                "Meteora M14 Scout probe BinArray length mismatch: pubkey={expected_pubkey} \
+                 expected={} actual={}",
+                BIN_ARRAY_ACCOUNT_LEN,
+                data.len()
+            ));
+        }
+        if data.get(..BIN_ARRAY_DISCRIMINATOR.len()) != Some(BIN_ARRAY_DISCRIMINATOR.as_slice()) {
+            return Err(format!(
+                "Meteora M14 Scout probe BinArray discriminator mismatch: {expected_pubkey}"
+            ));
+        }
+
+        let version = *data.get(BIN_ARRAY_VERSION_OFFSET).ok_or_else(|| {
+            format!("Meteora M14 Scout probe BinArray missing version byte: {expected_pubkey}")
+        })?;
+        match version {
+            BIN_ARRAY_VERSION_V2 => {
+                data[BIN_ARRAY_VERSION_OFFSET] = BIN_ARRAY_VERSION_V3;
+            }
+            BIN_ARRAY_VERSION_V3 => {}
+            _ => {
+                return Err(format!(
+                    "Meteora M14 Scout probe encountered unsupported BinArray version: \
+                     pubkey={expected_pubkey} version={version}"
+                ));
+            }
+        }
+
+        let data_field = account
+            .pointer_mut("/data/0")
+            .ok_or_else(|| {
+                format!("Meteora M14 Scout probe BinArray data field missing: {expected_pubkey}")
+            })?;
+        *data_field = Value::String(BASE64_STANDARD.encode(data));
+    }
+
+    Ok(probe_payload)
 }
 
 async fn fetch_candidate_accounts(client: &Client, pubkeys: &[String]) -> Result<Value, String> {
