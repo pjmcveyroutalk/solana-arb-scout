@@ -34,6 +34,7 @@ pub const BIN_ARRAY_INDEX_OFFSET: usize = 8;
 pub const BIN_ARRAY_VERSION_OFFSET: usize = 16;
 pub const BIN_ARRAY_LB_PAIR_OFFSET: usize = 24;
 pub const BIN_ARRAY_FIRST_BIN_OFFSET: usize = 56;
+pub const BIN_ARRAY_VERSION_V2: u8 = 2;
 pub const BIN_ARRAY_VERSION_V3: u8 = 3;
 pub const MAX_BIN_PER_ARRAY: i32 = 70;
 pub const BIN_STRIDE: usize = 144;
@@ -107,7 +108,7 @@ impl DlmmProtocolProfile {
 
     pub const fn accepts_bin_array_version(self, version: u8) -> bool {
         match self {
-            Self::V0_12 => version == BIN_ARRAY_VERSION_V3,
+            Self::V0_12 => version == BIN_ARRAY_VERSION_V2 || version == BIN_ARRAY_VERSION_V3,
         }
     }
 }
@@ -1402,12 +1403,13 @@ mod tests {
     }
 
     #[test]
-    fn v0_12_profile_accepts_only_bin_array_version_three() {
+    fn v0_12_profile_accepts_certified_bin_array_versions_two_and_three() {
         let profile = DlmmProtocolProfile::V0_12;
 
+        assert!(profile.accepts_bin_array_version(BIN_ARRAY_VERSION_V2));
         assert!(profile.accepts_bin_array_version(BIN_ARRAY_VERSION_V3));
         assert!(!profile.accepts_bin_array_version(0));
-        assert!(!profile.accepts_bin_array_version(2));
+        assert!(!profile.accepts_bin_array_version(1));
         assert!(!profile.accepts_bin_array_version(4));
         assert!(!profile.accepts_bin_array_version(u8::MAX));
     }
@@ -1429,6 +1431,7 @@ mod tests {
 
     #[test]
     fn protocol_domains_are_explicit_and_bounded() {
+        assert_eq!(BIN_ARRAY_VERSION_V2, 2);
         assert_eq!(BIN_ARRAY_VERSION_V3, 3);
         assert_eq!(MAX_BIN_PER_ARRAY, 70);
         assert_eq!(BIN_ARRAY_MIN_INDEX, -6_656);
@@ -2113,6 +2116,64 @@ mod tests {
     }
 
     #[test]
+    fn m14_certified_v2_and_v3_bin_arrays_are_accepted_by_snapshot(
+    ) -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+
+        for version in [BIN_ARRAY_VERSION_V2, BIN_ARRAY_VERSION_V3] {
+            let mut input = bin_array_snapshot_input(lb_pair_pubkey, -1)?;
+            input.state.version = version;
+            let snapshot = MeteoraDlmmSnapshot::new(
+                lb_pair_pubkey,
+                lb_pair,
+                vec![input],
+                None,
+                test_clock(),
+                DlmmProtocolProfile::V0_12,
+                test_source(),
+            )?;
+
+            assert_eq!(
+                snapshot
+                    .bin_arrays()
+                    .first()
+                    .map(|array| array.state().version),
+                Some(version)
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn m14_snapshot_still_fails_closed_on_uncertified_bin_array_versions(
+    ) -> Result<(), MeteoraDlmmFailure> {
+        let lb_pair_pubkey = [7_u8; 32];
+        let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
+
+        for version in [0_u8, 1_u8, 4_u8, u8::MAX] {
+            let mut input = bin_array_snapshot_input(lb_pair_pubkey, -1)?;
+            input.state.version = version;
+
+            assert_eq!(
+                MeteoraDlmmSnapshot::new(
+                    lb_pair_pubkey,
+                    lb_pair,
+                    vec![input],
+                    None,
+                    test_clock(),
+                    DlmmProtocolProfile::V0_12,
+                    test_source(),
+                ),
+                Err(MeteoraDlmmFailure::UnsupportedBinArrayVersion)
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn m5_snapshot_rejects_bin_array_from_another_lb_pair() -> Result<(), MeteoraDlmmFailure> {
         let lb_pair_pubkey = [7_u8; 32];
         let lb_pair = decode_lb_pair(METEORA_DLMM_PROGRAM_ID, &valid_lb_pair_bytes())?;
@@ -2303,44 +2364,56 @@ mod tests {
     }
 
     #[test]
-    fn bin_array_decoder_enforces_v3_and_decodes_full_bin_layout() {
-        let data = valid_bin_array_bytes();
+    fn bin_array_decoder_accepts_certified_v2_and_v3_layouts() {
         let profile = DlmmProtocolProfile::V0_12;
 
-        assert_eq!(
-            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile).map(|state| state.index),
-            Ok(-1)
-        );
-        assert_eq!(
-            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile).map(|state| state.bins.len()),
-            Ok(70)
-        );
-        assert_eq!(
-            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
-                .map(|state| state.bins.first().map(|bin| bin.amount_x)),
-            Ok(Some(11))
-        );
-        assert_eq!(
-            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
-                .map(|state| state.bins.first().map(|bin| bin.price)),
-            Ok(Some(33))
-        );
-        assert_eq!(
-            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
-                .map(|state| state.bins.first().map(|bin| bin.limit_order_ask_side)),
-            Ok(Some(1))
-        );
+        for version in [BIN_ARRAY_VERSION_V2, BIN_ARRAY_VERSION_V3] {
+            let mut data = valid_bin_array_bytes();
+            data[BIN_ARRAY_VERSION_OFFSET] = version;
+
+            assert_eq!(
+                decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
+                    .map(|state| state.version),
+                Ok(version)
+            );
+            assert_eq!(
+                decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile).map(|state| state.index),
+                Ok(-1)
+            );
+            assert_eq!(
+                decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
+                    .map(|state| state.bins.len()),
+                Ok(70)
+            );
+            assert_eq!(
+                decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
+                    .map(|state| state.bins.first().map(|bin| bin.amount_x)),
+                Ok(Some(11))
+            );
+            assert_eq!(
+                decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
+                    .map(|state| state.bins.first().map(|bin| bin.price)),
+                Ok(Some(33))
+            );
+            assert_eq!(
+                decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, profile)
+                    .map(|state| state.bins.first().map(|bin| bin.limit_order_ask_side)),
+                Ok(Some(1))
+            );
+        }
     }
 
     #[test]
-    fn bin_array_decoder_fails_closed_on_unsupported_version() {
-        let mut data = valid_bin_array_bytes();
-        data[BIN_ARRAY_VERSION_OFFSET] = 2;
+    fn bin_array_decoder_fails_closed_on_uncertified_versions() {
+        for version in [0_u8, 1_u8, 4_u8, u8::MAX] {
+            let mut data = valid_bin_array_bytes();
+            data[BIN_ARRAY_VERSION_OFFSET] = version;
 
-        assert_eq!(
-            decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, DlmmProtocolProfile::V0_12),
-            Err(MeteoraDlmmFailure::UnsupportedBinArrayVersion)
-        );
+            assert_eq!(
+                decode_bin_array(METEORA_DLMM_PROGRAM_ID, &data, DlmmProtocolProfile::V0_12),
+                Err(MeteoraDlmmFailure::UnsupportedBinArrayVersion)
+            );
+        }
     }
 
     #[test]
