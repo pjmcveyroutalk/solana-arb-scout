@@ -9,6 +9,7 @@ mod orca_o2;
 mod orca_o2_quote_inputs;
 mod orca_priority;
 mod orca_runtime;
+mod meteora_runtime;
 mod pumpswap;
 mod quote;
 mod raydium;
@@ -52,6 +53,8 @@ const R13_MATURITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
+const MAX_METEORA_OBSERVATIONS: usize = 10;
+const METEORA_OBSERVATION_WINDOW: Duration = Duration::from_secs(15);
 const MAX_TARGETED_ROUTE_LOOKUPS: usize = 15;
 
 #[derive(Debug)]
@@ -175,6 +178,33 @@ async fn main() -> Result<(), String> {
     let orca_prepared =
         orca_runtime::observe_and_prepare(&rpc_client, SOLANA_RPC_URL, &mut reader).await?;
 
+    let meteora_request = meteora_runtime::program_subscribe_request();
+    let meteora_subscription_id = meteora_request
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Meteora subscription request missing id".to_owned())?;
+
+    writer
+        .send(Message::Text(meteora_request.to_string()))
+        .await
+        .map_err(|error| format!("could not subscribe to Meteora DLMM: {error}"))?;
+
+    ws_transport::wait_for_subscription_confirmation(
+        &mut reader,
+        meteora_subscription_id,
+        "Meteora DLMM",
+    )
+    .await?;
+
+    let meteora_runtime = meteora_runtime::observe_and_prepare(
+        &rpc_client,
+        SOLANA_RPC_URL,
+        &mut reader,
+        MAX_METEORA_OBSERVATIONS,
+        METEORA_OBSERVATION_WINDOW,
+    )
+    .await?;
+
     let (
         discovered_orca_raydium_states,
         discovered_orca_raydium_contexts,
@@ -205,12 +235,18 @@ async fn main() -> Result<(), String> {
                     .values()
                     .map(|prepared| prepared.normalized.clone()),
             )
+            .chain(
+                meteora_runtime
+                    .values()
+                    .map(|runtime| runtime.normalized.clone()),
+            )
         {
-            let readiness = runtime_quote::readiness_for_pool(
+            let readiness = runtime_quote::readiness_for_pool_with_meteora(
                 &state,
                 &raydium_quote_contexts,
                 &pumpswap_quote_contexts,
                 &orca_prepared,
+                &meteora_runtime,
             );
 
             registry.upsert(state, readiness)?;
@@ -260,6 +296,7 @@ async fn main() -> Result<(), String> {
         &raydium_quote_contexts,
         &pumpswap_quote_contexts,
         &orca_prepared,
+        &meteora_runtime,
         &usd_prices,
     )
     .await
@@ -1309,22 +1346,33 @@ async fn validate_registry_routes_and_sizes(
     raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
     pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
     orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
+    meteora_runtime: &BTreeMap<String, runtime_quote::MeteoraRuntimeQuoteState>,
     usd_prices: &PythUsdPrices,
 ) -> Result<(), String> {
     println!("\nRegistry: Active Mint");
 
     let mut registry = ActiveMintRegistry::new();
 
-    for state in raydium_states.into_iter().chain(pumpswap_states).chain(
-        orca_prepared
-            .values()
-            .map(|prepared| prepared.normalized.clone()),
-    ) {
-        let readiness = runtime_quote::readiness_for_pool(
+    for state in raydium_states
+        .into_iter()
+        .chain(pumpswap_states)
+        .chain(
+            orca_prepared
+                .values()
+                .map(|prepared| prepared.normalized.clone()),
+        )
+        .chain(
+            meteora_runtime
+                .values()
+                .map(|runtime| runtime.normalized.clone()),
+        )
+    {
+        let readiness = runtime_quote::readiness_for_pool_with_meteora(
             &state,
             raydium_quote_contexts,
             pumpswap_quote_contexts,
             orca_prepared,
+            meteora_runtime,
         );
 
         registry.upsert(state, readiness)?;
@@ -1459,12 +1507,13 @@ async fn validate_registry_routes_and_sizes(
                 }
             };
 
-            match runtime_quote::quote_route_exact_input(
+            match runtime_quote::quote_route_exact_input_with_meteora(
                 route_candidate,
                 amount_in_raw,
                 raydium_quote_contexts,
                 pumpswap_quote_contexts,
                 orca_prepared,
+                meteora_runtime,
             ) {
                 Ok(route_quote) => {
                     let quote_complete_at_unix_ms = unix_time_ms_now()?;
