@@ -201,10 +201,13 @@ async fn hydrate_observation(
 
     let quote_plan = certified_directional_bin_array_pubkeys(&prepared.snapshot)?;
     if quote_plan != bin_array_pubkeys {
-        return Err(format!(concat!(
-            "Meteora runtime BinArray plan changed between base and quote hydration: ",
-            "base={bin_array_pubkeys:?} quote={quote_plan:?}"
-        )));
+        return Err(format!(
+            concat!(
+                "Meteora runtime BinArray plan changed between base and quote hydration: ",
+                "base={:?} quote={:?}"
+            ),
+            bin_array_pubkeys, quote_plan
+        ));
     }
 
     let snapshot_source_slot = prepared.snapshot.source().source_slot;
@@ -212,9 +215,9 @@ async fn hydrate_observation(
         return Err(format!(
             concat!(
                 "Meteora runtime normalized/snapshot source-slot mismatch: ",
-                "normalized={} snapshot={snapshot_source_slot}"
+                "normalized={} snapshot={}"
             ),
-            prepared.normalized.source_slot
+            prepared.normalized.source_slot, snapshot_source_slot
         ));
     }
 
@@ -271,10 +274,11 @@ fn certified_directional_bin_array_pubkeys_from_parts(
                     format!(
                         concat!(
                             "Meteora runtime certified BinArray search failed: ",
-                            "direction={} index={} error={error:?}"
+                            "direction={} index={} error={:?}"
                         ),
                         direction_label(swap_for_y),
-                        index
+                        index,
+                        error
                     )
                 })?;
 
@@ -301,9 +305,10 @@ fn certified_directional_bin_array_pubkeys_from_parts(
                 format!(
                     concat!(
                         "Meteora runtime directional BinArray index overflow: ",
-                        "direction={} index={index}"
+                        "direction={} index={}"
                     ),
-                    direction_label(swap_for_y)
+                    direction_label(swap_for_y),
+                    index
                 )
             })?;
         }
