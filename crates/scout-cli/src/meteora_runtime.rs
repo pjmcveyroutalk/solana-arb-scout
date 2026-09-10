@@ -1,4 +1,3 @@
-use crate::route::{USDC_MINT, USDT_MINT, WRAPPED_SOL_MINT};
 use crate::rpc_transport;
 use crate::runtime_quote::MeteoraRuntimeQuoteState;
 use crate::ws_transport;
@@ -8,7 +7,6 @@ use scout_cli::meteora::{
     bin_array_bitmap_bit, bin_id_to_bin_array_index, derive_bin_array_pda,
     MeteoraBitmapExtensionState, MeteoraDlmmSnapshot, MeteoraInternalBitmap, BIN_ARRAY_MAX_INDEX,
     BIN_ARRAY_MIN_INDEX, INTERNAL_BITMAP_MAX_INDEX, INTERNAL_BITMAP_MIN_INDEX,
-    LB_PAIR_ACCOUNT_LEN, LB_PAIR_DISCRIMINATOR, METEORA_DLMM_PROGRAM_ID,
 };
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys,
@@ -26,11 +24,6 @@ use tokio_tungstenite::tungstenite::Message;
 const MAX_BIN_ARRAYS_PER_DIRECTION: usize = 3;
 const BASE_HYDRATION_REQUEST_ID: u64 = 61;
 const QUOTE_HYDRATION_REQUEST_ID: u64 = 62;
-const EXACT_PAIR_FORWARD_REQUEST_ID: u64 = 63;
-const EXACT_PAIR_REVERSE_REQUEST_ID: u64 = 64;
-const METEORA_MINT_X_OFFSET: usize = 88;
-const METEORA_MINT_Y_OFFSET: usize = 120;
-const MAX_EXACT_PAIR_CANDIDATES_PER_ORIENTATION: usize = 5;
 
 pub fn program_subscribe_request() -> Value {
     live_program_subscribe_request()
@@ -88,17 +81,44 @@ where
             observation.pubkey, observation.slot, observation.admission.version
         );
 
-        match hydrate_with_next_generation(
+        let base_generation_id = next_generation_id;
+        let quote_generation_id = base_generation_id
+            .checked_add(1)
+            .ok_or_else(|| "Meteora runtime generation id overflow".to_owned())?;
+        next_generation_id = quote_generation_id
+            .checked_add(1)
+            .ok_or_else(|| "Meteora runtime generation id overflow".to_owned())?;
+
+        match hydrate_observation(
             rpc_client,
             rpc_url,
             &observation,
             trigger_received_at_unix_ms,
-            &mut next_generation_id,
+            base_generation_id,
+            quote_generation_id,
         )
         .await
         {
             Ok(runtime) => {
-                insert_runtime_state(&mut prepared, runtime, "meteora_runtime_prepared");
+                let pool_id = runtime.normalized.pool_id.clone();
+                let source_slot = runtime.normalized.source_slot;
+
+                let replace = should_replace_runtime_state(
+                    source_slot,
+                    prepared
+                        .get(&pool_id)
+                        .map(|existing: &MeteoraRuntimeQuoteState| existing.normalized.source_slot),
+                );
+
+                if replace {
+                    println!(
+                        "meteora_runtime_prepared: pool={} source_slot={} generation_id={}",
+                        pool_id,
+                        source_slot,
+                        runtime.snapshot.source().generation_id
+                    );
+                    prepared.insert(pool_id, runtime);
+                }
             }
             Err(error) => {
                 println!(
@@ -116,392 +136,16 @@ where
         observation_window_started.elapsed().as_millis()
     );
 
-    reacquire_canonical_anchor_pair(
-        rpc_client,
-        rpc_url,
-        &mut prepared,
-        &mut next_generation_id,
-    )
-    .await?;
-
     if prepared.is_empty() {
         println!(concat!(
             "meteora_production_admission_unavailable: ",
-            "no bounded runtime-ready Meteora pool observed or reacquired"
+            "no bounded runtime-ready Meteora pool observed"
         ));
     } else {
         println!("READ-ONLY METEORA PRODUCTION ADMISSION PASS");
     }
 
     Ok(prepared)
-}
-
-async fn reacquire_canonical_anchor_pair(
-    rpc_client: &Client,
-    rpc_url: &str,
-    prepared: &mut BTreeMap<String, MeteoraRuntimeQuoteState>,
-    next_generation_id: &mut u64,
-) -> Result<(), String> {
-    for (anchor_mint, intermediate_mint) in [
-        (WRAPPED_SOL_MINT, USDC_MINT),
-        (WRAPPED_SOL_MINT, USDT_MINT),
-    ] {
-        if prepared
-            .values()
-            .any(|runtime| runtime_matches_pair(runtime, anchor_mint, intermediate_mint))
-        {
-            println!(
-                "meteora_exact_pair_reacquisition_not_needed: anchor={} intermediate={}",
-                anchor_mint, intermediate_mint
-            );
-            return Ok(());
-        }
-
-        println!(
-            "meteora_exact_pair_reacquisition_start: anchor={} intermediate={}",
-            anchor_mint, intermediate_mint
-        );
-
-        if let Some(runtime) = discover_exact_pair(
-            rpc_client,
-            rpc_url,
-            anchor_mint,
-            intermediate_mint,
-            next_generation_id,
-        )
-        .await?
-        {
-            println!(
-                concat!(
-                    "meteora_exact_pair_reacquired: anchor={} intermediate={} ",
-                    "pool={} source_slot={}"
-                ),
-                anchor_mint,
-                intermediate_mint,
-                runtime.normalized.pool_id,
-                runtime.normalized.source_slot
-            );
-            insert_runtime_state(
-                prepared,
-                runtime,
-                "meteora_exact_pair_runtime_prepared",
-            );
-            println!("READ-ONLY METEORA EXACT-PAIR REACQUISITION PASS");
-            return Ok(());
-        }
-
-        println!(
-            "meteora_exact_pair_reacquisition_unavailable: anchor={} intermediate={}",
-            anchor_mint, intermediate_mint
-        );
-    }
-
-    Ok(())
-}
-
-async fn discover_exact_pair(
-    rpc_client: &Client,
-    rpc_url: &str,
-    anchor_mint: &str,
-    intermediate_mint: &str,
-    next_generation_id: &mut u64,
-) -> Result<Option<MeteoraRuntimeQuoteState>, String> {
-    for request in pair_lookup_requests(anchor_mint, intermediate_mint) {
-        let request_id = request
-            .get("id")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "Meteora exact-pair request missing id".to_owned())?;
-        let label = format!(
-            "Meteora exact-pair lookup anchor={anchor_mint} intermediate={intermediate_mint} id={request_id}"
-        );
-
-        let payload = match fetch_program_accounts(rpc_client, rpc_url, &request, &label).await {
-            Ok(payload) => payload,
-            Err(error) => {
-                println!(
-                    "meteora_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                    anchor_mint, intermediate_mint
-                );
-                continue;
-            }
-        };
-
-        let observations = match parse_pair_lookup_response(&payload) {
-            Ok(observations) => observations,
-            Err(error) => {
-                println!(
-                    "meteora_exact_pair_lookup_rejected: anchor={} intermediate={} reason={error}",
-                    anchor_mint, intermediate_mint
-                );
-                continue;
-            }
-        };
-
-        println!(
-            "meteora_exact_pair_lookup_parsed: anchor={} intermediate={} observation_count={}",
-            anchor_mint,
-            intermediate_mint,
-            observations.len()
-        );
-
-        for observation in observations
-            .into_iter()
-            .take(MAX_EXACT_PAIR_CANDIDATES_PER_ORIENTATION)
-        {
-            let trigger_received_at_unix_ms = crate::unix_time_ms_now()?;
-
-            let runtime = match hydrate_with_next_generation(
-                rpc_client,
-                rpc_url,
-                &observation,
-                trigger_received_at_unix_ms,
-                next_generation_id,
-            )
-            .await
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    println!(
-                        "meteora_exact_pair_candidate_rejected: pool={} reason={error}",
-                        observation.pubkey
-                    );
-                    continue;
-                }
-            };
-
-            if !runtime_matches_pair(&runtime, anchor_mint, intermediate_mint) {
-                println!(
-                    "meteora_exact_pair_candidate_rejected: pool={} reason=normalized mint pair mismatch",
-                    runtime.normalized.pool_id
-                );
-                continue;
-            }
-
-            return Ok(Some(runtime));
-        }
-    }
-
-    Ok(None)
-}
-
-fn pair_lookup_requests(anchor_mint: &str, intermediate_mint: &str) -> [Value; 2] {
-    [
-        pair_lookup_request(
-            EXACT_PAIR_FORWARD_REQUEST_ID,
-            anchor_mint,
-            intermediate_mint,
-        ),
-        pair_lookup_request(
-            EXACT_PAIR_REVERSE_REQUEST_ID,
-            intermediate_mint,
-            anchor_mint,
-        ),
-    ]
-}
-
-fn pair_lookup_request(request_id: u64, mint_x: &str, mint_y: &str) -> Value {
-    let discriminator = bs58::encode(LB_PAIR_DISCRIMINATOR).into_string();
-
-    json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "getProgramAccounts",
-        "params": [
-            METEORA_DLMM_PROGRAM_ID,
-            {
-                "commitment": "processed",
-                "encoding": "base64",
-                "withContext": true,
-                "filters": [
-                    {
-                        "dataSize": LB_PAIR_ACCOUNT_LEN
-                    },
-                    {
-                        "memcmp": {
-                            "offset": 0,
-                            "bytes": discriminator
-                        }
-                    },
-                    {
-                        "memcmp": {
-                            "offset": METEORA_MINT_X_OFFSET,
-                            "bytes": mint_x
-                        }
-                    },
-                    {
-                        "memcmp": {
-                            "offset": METEORA_MINT_Y_OFFSET,
-                            "bytes": mint_y
-                        }
-                    }
-                ]
-            }
-        ]
-    })
-}
-
-fn parse_pair_lookup_response(payload: &Value) -> Result<Vec<MeteoraLiveObservation>, String> {
-    if let Some(error) = payload.get("error") {
-        return Err(format!(
-            "Meteora exact-pair getProgramAccounts returned an RPC error: {error}"
-        ));
-    }
-
-    let slot = payload
-        .pointer("/result/context/slot")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            "Meteora exact-pair getProgramAccounts response missing context slot".to_owned()
-        })?;
-
-    let accounts = payload
-        .pointer("/result/value")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            "Meteora exact-pair getProgramAccounts response missing account array".to_owned()
-        })?;
-
-    let mut observations = Vec::with_capacity(accounts.len());
-
-    for entry in accounts {
-        let pubkey = entry.get("pubkey").and_then(Value::as_str).ok_or_else(|| {
-            "Meteora exact-pair getProgramAccounts entry missing pubkey".to_owned()
-        })?;
-        let account = entry.get("account").ok_or_else(|| {
-            "Meteora exact-pair getProgramAccounts entry missing account".to_owned()
-        })?;
-
-        let notification = json!({
-            "method": "programNotification",
-            "params": {
-                "result": {
-                    "context": {
-                        "slot": slot
-                    },
-                    "value": {
-                        "pubkey": pubkey,
-                        "account": account
-                    }
-                }
-            }
-        });
-
-        let observation = parse_meteora_program_notification(&notification)?
-            .ok_or_else(|| "Meteora exact-pair lookup account did not decode".to_owned())?;
-
-        if observations
-            .iter()
-            .any(|existing: &MeteoraLiveObservation| existing.pubkey == observation.pubkey)
-        {
-            continue;
-        }
-
-        observations.push(observation);
-    }
-
-    Ok(observations)
-}
-
-async fn fetch_program_accounts(
-    rpc_client: &Client,
-    rpc_url: &str,
-    request: &Value,
-    label: &str,
-) -> Result<Value, String> {
-    let started_at = Instant::now();
-
-    let request_id = request
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("{label} request missing id"))?;
-
-    println!(
-        "rpc_request_start: label={} id={} method=getProgramAccounts",
-        label, request_id
-    );
-
-    let payload = rpc_transport::post_json(rpc_client, rpc_url, request, label)
-        .await
-        .map_err(|error| {
-            format!(
-                "{label} RPC request failed after {} ms: {error}",
-                started_at.elapsed().as_millis()
-            )
-        })?;
-
-    println!(
-        "rpc_request_finish: label={} elapsed_ms={} rpc_error={}",
-        label,
-        started_at.elapsed().as_millis(),
-        payload.get("error").is_some()
-    );
-
-    Ok(payload)
-}
-
-async fn hydrate_with_next_generation(
-    rpc_client: &Client,
-    rpc_url: &str,
-    observation: &MeteoraLiveObservation,
-    trigger_received_at_unix_ms: u64,
-    next_generation_id: &mut u64,
-) -> Result<MeteoraRuntimeQuoteState, String> {
-    let base_generation_id = *next_generation_id;
-    let quote_generation_id = base_generation_id
-        .checked_add(1)
-        .ok_or_else(|| "Meteora runtime generation id overflow".to_owned())?;
-    *next_generation_id = quote_generation_id
-        .checked_add(1)
-        .ok_or_else(|| "Meteora runtime generation id overflow".to_owned())?;
-
-    hydrate_observation(
-        rpc_client,
-        rpc_url,
-        observation,
-        trigger_received_at_unix_ms,
-        base_generation_id,
-        quote_generation_id,
-    )
-    .await
-}
-
-fn insert_runtime_state(
-    prepared: &mut BTreeMap<String, MeteoraRuntimeQuoteState>,
-    runtime: MeteoraRuntimeQuoteState,
-    label: &str,
-) {
-    let pool_id = runtime.normalized.pool_id.clone();
-    let source_slot = runtime.normalized.source_slot;
-
-    let replace = should_replace_runtime_state(
-        source_slot,
-        prepared
-            .get(&pool_id)
-            .map(|existing| existing.normalized.source_slot),
-    );
-
-    if replace {
-        println!(
-            "{}: pool={} source_slot={} generation_id={}",
-            label,
-            pool_id,
-            source_slot,
-            runtime.snapshot.source().generation_id
-        );
-        prepared.insert(pool_id, runtime);
-    }
-}
-
-fn runtime_matches_pair(
-    runtime: &MeteoraRuntimeQuoteState,
-    anchor_mint: &str,
-    intermediate_mint: &str,
-) -> bool {
-    let token_a = runtime.normalized.token_a.mint.as_str();
-    let token_b = runtime.normalized.token_b.mint.as_str();
-
-    (token_a == anchor_mint && token_b == intermediate_mint)
-        || (token_a == intermediate_mint && token_b == anchor_mint)
 }
 
 async fn hydrate_observation(
@@ -771,113 +415,8 @@ mod tests {
         assert_eq!(request.get("id").and_then(Value::as_u64), Some(60));
         assert_eq!(
             request.pointer("/params/0").and_then(Value::as_str),
-            Some(METEORA_DLMM_PROGRAM_ID)
+            Some(scout_cli::meteora::METEORA_DLMM_PROGRAM_ID)
         );
-    }
-
-    #[test]
-    fn exact_pair_lookup_requests_are_bounded_and_bidirectional() -> Result<(), String> {
-        let requests = pair_lookup_requests(WRAPPED_SOL_MINT, USDC_MINT);
-        let discriminator = bs58::encode(LB_PAIR_DISCRIMINATOR).into_string();
-        let expected = [
-            (EXACT_PAIR_FORWARD_REQUEST_ID, WRAPPED_SOL_MINT, USDC_MINT),
-            (EXACT_PAIR_REVERSE_REQUEST_ID, USDC_MINT, WRAPPED_SOL_MINT),
-        ];
-
-        assert_eq!(requests.len(), 2);
-
-        for (request, (request_id, mint_x, mint_y)) in requests.iter().zip(expected) {
-            assert_eq!(request.get("id").and_then(Value::as_u64), Some(request_id));
-            assert_eq!(
-                request.get("method").and_then(Value::as_str),
-                Some("getProgramAccounts")
-            );
-            assert_eq!(
-                request.pointer("/params/0").and_then(Value::as_str),
-                Some(METEORA_DLMM_PROGRAM_ID)
-            );
-            assert_eq!(
-                request
-                    .pointer("/params/1/withContext")
-                    .and_then(Value::as_bool),
-                Some(true)
-            );
-
-            let filters = request
-                .pointer("/params/1/filters")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "Meteora exact-pair lookup must contain filters".to_owned())?;
-
-            assert_eq!(
-                filters.len(),
-                4,
-                "exact-pair lookup must never degrade to a broad pool scan"
-            );
-            assert_eq!(
-                request
-                    .pointer("/params/1/filters/0/dataSize")
-                    .and_then(Value::as_u64),
-                Some(LB_PAIR_ACCOUNT_LEN as u64)
-            );
-            assert_eq!(
-                request
-                    .pointer("/params/1/filters/1/memcmp/offset")
-                    .and_then(Value::as_u64),
-                Some(0)
-            );
-            assert_eq!(
-                request
-                    .pointer("/params/1/filters/1/memcmp/bytes")
-                    .and_then(Value::as_str),
-                Some(discriminator.as_str())
-            );
-            assert_eq!(
-                request
-                    .pointer("/params/1/filters/2/memcmp/offset")
-                    .and_then(Value::as_u64),
-                Some(METEORA_MINT_X_OFFSET as u64)
-            );
-            assert_eq!(
-                request
-                    .pointer("/params/1/filters/2/memcmp/bytes")
-                    .and_then(Value::as_str),
-                Some(mint_x)
-            );
-            assert_eq!(
-                request
-                    .pointer("/params/1/filters/3/memcmp/offset")
-                    .and_then(Value::as_u64),
-                Some(METEORA_MINT_Y_OFFSET as u64)
-            );
-            assert_eq!(
-                request
-                    .pointer("/params/1/filters/3/memcmp/bytes")
-                    .and_then(Value::as_str),
-                Some(mint_y)
-            );
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn exact_pair_parser_rejects_rpc_errors() -> Result<(), String> {
-        let payload = json!({
-            "jsonrpc": "2.0",
-            "id": EXACT_PAIR_FORWARD_REQUEST_ID,
-            "error": {
-                "code": -32000,
-                "message": "bounded test error"
-            }
-        });
-
-        let error = match parse_pair_lookup_response(&payload) {
-            Ok(_) => return Err("Meteora exact-pair RPC error did not fail closed".to_owned()),
-            Err(error) => error,
-        };
-
-        assert!(error.contains("returned an RPC error"));
-        Ok(())
     }
 
     #[test]
@@ -997,7 +536,7 @@ mod tests {
         NormalizedPoolState {
             pool_id: bs58::encode(snapshot.lb_pair_pubkey()).into_string(),
             venue: Venue::Meteora,
-            program_id: METEORA_DLMM_PROGRAM_ID.to_owned(),
+            program_id: scout_cli::meteora::METEORA_DLMM_PROGRAM_ID.to_owned(),
             source_slot: snapshot.source().source_slot,
             token_a: NormalizedToken {
                 mint: bs58::encode(snapshot.mint_x()).into_string(),
