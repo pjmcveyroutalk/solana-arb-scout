@@ -28,8 +28,7 @@ const SOLANA_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const METEORA_DATA_API_URL: &str = "https://dlmm.datapi.meteora.ag/pools";
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
-const METEORA_DLMM_PROGRAM_PUBKEY: Pubkey =
-    pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
+const METEORA_DLMM_PROGRAM_PUBKEY: Pubkey = pubkey!("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
 const BIN_ARRAY_BITMAP_SEED: &[u8] = b"bitmap";
 const QUOTE_AMOUNT_RAW: u64 = 1_000_000;
 const MAX_BIN_ARRAYS_PER_DIRECTION: usize = 3;
@@ -91,9 +90,8 @@ async fn main() -> Result<(), String> {
     let mut examined_count = 0usize;
     let mut observed_candidates = Vec::new();
 
-    for (batch_index, candidate_batch) in bounded_candidates
-        .chunks(CANDIDATE_BATCH_SIZE)
-        .enumerate()
+    for (batch_index, candidate_batch) in
+        bounded_candidates.chunks(CANDIDATE_BATCH_SIZE).enumerate()
     {
         let candidate_payload = fetch_candidate_accounts(&rpc_client, candidate_batch).await?;
         let candidate_slot = candidate_payload
@@ -431,7 +429,9 @@ async fn filter_v3_discovery_candidates(
         let accounts = payload
             .pointer("/result/value")
             .and_then(Value::as_array)
-            .ok_or_else(|| "Meteora M14 BinArray header probe missing result.value array".to_owned())?;
+            .ok_or_else(|| {
+                "Meteora M14 BinArray header probe missing result.value array".to_owned()
+            })?;
         if accounts.len() != pubkey_batch.len() {
             return Err(format!(
                 "Meteora M14 BinArray header account count mismatch: expected={} actual={}",
@@ -464,16 +464,18 @@ async fn filter_v3_discovery_candidates(
                     break;
                 }
                 None => {
-                    failure = Some(format!("BinArray {pubkey} was not included in header probe"));
+                    failure = Some(format!(
+                        "BinArray {pubkey} was not included in header probe"
+                    ));
                     break;
                 }
             }
         }
 
         if let Some(error) = failure {
-            rejection_count = rejection_count.checked_add(1).ok_or_else(|| {
-                "Meteora M14 header rejection counter overflow".to_owned()
-            })?;
+            rejection_count = rejection_count
+                .checked_add(1)
+                .ok_or_else(|| "Meteora M14 header rejection counter overflow".to_owned())?;
             println!(
                 "meteora_m14_candidate_rejected: pool={} reason=batched v3 prefilter: {}",
                 candidate.pool, error
