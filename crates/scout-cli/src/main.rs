@@ -64,6 +64,54 @@ struct PythUsdPrices {
     usdt: Option<SolUsdPrice>,
 }
 
+struct RuntimeQuoteContexts<'a> {
+    raydium: &'a BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    pumpswap: &'a BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    orca: &'a BTreeMap<String, orca_live::PreparedOrca>,
+    meteora: &'a BTreeMap<String, runtime_quote::MeteoraRuntimeQuoteState>,
+}
+
+impl RuntimeQuoteContexts<'_> {
+    fn readiness_for_pool(&self, pool: &NormalizedPoolState) -> Option<quote::QuoteReadiness> {
+        if pool.venue == Venue::Meteora {
+            runtime_quote::readiness_for_pool_with_meteora(
+                pool,
+                self.raydium,
+                self.pumpswap,
+                self.orca,
+                self.meteora,
+            )
+        } else {
+            runtime_quote::readiness_for_pool(pool, self.raydium, self.pumpswap, self.orca)
+        }
+    }
+
+    fn quote_route_exact_input(
+        &self,
+        route: &route::TwoLegRouteCandidate,
+        amount_in_raw: u64,
+    ) -> Result<quote::TwoLegRouteQuote, String> {
+        if route.leg_1().venue() == Venue::Meteora || route.leg_2().venue() == Venue::Meteora {
+            runtime_quote::quote_route_exact_input_with_meteora(
+                route,
+                amount_in_raw,
+                self.raydium,
+                self.pumpswap,
+                self.orca,
+                self.meteora,
+            )
+        } else {
+            runtime_quote::quote_route_exact_input(
+                route,
+                amount_in_raw,
+                self.raydium,
+                self.pumpswap,
+                self.orca,
+            )
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Rung11QuoteRecord {
     route_index: usize,
@@ -225,29 +273,31 @@ async fn main() -> Result<(), String> {
 
     let initial_routes = {
         let mut registry = ActiveMintRegistry::new();
+        let quote_contexts = RuntimeQuoteContexts {
+            raydium: &raydium_quote_contexts,
+            pumpswap: &pumpswap_quote_contexts,
+            orca: &orca_prepared,
+            meteora: &meteora_runtime,
+        };
 
         for state in raydium_states
             .iter()
             .cloned()
             .chain(pumpswap_states.iter().cloned())
             .chain(
-                orca_prepared
+                quote_contexts
+                    .orca
                     .values()
                     .map(|prepared| prepared.normalized.clone()),
             )
             .chain(
-                meteora_runtime
+                quote_contexts
+                    .meteora
                     .values()
                     .map(|runtime| runtime.normalized.clone()),
             )
         {
-            let readiness = runtime_quote::readiness_for_pool_with_meteora(
-                &state,
-                &raydium_quote_contexts,
-                &pumpswap_quote_contexts,
-                &orca_prepared,
-                &meteora_runtime,
-            );
+            let readiness = quote_contexts.readiness_for_pool(&state);
 
             registry.upsert(state, readiness)?;
         }
@@ -289,14 +339,18 @@ async fn main() -> Result<(), String> {
 
     let usd_prices = fetch_pyth_usd_prices(&rpc_client).await?;
 
+    let quote_contexts = RuntimeQuoteContexts {
+        raydium: &raydium_quote_contexts,
+        pumpswap: &pumpswap_quote_contexts,
+        orca: &orca_prepared,
+        meteora: &meteora_runtime,
+    };
+
     validate_registry_routes_and_sizes(
         &rpc_client,
         raydium_states,
         pumpswap_states,
-        &raydium_quote_contexts,
-        &pumpswap_quote_contexts,
-        &orca_prepared,
-        &meteora_runtime,
+        &quote_contexts,
         &usd_prices,
     )
     .await
@@ -1343,10 +1397,7 @@ async fn validate_registry_routes_and_sizes(
     rpc_client: &Client,
     raydium_states: Vec<NormalizedPoolState>,
     pumpswap_states: Vec<NormalizedPoolState>,
-    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
-    pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
-    orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
-    meteora_runtime: &BTreeMap<String, runtime_quote::MeteoraRuntimeQuoteState>,
+    quote_contexts: &RuntimeQuoteContexts<'_>,
     usd_prices: &PythUsdPrices,
 ) -> Result<(), String> {
     println!("\nRegistry: Active Mint");
@@ -1357,23 +1408,19 @@ async fn validate_registry_routes_and_sizes(
         .into_iter()
         .chain(pumpswap_states)
         .chain(
-            orca_prepared
+            quote_contexts
+                .orca
                 .values()
                 .map(|prepared| prepared.normalized.clone()),
         )
         .chain(
-            meteora_runtime
+            quote_contexts
+                .meteora
                 .values()
                 .map(|runtime| runtime.normalized.clone()),
         )
     {
-        let readiness = runtime_quote::readiness_for_pool_with_meteora(
-            &state,
-            raydium_quote_contexts,
-            pumpswap_quote_contexts,
-            orca_prepared,
-            meteora_runtime,
-        );
+        let readiness = quote_contexts.readiness_for_pool(&state);
 
         registry.upsert(state, readiness)?;
     }
@@ -1507,14 +1554,7 @@ async fn validate_registry_routes_and_sizes(
                 }
             };
 
-            match runtime_quote::quote_route_exact_input_with_meteora(
-                route_candidate,
-                amount_in_raw,
-                raydium_quote_contexts,
-                pumpswap_quote_contexts,
-                orca_prepared,
-                meteora_runtime,
-            ) {
+            match quote_contexts.quote_route_exact_input(route_candidate, amount_in_raw) {
                 Ok(route_quote) => {
                     let quote_complete_at_unix_ms = unix_time_ms_now()?;
                     route_grid_quotes += 1;
