@@ -798,11 +798,7 @@ async fn ensure_meteora_raydium_ws_sol_usdc_pair(
             };
 
             for observation in observations {
-                if !raydium_observation_matches_pair(
-                    &observation,
-                    WRAPPED_SOL_MINT,
-                    USDC_MINT,
-                ) {
+                if !raydium_observation_matches_pair(&observation, WRAPPED_SOL_MINT, USDC_MINT) {
                     continue;
                 }
 
