@@ -244,7 +244,7 @@ async fn main() -> Result<(), String> {
     )
     .await?;
 
-    let meteora_runtime = meteora_runtime::observe_and_prepare(
+    let mut meteora_runtime = meteora_runtime::observe_and_prepare(
         &rpc_client,
         SOLANA_RPC_URL,
         &mut reader,
@@ -335,6 +335,25 @@ async fn main() -> Result<(), String> {
         merge_quote_contexts(&mut raydium_quote_contexts, discovered_raydium_contexts);
         merge_normalized_states(&mut pumpswap_states, discovered_pumpswap_states);
         merge_quote_contexts(&mut pumpswap_quote_contexts, discovered_pumpswap_contexts);
+    }
+
+    let has_meteora_route = initial_routes.iter().any(|route| {
+        route.leg_1().venue() == Venue::Meteora || route.leg_2().venue() == Venue::Meteora
+    });
+
+    if !has_meteora_route {
+        let acquired = ensure_meteora_raydium_ws_sol_usdc_pair(
+            &rpc_client,
+            &mut raydium_states,
+            &mut raydium_quote_contexts,
+            &mut meteora_runtime,
+        )
+        .await?;
+
+        println!(
+            "meteora_exact_pair_counterpart_acquired={acquired} anchor={} intermediate={}",
+            WRAPPED_SOL_MINT, USDC_MINT
+        );
     }
 
     let usd_prices = fetch_pyth_usd_prices(&rpc_client).await?;
@@ -739,6 +758,150 @@ async fn discover_orca_cross_venue_counterpart(
     );
 
     Ok((Vec::new(), BTreeMap::new(), Vec::new(), BTreeMap::new()))
+}
+
+async fn ensure_meteora_raydium_ws_sol_usdc_pair(
+    rpc_client: &Client,
+    raydium_states: &mut Vec<NormalizedPoolState>,
+    raydium_quote_contexts: &mut BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    meteora_runtime: &mut BTreeMap<String, runtime_quote::MeteoraRuntimeQuoteState>,
+) -> Result<bool, String> {
+    println!("\nStage B Meteora/Raydium exact-pair evidence acquisition");
+
+    let raydium_pair_ready = raydium_states.iter().any(|state| {
+        normalized_pool_matches_pair(state, WRAPPED_SOL_MINT, USDC_MINT)
+            && raydium_quote_contexts.contains_key(&state.pool_id)
+    });
+
+    if !raydium_pair_ready {
+        let mut incomplete_reason = None;
+        let mut acquired_raydium = None;
+
+        'request: for request in raydium_pair_lookup_requests(WRAPPED_SOL_MINT, USDC_MINT) {
+            let label = format!(
+                "Stage B Raydium exact-pair lookup anchor={} intermediate={}",
+                WRAPPED_SOL_MINT, USDC_MINT
+            );
+            let payload = match fetch_program_accounts(rpc_client, &request, &label).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    incomplete_reason = Some(format!("{label} failed: {error}"));
+                    continue;
+                }
+            };
+            let observations = match parse_raydium_pair_lookup_response(&payload) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    incomplete_reason = Some(format!("{label} parse failed: {error}"));
+                    continue;
+                }
+            };
+
+            for observation in observations {
+                if !raydium_observation_matches_pair(
+                    &observation,
+                    WRAPPED_SOL_MINT,
+                    USDC_MINT,
+                ) {
+                    continue;
+                }
+
+                let (normalized, snapshot) =
+                    match hydrate_raydium_observation(rpc_client, &observation).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            incomplete_reason = Some(format!(
+                                "Stage B Raydium exact-pair hydration failed: pool={} error={}",
+                                observation.pubkey, error
+                            ));
+                            continue;
+                        }
+                    };
+                let context = VenueQuoteContext::Raydium {
+                    pool_id: normalized.pool_id.clone(),
+                    snapshot: &snapshot,
+                };
+
+                if let Err(error) = quote_readiness_for_pool(&normalized, &context) {
+                    incomplete_reason = Some(format!(
+                        "Stage B Raydium exact-pair readiness failed: pool={} error={}",
+                        normalized.pool_id, error
+                    ));
+                    continue;
+                }
+
+                acquired_raydium = Some((normalized, snapshot));
+                break 'request;
+            }
+        }
+
+        match acquired_raydium {
+            Some((normalized, snapshot)) => {
+                let mut contexts = BTreeMap::new();
+                contexts.insert(normalized.pool_id.clone(), snapshot);
+                merge_normalized_states(raydium_states, vec![normalized]);
+                merge_quote_contexts(raydium_quote_contexts, contexts);
+                println!("READ-ONLY STAGE B RAYDIUM WSOL-USDC COUNTERPART PASS");
+            }
+            None => {
+                if let Some(reason) = incomplete_reason {
+                    return Err(reason);
+                }
+
+                println!(
+                    "stage_b_raydium_ws_sol_usdc_counterpart_unavailable: confirmed_no_exact_pair"
+                );
+                return Ok(false);
+            }
+        }
+    }
+
+    if meteora_runtime.values().any(|runtime| {
+        normalized_pool_matches_pair(&runtime.normalized, WRAPPED_SOL_MINT, USDC_MINT)
+    }) {
+        println!("READ-ONLY STAGE B METEORA-RAYDIUM EXACT-PAIR PASS");
+        return Ok(true);
+    }
+
+    let generation_id_start = meteora_runtime
+        .values()
+        .map(|runtime| runtime.snapshot.source().generation_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| "Stage B Meteora exact-pair generation id overflow".to_owned())?;
+
+    let Some(runtime) = meteora_runtime::prepare_exact_pair(
+        rpc_client,
+        SOLANA_RPC_URL,
+        WRAPPED_SOL_MINT,
+        USDC_MINT,
+        generation_id_start,
+    )
+    .await?
+    else {
+        println!("stage_b_meteora_ws_sol_usdc_counterpart_unavailable: confirmed_no_exact_pair");
+        return Ok(false);
+    };
+
+    let pool_id = runtime.normalized.pool_id.clone();
+    let source_slot = runtime.normalized.source_slot;
+    let replace = meteora_runtime
+        .get(&pool_id)
+        .map(|existing| source_slot >= existing.normalized.source_slot)
+        .unwrap_or(true);
+
+    if replace {
+        meteora_runtime.insert(pool_id.clone(), runtime);
+    }
+
+    println!(
+        "stage_b_meteora_exact_pair_prepared: pool={} source_slot={}",
+        pool_id, source_slot
+    );
+    println!("READ-ONLY STAGE B METEORA-RAYDIUM EXACT-PAIR PASS");
+
+    Ok(true)
 }
 
 async fn discover_deterministic_cross_venue_overlap(
@@ -1284,6 +1447,18 @@ fn anchor_pair_from_pool(pool: &NormalizedPoolState) -> Option<(String, String)>
     }
 
     None
+}
+
+fn normalized_pool_matches_pair(
+    pool: &NormalizedPoolState,
+    anchor_mint: &str,
+    intermediate_mint: &str,
+) -> bool {
+    let token_a = pool.token_a.mint.as_str();
+    let token_b = pool.token_b.mint.as_str();
+
+    (token_a == anchor_mint && token_b == intermediate_mint)
+        || (token_b == anchor_mint && token_a == intermediate_mint)
 }
 
 fn raydium_observation_matches_pair(
