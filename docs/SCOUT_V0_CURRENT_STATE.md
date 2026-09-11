@@ -9,8 +9,8 @@ Last updated: 2026-09-10
 - Production branch: `main`
 - Certified `main` SHA: `e8f2f35724ad4bbcabf7cbfca6a8c022ee5a9b45`
 - Certified `main` tree: `9fe29a1b46e356efe5f0e27ef78799236db6c050`
-- Current `scout-dev` SHA: `524dd30b4ba677565de0331b70a985e840e5e049`
-- Current `scout-dev` tree: `9fe29a1b46e356efe5f0e27ef78799236db6c050`
+- Final Stage B source head before documentation-only synchronization: `524dd30b4ba677565de0331b70a985e840e5e049`
+- Certified Stage B source tree: `9fe29a1b46e356efe5f0e27ef78799236db6c050`
 - PR #35 is merged by a standard two-parent merge commit.
 - The certified rollback checkpoint is the exact `main` SHA/tree above, backed by post-merge CI and post-merge live-smoke evidence.
 
@@ -211,5 +211,4 @@ For implementation work:
 - do not advance R15 without the explicit renewed-R14 gate
 
 This file is the durable repo-owned current-state ledger for Scout V0.
-
 
