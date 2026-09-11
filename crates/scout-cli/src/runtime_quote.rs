@@ -461,17 +461,11 @@ mod tests {
                         assert_eq!(adapter.venue(), Venue::Meteora);
                         assert_eq!(adapter.pool_id(), meteora_pool.pool_id.as_str());
                         assert_eq!(adapter.source_slot(), SOURCE_SLOT);
-                        assert!(adapter.contains_pair(
-                            WRAPPED_SOL_MINT,
-                            intermediate_mint.as_str()
-                        ));
+                        assert!(adapter.contains_pair(WRAPPED_SOL_MINT, intermediate_mint.as_str()));
 
                         let capabilities = adapter.capabilities();
                         assert_eq!(capabilities.liquidity_model, LiquidityModel::Dlmm);
-                        assert_eq!(
-                            capabilities.exact_input_quote,
-                            CapabilityState::Supported
-                        );
+                        assert_eq!(capabilities.exact_input_quote, CapabilityState::Supported);
                         assert_eq!(capabilities.auxiliary_state, AuxiliaryStateKind::Bins);
 
                         Ok(())
