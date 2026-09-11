@@ -5,7 +5,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() -> Result<(), String> {
-    let source_paths = env::args_os().skip(1).map(PathBuf::from).collect::<Vec<_>>();
+    let source_paths = env::args_os()
+        .skip(1)
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
 
     if source_paths.len() != temporal::REQUIRED_SOURCE_RUNS {
         return Err(format!(
@@ -16,8 +19,7 @@ fn main() -> Result<(), String> {
     }
 
     let evidence = temporal::aggregate_r12_runs(&source_paths)?;
-    let output_path =
-        Path::new(temporal::OUTPUT_DIRECTORY).join(temporal::OUTPUT_FILE_NAME);
+    let output_path = Path::new(temporal::OUTPUT_DIRECTORY).join(temporal::OUTPUT_FILE_NAME);
 
     temporal::write_evidence(&evidence, &output_path)?;
     temporal::validate_evidence_file(&output_path)?;
