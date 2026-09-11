@@ -1,239 +1,215 @@
 # SCOUT V0 — CURRENT STATE
 
-Last updated: 2026-09-08
+Last updated: 2026-09-10
 
 ## Repository state
 
 - Repository: `pjmcveyroutalk/solana-arb-scout`
 - Canonical integration branch: `scout-dev`
 - Production branch: `main`
-- Current `main` SHA: `bb805a34fdbeede6f0e43f5b754ca98ea86fc8df`
-- Current `scout-dev` SHA: `bb805a34fdbeede6f0e43f5b754ca98ea86fc8df`
-- Branches are intentionally realigned before the Meteora integration sequence begins.
-- Operator workflow remains branch-first: implementation work lands on `scout-dev`, deterministic CI is required before merge, and `main` is not edited casually.
+- Certified `main` SHA: `e8f2f35724ad4bbcabf7cbfca6a8c022ee5a9b45`
+- Certified `main` tree: `9fe29a1b46e356efe5f0e27ef78799236db6c050`
+- Current `scout-dev` SHA: `524dd30b4ba677565de0331b70a985e840e5e049`
+- Current `scout-dev` tree: `9fe29a1b46e356efe5f0e27ef78799236db6c050`
+- PR #35 is merged by a standard two-parent merge commit.
+- The certified rollback checkpoint is the exact `main` SHA/tree above, backed by post-merge CI and post-merge live-smoke evidence.
 
-## H3 closeout
+Operator workflow remains branch-first: implementation work lands on `scout-dev`, evidence is independently verified, canonical Rust 1.80 CI certifies source changes, and `main` is not edited casually.
 
-H3 — centralize RPC and WebSocket transport — is complete and merged.
+## Current milestone state
 
-- PR #7 merged to `main`.
-- H3 deterministic Rust 1.80 CI completed successfully before merge.
-- Shared RPC transport is centralized in `rpc_transport.rs`.
-- Shared WebSocket decoding / subscription lifecycle primitives are centralized in `ws_transport.rs`.
-- Orca runtime paths consume the shared transport primitives.
-- Existing Scout, Orca O1, Orca O2, cross-venue route, and localized-priority paths remain read-only.
+- M13 — Scout Meteora integration: **SEALED**
+- M14 — Meteora frozen/mainnet differential certification: **SEALED**
+- Stage B — normal-runtime Meteora participation + R12 compatibility: **CLOSED**
+- Pre-merge history/integrity audit: **CLOSED**
+- PR #35 merge certification: **CLOSED**
+- New post-merge rollback checkpoint: **CERTIFIED**
+- Phase 4 — documentation/source-of-truth synchronization: **ACTIVE**
+- Stage C — four-venue route activation: **NEXT AFTER PHASE 4**
+- R15 — execution-architecture authorization gate: **HARD BLOCKED**
 
-H3 established the transport and subscription-lifecycle foundation required by Meteora without forcing existing venues into an unnecessary redesign.
+Do not reopen M13 or M14 without verified regression evidence.
 
-## Post-H3 control-plane cleanup
+## Certified post-merge checkpoint
 
-Control-plane cleanup is complete.
+Certified `main`:
 
-- Stale PR #3 was closed without merge.
-- `scout-dev` was realigned to the merged H3 `main`.
-- `.github/workflows/live-smoke.yml` was corrected so live smoke consumes the committed `Cargo.lock` with `cargo run --locked`.
-- The workflow no longer regenerates or mutates dependency resolution before runtime certification.
-- PR #8 merged that single workflow cleanup into `main`.
-- `scout-dev` was realigned again after PR #8.
+`e8f2f35724ad4bbcabf7cbfca6a8c022ee5a9b45`
+
+Certified tree:
+
+`9fe29a1b46e356efe5f0e27ef78799236db6c050`
+
+Post-merge deterministic CI:
+
+- Scout V0 CI #518
+- Run ID: `34545369583`
+- Result: **GREEN**
+- Exact `main`: `e8f2f35724ad4bbcabf7cbfca6a8c022ee5a9b45`
+- Canonical Rust 1.80 preflight: **PASS**
+
+Post-merge runtime certification:
+
+- Scout V0 Live Smoke #83
+- Run ID: `34547165417`
+- Event: `workflow_dispatch`
+- Branch: `main`
+- Exact head: `e8f2f35724ad4bbcabf7cbfca6a8c022ee5a9b45`
+- Result: **GREEN**
+- All 7 workflow jobs passed.
+
+Retained Live Smoke #83 evidence independently verifies:
+
+- R12 completed with 54/54 unique candidate identities.
+- 36 R12 candidates contained truthful Meteora fee serialization.
+- R12 completed normally with a `run_end`.
+- R13 carried all 54 candidates forward.
+- R13 reached maturity.
+- All 6 R13 route-history searches completed with `history_complete=true`.
+- All 6 completed as `no_atomic_match_complete`.
+- R13 ended with `search_incomplete_count=0`.
+- Meteora M14 frozen/mainnet differential evidence remained internally consistent.
+- The M14 frozen payload was passed to Scout unchanged.
+- No native version-byte rewrite occurred.
+- Bilateral M14 quotes remained full-fill with zero unspent input.
+- Meteora localized priority remains truthfully unavailable/unknown until later contention work supplies a supported scope.
+
+Live Smoke #82 previously failed closed when two high-activity route-history searches saturated the bounded history-pagination window. The succeeding #83 run on unchanged certified `main` demonstrates that #82 was not evidence of a Stage B source regression.
+
+## Four-venue runtime state
+
+Scout's current read-only runtime supports evidence across four venues:
+
+- Raydium
+- PumpSwap
+- Orca Whirlpools
+- Meteora DLMM
+
+Meteora is no longer merely a dormant enum/architecture placeholder. Stage B proved that supported Meteora pools can be observed, hydrated/prepared, admitted to the normal runtime registry, routed cross-venue, quoted, serialized into R12 evidence, replayed, and carried into R13 forensics.
+
+The Stage B merge introduced only the approved effective three-file package:
+
+- `crates/scout-cli/src/main.rs`
+- `crates/scout-cli/src/meteora_runtime.rs`
+- `crates/scout-cli/src/recorder.rs`
+
+Sealed M13/M14 source was not reopened by the merge.
+
+## Meteora certification authority
+
+The official differential/reference baseline remains:
+
+- Repository: `MeteoraAg/dlmm-sdk`
+- Commit: `576919e3e4368e542c402f000b4264724f7f23ec`
+- Reference quote function: `commons::quote::quote_exact_in`
+- Meteora DLMM program ID: `LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`
+
+M14 remains a read-only frozen/mainnet differential certification surface. It does not grant transaction construction, signing, submission, borrowing, Treasury mutation, or live-trading authority.
 
 ## Canonical Rust contract
 
 Scout V0 is pinned to Rust 1.80.0 as a source-generation and delivery contract.
 
-Every Rust handoff is expected to satisfy the repository's canonical Rust 1.80 preflight before merge. Formatting is part of source correctness, not post-CI cleanup.
+Every Rust handoff is expected to satisfy the repository's canonical Rust 1.80 preflight before merge. Formatting is part of source correctness, not a post-CI cleanup step.
 
 The canonical preflight remains the authority for:
 
 - Rust 1.80 formatting
 - compilation
-- Clippy
-- tests
-- dependency / lockfile checks
-- Scout safety tripwires
+- Clippy with warnings denied
+- workspace tests
+- committed dependency/lockfile checks
+- Scout read-only capability tripwires
 
-No Rust source is considered Rust-1.80-format-certified until the actual repository preflight passes.
-
-## Runtime certification
-
-Merged `main` SHA:
-
-`bb805a34fdbeede6f0e43f5b754ca98ea86fc8df`
-
-Post-merge deterministic CI completed successfully.
-
-The repaired live-smoke workflow also completed successfully on this exact merged SHA. Successful runtime checks included:
-
-- Scout Existing Live Smoke
-- Orca O1 Live Observation
-- Orca O2 Live Deterministic Parity
-- Orca Cross-Venue Live Route Proof
-- Orca + Raydium Localized Priority Proof
-
-This closes the H3 runtime certification gate.
+No Rust source is considered certified until the actual repository preflight passes.
 
 ## Safety posture
 
-Scout remains read-only.
+Scout V0 remains read-only.
 
-The repository continues to deny or tripwire unsafe execution behavior in the current development phase. No signing or transaction-submission authority is being introduced as part of the Meteora market-data / quote integration.
+Current work does **not** authorize:
 
-Meteora implementation must preserve this boundary until a later, explicitly authorized execution phase.
+- private keys
+- signing
+- transaction submission or broadcast
+- bundles or Jito searcher execution
+- TPU execution
+- Treasury mutation
+- borrowing execution
+- flash execution
+- live trading
 
-## Current venue architecture
+Public on-chain observation, deterministic quote reconstruction, evidence recording, replay, forensics, and read-only certification remain allowed.
 
-Scout's venue-neutral core already supports the concepts required for Meteora integration, including:
+R15 remains **HARD BLOCKED** unless a renewed evidence-based R14 decision explicitly returns `SELECT_NICHE`. Even a future `SELECT_NICHE` result would not itself authorize keys, signing, submission, Treasury mutation, flash execution, or live trading.
 
-- `Venue::Meteora`
-- `LiquidityModel::Dlmm`
-- `AuxiliaryStateKind::Bins`
-- normalized pool state
-- venue capability and trading state
-- Token-2022 policy gating
-- route-level requested / consumed / unspent input accounting
-- source-slot tracking
+## Current active phase — Phase 4
 
-Meteora is recognized by the runtime quote layer but remains fail-closed until its implementation is enabled.
+Phase 4 exists to make GitHub and the canonical Drive documents tell the same current story before Stage C begins.
 
-Existing production-proven venue paths remain intact:
+Required synchronization:
 
-- Raydium
-- PumpSwap
-- Orca Whirlpools
+1. Update this repo-owned `docs/SCOUT_V0_CURRENT_STATE.md` ledger.
+2. Update the canonical post-M14 Working Blueprint with the exact final Stage B, merge, CI, and Live Smoke evidence.
+3. Update the canonical rolling Scout Master Handoff continuation marker.
+4. Verify no competing current-state document still presents an older milestone as current.
+5. Preserve archive/recovery chronology intact.
 
-Meteora is additive; this is not a venue-architecture rewrite.
+Stage C must not begin until Phase 4 is verified complete.
 
-## Meteora DLMM implementation authority
+## Next build phase — Stage C
 
-The canonical integration authority is:
+After Phase 4 closes, the next active build phase is:
 
-`SOLANA ARB SCOUT V0 — METEORA DLMM INTEGRATION HANDOFF`
+**Stage C — Four-Venue Route Activation**
 
-Status: Integration-Ready Research Package.
+Stage C is intended to move from Stage B proof that Meteora can participate in normal runtime routes to deliberate, deterministic four-venue route activation coverage.
 
-Research is closed for the initial integration scope. Do not restart broad research, redesign the architecture, import Anchor, or substitute the full Meteora SDK into Scout.
+The Stage C sequence is:
 
-Official differential/reference baseline:
+- C01 — audit exact current route/dispatch/readiness interfaces after the Stage B merge
+- C02 — define the supported venue-pair matrix for Raydium, PumpSwap, Orca, and Meteora
+- C03 — prove existing structural route-validity rules remain venue-neutral
+- C04 — add deterministic dispatch/readiness coverage for Meteora combinations supported by evidence
+- C05 — preserve full-fill exact-input admission semantics
+- C06 — preserve source-slot/freshness provenance across both legs
+- C07 — prove no duplicate/invalid same-venue or mismatched-pair routes
+- C08 — canonical Rust 1.80 CI
+- C09 — dedicated live Stage C evidence gate
+- C10 — close Stage C only after live multi-venue route evidence is inspectable and reproducible
 
-- repository: `MeteoraAg/dlmm-sdk`
-- commit: `576919e3e4368e542c402f000b4264724f7f23ec`
+Do not skip Stage C gates or advance directly to later contention, priority, repeated-observation, or execution work.
 
-Meteora DLMM program ID:
+## Later evidence sequence
 
-`LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo`
+After Stage C, the canonical post-M14 sequence remains:
 
-## Initial Meteora scope
+- Stage D — Meteora contention footprint
+- Stage E — localized priority / competition
+- Stage F — repeated observation / temporal evidence
+- Stages G/H/I/J — bounded dataset, captureability forensics, cohort reconstruction, and renewed R14 decision
+- R15 — blocked authorization gate, reachable only if renewed R14 explicitly returns `SELECT_NICHE`
 
-Initial implementation is intentionally narrow:
-
-- DLMM
-- exact-input
-- `Swap2`
-- SPL Token
-- currently allowed Token-2022 subset
-- profile `0.12.0`
-- BinArray v3
-- native Rust implementation
-- coherent hydration
-- limit-order liquidity included in quote truth
-- dynamic fees
-- bitmap extension
-- full-fill arbitrage admission
-
-Deferred:
-
-- exact-output
-- unsupported Token-2022 transfer-fee / transfer-hook / scaled-UI behavior
-- DAMM v2
-- limit-order placement / cancellation
-- generalized host-fee support
-- ALT correctness as an execution dependency
-
-Unknown or unsupported token behavior remains fail-closed.
-
-## Meteora data-coherence contract
-
-WebSocket activity is a dirty signal.
-
-HTTP hydration is authoritative.
-
-The integration must preserve:
-
-- dirty-slot watermark
-- `getMultipleAccounts` minimum-context-slot floor
-- generation validation
-- refresh-again-if-authoritative-slot-is-behind
-- reconnect invalidation
-- readiness only after authoritative bootstrap
-
-Subscription lifecycle semantics are venue-neutral:
-
-`requested != confirmed != bootstrapped != ready`
-
-A confirmed subscription alone is never equivalent to quote readiness.
-
-## Operational readiness tiers
-
-Meteora pools progress through:
-
-`COLD -> WARM -> HOT -> EXECUTION_CANDIDATE`
-
-These tiers describe operational readiness and must not be collapsed into a single subscribed / not-subscribed flag.
-
-## Canonical Meteora roadmap
-
-M1 — constants / profile
-
-M2 — strict decoders
-
-M3 — bin / PDA primitives
-
-M4 — bitmap traversal
-
-M5 — immutable snapshot
-
-M6 — core arithmetic
-
-M7 — limit-order liquidity
-
-M8 — exact-input traversal
-
-M9 — hydration planner
-
-M10 — native `Swap2` serializer
-
-M11 — `ExecutionAccountPlan`
-
-M12 — v0 compile + simulation
-
-M13 — Scout integration
-
-M14 — frozen / mainnet certification
-
-This M1-M14 sequence is authoritative. Do not invent or resurrect unsupported H4-H9 historical milestone names.
-
-## Immediate next step
-
-Begin **M1 — constants / profile** on `scout-dev`.
-
-M1 should establish only the smallest stable Meteora surface required by later phases: canonical program identity, supported profile/version identity, narrowly scoped constants, and fail-closed configuration contracts.
-
-Do not advance arithmetic, account decoding, traversal, serializer, or execution-plan logic into M1 unless the repository or canonical Meteora handoff proves it belongs there.
+Meteora localized priority being unavailable/unknown before Stage D/E is intentional and must remain truthful.
 
 ## Operator handoff rules
 
 For implementation work:
 
-- research / audit first
-- retrieve exact current source before modifying it
-- full replacement files only
-- no patches
-- one file at a time when practical
+- research and audit first
+- verify exact live repository state before proposing mutation
+- complete-file replacement only
+- no patches or line-edit instructions
+- one operator action at a time
 - Rust 1.80 compatibility is mandatory
-- GitHub CI is the certification authority
-- do not ask the operator to format or debug generated Rust
-- do not mutate `main` directly
-- no tracking parameters in GitHub links
-- no execution authority without an explicit later-phase decision
+- GitHub CI certifies source changes
+- do not make the operator format or debug generated Rust
+- do not mutate `main` casually
+- preserve M13/M14 seals absent verified regression
+- keep V0 read-only
+- keep Cross-Chain/RWA and Pulse Field Lab isolated from this build
+- do not advance R15 without the explicit renewed-R14 gate
 
 This file is the durable repo-owned current-state ledger for Scout V0.
+
 
