@@ -3,6 +3,7 @@ mod discovery;
 pub mod economics;
 mod forensics;
 mod forensics_rpc;
+mod meteora_runtime;
 mod orca;
 mod orca_live;
 mod orca_o2;
@@ -52,6 +53,8 @@ const R13_MATURITY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_SLOT_OBSERVATIONS: usize = 5;
 const MAX_RAYDIUM_OBSERVATIONS: usize = 5;
 const MAX_PUMPSWAP_OBSERVATIONS: usize = 15;
+const MAX_METEORA_OBSERVATIONS: usize = 10;
+const METEORA_OBSERVATION_WINDOW: Duration = Duration::from_secs(15);
 const MAX_TARGETED_ROUTE_LOOKUPS: usize = 15;
 
 #[derive(Debug)]
@@ -59,6 +62,54 @@ struct PythUsdPrices {
     sol: SolUsdPrice,
     usdc: Option<SolUsdPrice>,
     usdt: Option<SolUsdPrice>,
+}
+
+struct RuntimeQuoteContexts<'a> {
+    raydium: &'a BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    pumpswap: &'a BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
+    orca: &'a BTreeMap<String, orca_live::PreparedOrca>,
+    meteora: &'a BTreeMap<String, runtime_quote::MeteoraRuntimeQuoteState>,
+}
+
+impl RuntimeQuoteContexts<'_> {
+    fn readiness_for_pool(&self, pool: &NormalizedPoolState) -> Option<quote::QuoteReadiness> {
+        if pool.venue == Venue::Meteora {
+            runtime_quote::readiness_for_pool_with_meteora(
+                pool,
+                self.raydium,
+                self.pumpswap,
+                self.orca,
+                self.meteora,
+            )
+        } else {
+            runtime_quote::readiness_for_pool(pool, self.raydium, self.pumpswap, self.orca)
+        }
+    }
+
+    fn quote_route_exact_input(
+        &self,
+        route: &route::TwoLegRouteCandidate,
+        amount_in_raw: u64,
+    ) -> Result<quote::TwoLegRouteQuote, String> {
+        if route.leg_1().venue() == Venue::Meteora || route.leg_2().venue() == Venue::Meteora {
+            runtime_quote::quote_route_exact_input_with_meteora(
+                route,
+                amount_in_raw,
+                self.raydium,
+                self.pumpswap,
+                self.orca,
+                self.meteora,
+            )
+        } else {
+            runtime_quote::quote_route_exact_input(
+                route,
+                amount_in_raw,
+                self.raydium,
+                self.pumpswap,
+                self.orca,
+            )
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -175,6 +226,33 @@ async fn main() -> Result<(), String> {
     let orca_prepared =
         orca_runtime::observe_and_prepare(&rpc_client, SOLANA_RPC_URL, &mut reader).await?;
 
+    let meteora_request = meteora_runtime::program_subscribe_request();
+    let meteora_subscription_id = meteora_request
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "Meteora subscription request missing id".to_owned())?;
+
+    writer
+        .send(Message::Text(meteora_request.to_string()))
+        .await
+        .map_err(|error| format!("could not subscribe to Meteora DLMM: {error}"))?;
+
+    ws_transport::wait_for_subscription_confirmation(
+        &mut reader,
+        meteora_subscription_id,
+        "Meteora DLMM",
+    )
+    .await?;
+
+    let mut meteora_runtime = meteora_runtime::observe_and_prepare(
+        &rpc_client,
+        SOLANA_RPC_URL,
+        &mut reader,
+        MAX_METEORA_OBSERVATIONS,
+        METEORA_OBSERVATION_WINDOW,
+    )
+    .await?;
+
     let (
         discovered_orca_raydium_states,
         discovered_orca_raydium_contexts,
@@ -195,23 +273,31 @@ async fn main() -> Result<(), String> {
 
     let initial_routes = {
         let mut registry = ActiveMintRegistry::new();
+        let quote_contexts = RuntimeQuoteContexts {
+            raydium: &raydium_quote_contexts,
+            pumpswap: &pumpswap_quote_contexts,
+            orca: &orca_prepared,
+            meteora: &meteora_runtime,
+        };
 
         for state in raydium_states
             .iter()
             .cloned()
             .chain(pumpswap_states.iter().cloned())
             .chain(
-                orca_prepared
+                quote_contexts
+                    .orca
                     .values()
                     .map(|prepared| prepared.normalized.clone()),
             )
+            .chain(
+                quote_contexts
+                    .meteora
+                    .values()
+                    .map(|runtime| runtime.normalized.clone()),
+            )
         {
-            let readiness = runtime_quote::readiness_for_pool(
-                &state,
-                &raydium_quote_contexts,
-                &pumpswap_quote_contexts,
-                &orca_prepared,
-            );
+            let readiness = quote_contexts.readiness_for_pool(&state);
 
             registry.upsert(state, readiness)?;
         }
@@ -251,15 +337,39 @@ async fn main() -> Result<(), String> {
         merge_quote_contexts(&mut pumpswap_quote_contexts, discovered_pumpswap_contexts);
     }
 
+    let has_meteora_route = initial_routes.iter().any(|route| {
+        route.leg_1().venue() == Venue::Meteora || route.leg_2().venue() == Venue::Meteora
+    });
+
+    if !has_meteora_route {
+        let acquired = ensure_meteora_raydium_ws_sol_usdc_pair(
+            &rpc_client,
+            &mut raydium_states,
+            &mut raydium_quote_contexts,
+            &mut meteora_runtime,
+        )
+        .await?;
+
+        println!(
+            "meteora_exact_pair_counterpart_acquired={acquired} anchor={} intermediate={}",
+            WRAPPED_SOL_MINT, USDC_MINT
+        );
+    }
+
     let usd_prices = fetch_pyth_usd_prices(&rpc_client).await?;
+
+    let quote_contexts = RuntimeQuoteContexts {
+        raydium: &raydium_quote_contexts,
+        pumpswap: &pumpswap_quote_contexts,
+        orca: &orca_prepared,
+        meteora: &meteora_runtime,
+    };
 
     validate_registry_routes_and_sizes(
         &rpc_client,
         raydium_states,
         pumpswap_states,
-        &raydium_quote_contexts,
-        &pumpswap_quote_contexts,
-        &orca_prepared,
+        &quote_contexts,
         &usd_prices,
     )
     .await
@@ -648,6 +758,146 @@ async fn discover_orca_cross_venue_counterpart(
     );
 
     Ok((Vec::new(), BTreeMap::new(), Vec::new(), BTreeMap::new()))
+}
+
+async fn ensure_meteora_raydium_ws_sol_usdc_pair(
+    rpc_client: &Client,
+    raydium_states: &mut Vec<NormalizedPoolState>,
+    raydium_quote_contexts: &mut BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
+    meteora_runtime: &mut BTreeMap<String, runtime_quote::MeteoraRuntimeQuoteState>,
+) -> Result<bool, String> {
+    println!("\nStage B Meteora/Raydium exact-pair evidence acquisition");
+
+    let raydium_pair_ready = raydium_states.iter().any(|state| {
+        normalized_pool_matches_pair(state, WRAPPED_SOL_MINT, USDC_MINT)
+            && raydium_quote_contexts.contains_key(&state.pool_id)
+    });
+
+    if !raydium_pair_ready {
+        let mut incomplete_reason = None;
+        let mut acquired_raydium = None;
+
+        'request: for request in raydium_pair_lookup_requests(WRAPPED_SOL_MINT, USDC_MINT) {
+            let label = format!(
+                "Stage B Raydium exact-pair lookup anchor={} intermediate={}",
+                WRAPPED_SOL_MINT, USDC_MINT
+            );
+            let payload = match fetch_program_accounts(rpc_client, &request, &label).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    incomplete_reason = Some(format!("{label} failed: {error}"));
+                    continue;
+                }
+            };
+            let observations = match parse_raydium_pair_lookup_response(&payload) {
+                Ok(observations) => observations,
+                Err(error) => {
+                    incomplete_reason = Some(format!("{label} parse failed: {error}"));
+                    continue;
+                }
+            };
+
+            for observation in observations {
+                if !raydium_observation_matches_pair(&observation, WRAPPED_SOL_MINT, USDC_MINT) {
+                    continue;
+                }
+
+                let (normalized, snapshot) =
+                    match hydrate_raydium_observation(rpc_client, &observation).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            incomplete_reason = Some(format!(
+                                "Stage B Raydium exact-pair hydration failed: pool={} error={}",
+                                observation.pubkey, error
+                            ));
+                            continue;
+                        }
+                    };
+                let context = VenueQuoteContext::Raydium {
+                    pool_id: normalized.pool_id.clone(),
+                    snapshot: &snapshot,
+                };
+
+                if let Err(error) = quote_readiness_for_pool(&normalized, &context) {
+                    incomplete_reason = Some(format!(
+                        "Stage B Raydium exact-pair readiness failed: pool={} error={}",
+                        normalized.pool_id, error
+                    ));
+                    continue;
+                }
+
+                acquired_raydium = Some((normalized, snapshot));
+                break 'request;
+            }
+        }
+
+        match acquired_raydium {
+            Some((normalized, snapshot)) => {
+                let mut contexts = BTreeMap::new();
+                contexts.insert(normalized.pool_id.clone(), snapshot);
+                merge_normalized_states(raydium_states, vec![normalized]);
+                merge_quote_contexts(raydium_quote_contexts, contexts);
+                println!("READ-ONLY STAGE B RAYDIUM WSOL-USDC COUNTERPART PASS");
+            }
+            None => {
+                if let Some(reason) = incomplete_reason {
+                    return Err(reason);
+                }
+
+                println!(
+                    "stage_b_raydium_ws_sol_usdc_counterpart_unavailable: confirmed_no_exact_pair"
+                );
+                return Ok(false);
+            }
+        }
+    }
+
+    if meteora_runtime.values().any(|runtime| {
+        normalized_pool_matches_pair(&runtime.normalized, WRAPPED_SOL_MINT, USDC_MINT)
+    }) {
+        println!("READ-ONLY STAGE B METEORA-RAYDIUM EXACT-PAIR PASS");
+        return Ok(true);
+    }
+
+    let generation_id_start = meteora_runtime
+        .values()
+        .map(|runtime| runtime.snapshot.source().generation_id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| "Stage B Meteora exact-pair generation id overflow".to_owned())?;
+
+    let Some(runtime) = meteora_runtime::prepare_exact_pair(
+        rpc_client,
+        SOLANA_RPC_URL,
+        WRAPPED_SOL_MINT,
+        USDC_MINT,
+        generation_id_start,
+    )
+    .await?
+    else {
+        println!("stage_b_meteora_ws_sol_usdc_counterpart_unavailable: confirmed_no_exact_pair");
+        return Ok(false);
+    };
+
+    let pool_id = runtime.normalized.pool_id.clone();
+    let source_slot = runtime.normalized.source_slot;
+    let replace = meteora_runtime
+        .get(&pool_id)
+        .map(|existing| source_slot >= existing.normalized.source_slot)
+        .unwrap_or(true);
+
+    if replace {
+        meteora_runtime.insert(pool_id.clone(), runtime);
+    }
+
+    println!(
+        "stage_b_meteora_exact_pair_prepared: pool={} source_slot={}",
+        pool_id, source_slot
+    );
+    println!("READ-ONLY STAGE B METEORA-RAYDIUM EXACT-PAIR PASS");
+
+    Ok(true)
 }
 
 async fn discover_deterministic_cross_venue_overlap(
@@ -1195,6 +1445,18 @@ fn anchor_pair_from_pool(pool: &NormalizedPoolState) -> Option<(String, String)>
     None
 }
 
+fn normalized_pool_matches_pair(
+    pool: &NormalizedPoolState,
+    anchor_mint: &str,
+    intermediate_mint: &str,
+) -> bool {
+    let token_a = pool.token_a.mint.as_str();
+    let token_b = pool.token_b.mint.as_str();
+
+    (token_a == anchor_mint && token_b == intermediate_mint)
+        || (token_b == anchor_mint && token_a == intermediate_mint)
+}
+
 fn raydium_observation_matches_pair(
     observation: &raydium::RaydiumCpmmAccountObservation,
     anchor_mint: &str,
@@ -1306,26 +1568,30 @@ async fn validate_registry_routes_and_sizes(
     rpc_client: &Client,
     raydium_states: Vec<NormalizedPoolState>,
     pumpswap_states: Vec<NormalizedPoolState>,
-    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
-    pumpswap_quote_contexts: &BTreeMap<String, pumpswap::PumpSwapHydrationSnapshot>,
-    orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
+    quote_contexts: &RuntimeQuoteContexts<'_>,
     usd_prices: &PythUsdPrices,
 ) -> Result<(), String> {
     println!("\nRegistry: Active Mint");
 
     let mut registry = ActiveMintRegistry::new();
 
-    for state in raydium_states.into_iter().chain(pumpswap_states).chain(
-        orca_prepared
-            .values()
-            .map(|prepared| prepared.normalized.clone()),
-    ) {
-        let readiness = runtime_quote::readiness_for_pool(
-            &state,
-            raydium_quote_contexts,
-            pumpswap_quote_contexts,
-            orca_prepared,
-        );
+    for state in raydium_states
+        .into_iter()
+        .chain(pumpswap_states)
+        .chain(
+            quote_contexts
+                .orca
+                .values()
+                .map(|prepared| prepared.normalized.clone()),
+        )
+        .chain(
+            quote_contexts
+                .meteora
+                .values()
+                .map(|runtime| runtime.normalized.clone()),
+        )
+    {
+        let readiness = quote_contexts.readiness_for_pool(&state);
 
         registry.upsert(state, readiness)?;
     }
@@ -1459,13 +1725,7 @@ async fn validate_registry_routes_and_sizes(
                 }
             };
 
-            match runtime_quote::quote_route_exact_input(
-                route_candidate,
-                amount_in_raw,
-                raydium_quote_contexts,
-                pumpswap_quote_contexts,
-                orca_prepared,
-            ) {
+            match quote_contexts.quote_route_exact_input(route_candidate, amount_in_raw) {
                 Ok(route_quote) => {
                     let quote_complete_at_unix_ms = unix_time_ms_now()?;
                     route_grid_quotes += 1;
@@ -1563,8 +1823,8 @@ async fn validate_registry_routes_and_sizes(
             rpc_client,
             route_candidate.leg_1(),
             route_candidate.leg_2(),
-            raydium_quote_contexts,
-            orca_prepared,
+            quote_contexts.raydium,
+            quote_contexts.orca,
             &mut priority_cache,
         )
         .await;
