@@ -28,6 +28,8 @@ mod registry;
 mod route;
 #[path = "../rpc_transport.rs"]
 mod rpc_transport;
+#[path = "../runtime_quote.rs"]
+mod runtime_quote;
 #[path = "../sizing.rs"]
 mod sizing;
 
