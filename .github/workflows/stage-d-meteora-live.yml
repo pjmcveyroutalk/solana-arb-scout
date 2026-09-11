@@ -1,0 +1,45 @@
+name: Scout Stage D Meteora Live
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/stage-d-meteora-live.yml"
+      - "crates/scout-cli/src/bin/meteora-contention-live.rs"
+      - "crates/scout-cli/src/meteora_contention.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  meteora-stage-d-live:
+    name: Meteora Stage D Live Contention Proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.80
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.80.0 --profile minimal
+
+      - name: Run read-only Meteora Stage D proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 240s rustup run 1.80.0 cargo run --locked -p scout-cli --bin meteora-contention-live
+
+      - name: Upload Stage D contention evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meteora-stage-d-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/stage-d-meteora/contention.json
+          if-no-files-found: error
+          retention-days: 14
