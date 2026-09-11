@@ -338,12 +338,7 @@ mod tests {
 
     #[test]
     fn meteora_dlmm_and_raydium_generate_both_route_directions_without_cpmm_reserves() {
-        let mut meteora = sample_pool(
-            Venue::Meteora,
-            "meteora-pool",
-            WRAPPED_SOL_MINT,
-            TEST_TOKEN,
-        );
+        let mut meteora = sample_pool(Venue::Meteora, "meteora-pool", WRAPPED_SOL_MINT, TEST_TOKEN);
         meteora.quote_reserves = QuoteReserveState::Unavailable;
 
         let raydium = sample_pool(
@@ -360,12 +355,7 @@ mod tests {
 
     #[test]
     fn meteora_dlmm_and_pumpswap_generate_both_route_directions_without_cpmm_reserves() {
-        let mut meteora = sample_pool(
-            Venue::Meteora,
-            "meteora-pool",
-            WRAPPED_SOL_MINT,
-            TEST_TOKEN,
-        );
+        let mut meteora = sample_pool(Venue::Meteora, "meteora-pool", WRAPPED_SOL_MINT, TEST_TOKEN);
         meteora.quote_reserves = QuoteReserveState::Unavailable;
 
         let pumpswap = sample_pool(
@@ -382,12 +372,7 @@ mod tests {
 
     #[test]
     fn meteora_dlmm_and_orca_generate_both_route_directions_without_cpmm_reserves() {
-        let mut meteora = sample_pool(
-            Venue::Meteora,
-            "meteora-pool",
-            WRAPPED_SOL_MINT,
-            TEST_TOKEN,
-        );
+        let mut meteora = sample_pool(Venue::Meteora, "meteora-pool", WRAPPED_SOL_MINT, TEST_TOKEN);
         meteora.quote_reserves = QuoteReserveState::Unavailable;
 
         let mut orca = sample_pool(Venue::Orca, "orca-pool", TEST_TOKEN, WRAPPED_SOL_MINT);
