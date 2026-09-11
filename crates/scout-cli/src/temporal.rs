@@ -772,7 +772,10 @@ mod tests {
         write_source(&paths[1], "run-a", 1_500, "economics_unresolved")?;
         write_source(&paths[2], "run-c", 2_000, "economics_unresolved")?;
 
-        let error = aggregate_r12_runs(&paths).expect_err("duplicate run id must fail closed");
+        let error = match aggregate_r12_runs(&paths) {
+            Ok(_) => return Err("duplicate run id unexpectedly succeeded".to_owned()),
+            Err(error) => error,
+        };
         assert!(error.contains("duplicate R12 run_id"));
 
         remove_dir_all(&dir).map_err(|cleanup_error| {
@@ -823,7 +826,10 @@ mod tests {
         }
         write(&path, bytes).map_err(|error| format!("test source write failed: {error}"))?;
 
-        let error = parse_completed_r12_run(&path).expect_err("identity mismatch must fail closed");
+        let error = match parse_completed_r12_run(&path) {
+            Ok(_) => return Err("identity mismatch unexpectedly succeeded".to_owned()),
+            Err(error) => error,
+        };
         assert!(error.contains("candidate identity mismatch"));
 
         remove_dir_all(&dir).map_err(|cleanup_error| {
