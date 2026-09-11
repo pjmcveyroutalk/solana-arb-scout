@@ -232,6 +232,24 @@ mod tests {
         }
     }
 
+    fn assert_bidirectional_pair(routes: &[TwoLegRouteCandidate], left: Venue, right: Venue) {
+        assert_eq!(routes.len(), 2);
+
+        assert!(routes.iter().any(|route| {
+            route.leg_1().venue() == left
+                && route.leg_2().venue() == right
+                && route.anchor_mint() == WRAPPED_SOL_MINT
+                && route.intermediate_mint() == TEST_TOKEN
+        }));
+
+        assert!(routes.iter().any(|route| {
+            route.leg_1().venue() == right
+                && route.leg_2().venue() == left
+                && route.anchor_mint() == WRAPPED_SOL_MINT
+                && route.intermediate_mint() == TEST_TOKEN
+        }));
+    }
+
     #[test]
     fn valid_cross_venue_pair_generates_both_directions() {
         let pools = vec![
@@ -316,6 +334,68 @@ mod tests {
                 && route.anchor_mint() == WRAPPED_SOL_MINT
                 && route.intermediate_mint() == TEST_TOKEN
         }));
+    }
+
+    #[test]
+    fn meteora_dlmm_and_raydium_generate_both_route_directions_without_cpmm_reserves() {
+        let mut meteora = sample_pool(
+            Venue::Meteora,
+            "meteora-pool",
+            WRAPPED_SOL_MINT,
+            TEST_TOKEN,
+        );
+        meteora.quote_reserves = QuoteReserveState::Unavailable;
+
+        let raydium = sample_pool(
+            Venue::RaydiumCpmm,
+            "raydium-pool",
+            WRAPPED_SOL_MINT,
+            TEST_TOKEN,
+        );
+
+        let routes = generate_two_leg_routes(&[meteora, raydium]);
+
+        assert_bidirectional_pair(&routes, Venue::Meteora, Venue::RaydiumCpmm);
+    }
+
+    #[test]
+    fn meteora_dlmm_and_pumpswap_generate_both_route_directions_without_cpmm_reserves() {
+        let mut meteora = sample_pool(
+            Venue::Meteora,
+            "meteora-pool",
+            WRAPPED_SOL_MINT,
+            TEST_TOKEN,
+        );
+        meteora.quote_reserves = QuoteReserveState::Unavailable;
+
+        let pumpswap = sample_pool(
+            Venue::PumpSwap,
+            "pumpswap-pool",
+            TEST_TOKEN,
+            WRAPPED_SOL_MINT,
+        );
+
+        let routes = generate_two_leg_routes(&[meteora, pumpswap]);
+
+        assert_bidirectional_pair(&routes, Venue::Meteora, Venue::PumpSwap);
+    }
+
+    #[test]
+    fn meteora_dlmm_and_orca_generate_both_route_directions_without_cpmm_reserves() {
+        let mut meteora = sample_pool(
+            Venue::Meteora,
+            "meteora-pool",
+            WRAPPED_SOL_MINT,
+            TEST_TOKEN,
+        );
+        meteora.quote_reserves = QuoteReserveState::Unavailable;
+
+        let mut orca = sample_pool(Venue::Orca, "orca-pool", TEST_TOKEN, WRAPPED_SOL_MINT);
+        orca.quote_reserves = QuoteReserveState::Unavailable;
+
+        let routes = generate_two_leg_routes(&[meteora, orca]);
+
+        assert_bidirectional_pair(&routes, Venue::Meteora, Venue::Orca);
     }
 
     #[test]
@@ -442,3 +522,4 @@ mod tests {
         assert_eq!(keys.len(), routes.len());
     }
 }
+
