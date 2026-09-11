@@ -1815,11 +1815,8 @@ async fn validate_registry_routes_and_sizes(
 
         let quote_bound_scope = route_candidate.leg_1().venue() == Venue::Meteora
             || route_candidate.leg_2().venue() == Venue::Meteora;
-        let observation_key = route_priority_observation_key(
-            record.route_index,
-            record.dollars,
-            quote_bound_scope,
-        );
+        let observation_key =
+            route_priority_observation_key(record.route_index, record.dollars, quote_bound_scope);
 
         if route_priority_observations.contains_key(&observation_key) {
             continue;
@@ -1853,11 +1850,8 @@ async fn validate_registry_routes_and_sizes(
 
         let quote_bound_scope = route_candidate.leg_1().venue() == Venue::Meteora
             || route_candidate.leg_2().venue() == Venue::Meteora;
-        let observation_key = route_priority_observation_key(
-            record.route_index,
-            record.dollars,
-            quote_bound_scope,
-        );
+        let observation_key =
+            route_priority_observation_key(record.route_index, record.dollars, quote_bound_scope);
 
         let priority_observation = if let Some(observation) =
             route_priority_observations.get(&observation_key)
@@ -2549,4 +2543,3 @@ mod tests {
         );
     }
 }
-
