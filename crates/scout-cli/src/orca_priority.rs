@@ -212,7 +212,8 @@ fn meteora_scope(
     if runtime.normalized.pool_id.as_str() != leg.pool_id() {
         return Err(format!(
             "Meteora runtime priority pool mismatch: route={} runtime={}",
-            leg.pool_id(), runtime.normalized.pool_id
+            leg.pool_id(),
+            runtime.normalized.pool_id
         ));
     }
 
@@ -268,7 +269,8 @@ fn validate_meteora_leg_quote(
     if leg_quote.pool_id.as_str() != leg.pool_id() {
         return Err(format!(
             "Meteora priority quote pool mismatch: route={} quote={}",
-            leg.pool_id(), leg_quote.pool_id
+            leg.pool_id(),
+            leg_quote.pool_id
         ));
     }
 
@@ -427,11 +429,8 @@ fn parse_response(
 
     if response_id != ORCA_PRIORITY_FEE_RPC_REQUEST_ID {
         return Err(format!(
-            concat!(
-                "priority-fee response id mismatch: expected={} actual={}"
-            ),
-            ORCA_PRIORITY_FEE_RPC_REQUEST_ID,
-            response_id
+            concat!("priority-fee response id mismatch: expected={} actual={}"),
+            ORCA_PRIORITY_FEE_RPC_REQUEST_ID, response_id
         ));
     }
 
@@ -467,4 +466,3 @@ fn parse_response(
         scope_provenance: provenance.to_owned(),
     })
 }
-
