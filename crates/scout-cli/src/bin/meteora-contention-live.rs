@@ -1,5 +1,4 @@
 use reqwest::Client;
-use scout_cli::meteora::METEORA_DLMM_PROGRAM_ID;
 use scout_cli::meteora_contention::meteora_quote_contention_footprint;
 use scout_cli::meteora_live::{
     meteora_base_hydration_account_pubkeys, meteora_initial_bin_array_pubkeys,
