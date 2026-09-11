@@ -100,14 +100,10 @@ pub fn meteora_quote_contention_footprint(
         let bin_array = snapshot
             .bin_array_by_index(*index)
             .map_err(|error| {
-                format!(
-                    "Meteora contention BinArray lookup failed: index={index} error={error:?}"
-                )
+                format!("Meteora contention BinArray lookup failed: index={index} error={error:?}")
             })?
             .ok_or_else(|| {
-                format!(
-                    "Meteora contention quote references an unhydrated BinArray: index={index}"
-                )
+                format!("Meteora contention quote references an unhydrated BinArray: index={index}")
             })?;
 
         push_unique_account(
@@ -147,7 +143,9 @@ fn validate_quote_binding(
     }
 
     if quote.requested_input_raw == 0 {
-        return Err("Meteora contention quote requested input must be greater than zero".to_owned());
+        return Err(
+            "Meteora contention quote requested input must be greater than zero".to_owned(),
+        );
     }
 
     if quote.consumed_input_raw != quote.requested_input_raw || quote.unspent_input_raw != 0 {
@@ -178,11 +176,7 @@ fn validate_quote_binding(
                 "Meteora contention quote direction mismatch: swap_for_y={} ",
                 "input={} expected_input={} output={} expected_output={}"
             ),
-            quote.swap_for_y,
-            quote.input_mint,
-            expected_input,
-            quote.output_mint,
-            expected_output
+            quote.swap_for_y, quote.input_mint, expected_input, quote.output_mint, expected_output
         ));
     }
 
@@ -246,8 +240,7 @@ mod tests {
     use crate::meteora::{
         derive_bin_array_pda, DlmmProtocolProfile, MeteoraBin, MeteoraBinArraySnapshotInput,
         MeteoraBinArrayState, MeteoraBitmapExtensionState, MeteoraClockSnapshot,
-        MeteoraInternalBitmap, MeteoraLbPairState, BIN_ARRAY_VERSION_V3,
-        INTERNAL_BITMAP_MIN_INDEX,
+        MeteoraInternalBitmap, MeteoraLbPairState, BIN_ARRAY_VERSION_V3, INTERNAL_BITMAP_MIN_INDEX,
     };
 
     const LB_PAIR: [u8; 32] = [7_u8; 32];
