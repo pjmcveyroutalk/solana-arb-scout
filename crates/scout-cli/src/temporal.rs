@@ -659,7 +659,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
-        std::env::temp_dir().join(format!("scout-stage-f-{label}-{}-{now}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "scout-stage-f-{label}-{}-{now}",
+            std::process::id()
+        ))
     }
 
     fn candidate_payload(candidate_id: &str, route_id: &str, usd_size: u64, status: &str) -> Value {
@@ -732,12 +735,7 @@ mod tests {
         ];
 
         write_source(&paths[0], "run-a", 1_000, "economics_unresolved")?;
-        write_source(
-            &paths[1],
-            "run-b",
-            1_500,
-            "economics_resolved_nonpositive",
-        )?;
+        write_source(&paths[1], "run-b", 1_500, "economics_resolved_nonpositive")?;
         write_source(&paths[2], "run-c", 2_250, "economics_resolved_positive")?;
 
         let evidence = aggregate_r12_runs(&paths)?;
@@ -847,12 +845,7 @@ mod tests {
 
         write_source(&paths[0], "run-a", 1_000, "quote_rejected")?;
         write_source(&paths[1], "run-b", 1_250, "economics_unresolved")?;
-        write_source(
-            &paths[2],
-            "run-c",
-            1_500,
-            "economics_resolved_nonpositive",
-        )?;
+        write_source(&paths[2], "run-c", 1_500, "economics_resolved_nonpositive")?;
 
         let evidence = aggregate_r12_runs(&paths)?;
         let output = dir.join("temporal.json");
@@ -863,4 +856,3 @@ mod tests {
         Ok(())
     }
 }
-
