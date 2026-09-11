@@ -13,7 +13,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run() -> Result<(), String> {
-    let listen_addr = env::var("SCOUT_LOCAL_RPC_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_owned());
+    let listen_addr =
+        env::var("SCOUT_LOCAL_RPC_ADDR").unwrap_or_else(|_| DEFAULT_LISTEN_ADDR.to_owned());
     let upstream = env::var("SCOUT_RPC_UPSTREAM").unwrap_or_else(|_| DEFAULT_UPSTREAM.to_owned());
 
     ensure_loopback_listener(&listen_addr)?;
@@ -131,7 +132,11 @@ fn validate_request(request: &Value) -> Result<&str, Value> {
     };
 
     if !is_read_only_method(method) {
-        return Err(json_rpc_error(id, -32601, "method not allowed by Scout read-only RPC"));
+        return Err(json_rpc_error(
+            id,
+            -32601,
+            "method not allowed by Scout read-only RPC",
+        ));
     }
 
     Ok(method)
@@ -267,7 +272,9 @@ fn send_json(stream: &mut TcpStream, status: &str, value: &Value) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_loopback_listener, is_read_only_method, parse_content_length, validate_request};
+    use super::{
+        ensure_loopback_listener, is_read_only_method, parse_content_length, validate_request,
+    };
     use serde_json::json;
 
     #[test]
