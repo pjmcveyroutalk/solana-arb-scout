@@ -1804,18 +1804,26 @@ async fn validate_registry_routes_and_sizes(
 
     let jito_observation = observe_jito_tip_floor(rpc_client).await;
     let mut priority_cache = BTreeMap::<Vec<String>, costs::PriorityObservationState>::new();
-    let mut route_priority_observations = BTreeMap::<usize, costs::PriorityObservationState>::new();
+    let mut route_priority_observations =
+        BTreeMap::<(usize, Option<u64>), costs::PriorityObservationState>::new();
     let mut rung11c_route_scope_attempts = 0usize;
 
-    let successful_route_indices = rung11c_quote_records
-        .iter()
-        .map(|record| record.route_index)
-        .collect::<BTreeSet<_>>();
-
-    for route_index in successful_route_indices {
-        let Some(route_candidate) = route_candidates.get(route_index) else {
+    for record in &rung11c_quote_records {
+        let Some(route_candidate) = route_candidates.get(record.route_index) else {
             continue;
         };
+
+        let quote_bound_scope = route_candidate.leg_1().venue() == Venue::Meteora
+            || route_candidate.leg_2().venue() == Venue::Meteora;
+        let observation_key = route_priority_observation_key(
+            record.route_index,
+            record.dollars,
+            quote_bound_scope,
+        );
+
+        if route_priority_observations.contains_key(&observation_key) {
+            continue;
+        }
 
         rung11c_route_scope_attempts += 1;
 
@@ -1823,13 +1831,13 @@ async fn validate_registry_routes_and_sizes(
             rpc_client,
             route_candidate.leg_1(),
             route_candidate.leg_2(),
-            quote_contexts.raydium,
-            quote_contexts.orca,
+            quote_contexts,
+            &record.route_quote,
             &mut priority_cache,
         )
         .await;
 
-        route_priority_observations.insert(route_index, priority_observation);
+        route_priority_observations.insert(observation_key, priority_observation);
     }
 
     let external_cost_usd_prices = costs::ExternalCostUsdPrices::new(
@@ -1843,8 +1851,16 @@ async fn validate_registry_routes_and_sizes(
             continue;
         };
 
+        let quote_bound_scope = route_candidate.leg_1().venue() == Venue::Meteora
+            || route_candidate.leg_2().venue() == Venue::Meteora;
+        let observation_key = route_priority_observation_key(
+            record.route_index,
+            record.dollars,
+            quote_bound_scope,
+        );
+
         let priority_observation = if let Some(observation) =
-            route_priority_observations.get(&record.route_index)
+            route_priority_observations.get(&observation_key)
         {
             observation
         } else {
@@ -2225,29 +2241,60 @@ async fn observe_jito_tip_floor(rpc_client: &Client) -> costs::JitoObservationSt
     }
 }
 
+fn route_priority_observation_key(
+    route_index: usize,
+    dollars: u64,
+    quote_bound_scope: bool,
+) -> (usize, Option<u64>) {
+    if quote_bound_scope {
+        (route_index, Some(dollars))
+    } else {
+        (route_index, None)
+    }
+}
+
 async fn route_priority_observation(
     rpc_client: &Client,
     leg_1: &RouteLeg,
     leg_2: &RouteLeg,
-    raydium_quote_contexts: &BTreeMap<String, raydium::RaydiumHydrationSnapshot>,
-    orca_prepared: &BTreeMap<String, orca_live::PreparedOrca>,
+    quote_contexts: &RuntimeQuoteContexts<'_>,
+    route_quote: &quote::TwoLegRouteQuote,
     cache: &mut BTreeMap<Vec<String>, costs::PriorityObservationState>,
 ) -> costs::PriorityObservationState {
+    if leg_1.venue() == Venue::Meteora || leg_2.venue() == Venue::Meteora {
+        let priority_contexts = orca_priority::RoutePriorityContexts {
+            raydium: quote_contexts.raydium,
+            orca: quote_contexts.orca,
+            meteora: quote_contexts.meteora,
+        };
+
+        return orca_priority::observe_route_with_contexts(
+            rpc_client,
+            SOLANA_RPC_URL,
+            leg_1,
+            leg_2,
+            Some(route_quote),
+            &priority_contexts,
+            cache,
+        )
+        .await;
+    }
+
     if leg_1.venue() == Venue::Orca || leg_2.venue() == Venue::Orca {
         return orca_priority::observe_route(
             rpc_client,
             SOLANA_RPC_URL,
             leg_1,
             leg_2,
-            raydium_quote_contexts,
-            orca_prepared,
+            quote_contexts.raydium,
+            quote_contexts.orca,
             cache,
         )
         .await;
     }
 
     let leg_1_raydium = match leg_1.venue() {
-        Venue::RaydiumCpmm => match raydium_quote_contexts.get(leg_1.pool_id()) {
+        Venue::RaydiumCpmm => match quote_contexts.raydium.get(leg_1.pool_id()) {
             Some(snapshot) => Some(snapshot),
             None => {
                 let reason = format!(
@@ -2268,7 +2315,7 @@ async fn route_priority_observation(
     };
 
     let leg_2_raydium = match leg_2.venue() {
-        Venue::RaydiumCpmm => match raydium_quote_contexts.get(leg_2.pool_id()) {
+        Venue::RaydiumCpmm => match quote_contexts.raydium.get(leg_2.pool_id()) {
             Some(snapshot) => Some(snapshot),
             None => {
                 let reason = format!(
@@ -2485,4 +2532,21 @@ mod tests {
             "Rung 9 deterministic discovery incomplete: incomplete_probe_count=2 first_cause=first transport failure"
         );
     }
+
+    #[test]
+    fn meteora_priority_observation_key_is_quote_size_bound() {
+        assert_ne!(
+            route_priority_observation_key(7, 1, true),
+            route_priority_observation_key(7, 1_000, true)
+        );
+    }
+
+    #[test]
+    fn legacy_priority_observation_key_remains_route_bound() {
+        assert_eq!(
+            route_priority_observation_key(7, 1, false),
+            route_priority_observation_key(7, 1_000, false)
+        );
+    }
 }
+
