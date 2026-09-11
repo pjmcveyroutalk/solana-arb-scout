@@ -1,3 +1,4 @@
+pub mod local_rpc;
 pub mod meteora;
 pub mod meteora_contention;
 pub mod meteora_live;
