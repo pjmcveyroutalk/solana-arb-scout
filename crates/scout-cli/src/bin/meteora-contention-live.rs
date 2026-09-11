@@ -163,8 +163,14 @@ async fn main() -> Result<(), String> {
         quote.touched_bin_arrays,
         footprint.accounts.len()
     );
-    println!("meteora_stage_d_live_accounts: [{}]", footprint.account_pubkeys_base58().join(","));
-    println!("meteora_stage_d_live_provenance: {}", footprint.provenance());
+    println!(
+        "meteora_stage_d_live_accounts: [{}]",
+        footprint.account_pubkeys_base58().join(",")
+    );
+    println!(
+        "meteora_stage_d_live_provenance: {}",
+        footprint.provenance()
+    );
     println!("meteora_stage_d_evidence={EVIDENCE_PATH}");
     println!("READ-ONLY METEORA STAGE D CONTENTION FOOTPRINT PASS");
 
@@ -193,7 +199,9 @@ async fn fetch_pool_observation(rpc_client: &Client) -> Result<MeteoraLiveObserv
     .await?;
 
     if let Some(error) = payload.get("error") {
-        return Err(format!("Meteora Stage D getAccountInfo returned an RPC error: {error}"));
+        return Err(format!(
+            "Meteora Stage D getAccountInfo returned an RPC error: {error}"
+        ));
     }
 
     let slot = payload
