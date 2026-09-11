@@ -1,4 +1,5 @@
 pub mod meteora;
+pub mod meteora_contention;
 pub mod meteora_live;
 pub mod meteora_m10;
 pub mod meteora_m11;
