@@ -98,22 +98,8 @@ jobs:
               exit 1
             fi
 
-            run_id="$(python3 - "${r12_files[0]}" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-with open(path, "r", encoding="utf-8") as source:
-    for line in source:
-        record = json.loads(line)
-        if record.get("event_type") == "run_start":
-            run_id = record.get("run_id")
-            if not isinstance(run_id, str) or not run_id:
-                raise SystemExit("R12 run_start has no valid run_id")
-            print(run_id)
-            raise SystemExit(0)
-raise SystemExit("R12 source has no run_start")
-PY
+            run_id="$(
+              python3 -c 'import json,sys; records=(json.loads(line) for line in open(sys.argv[1], encoding="utf-8")); record=next((record for record in records if record.get("event_type")=="run_start"), None); run_id=record.get("run_id") if isinstance(record, dict) else None; print(run_id) if isinstance(run_id, str) and run_id else sys.exit("R12 source has no valid run_start run_id")' "${r12_files[0]}"
             )"
 
             r12_target="$root/source-r12/observation-${observation}.jsonl"
