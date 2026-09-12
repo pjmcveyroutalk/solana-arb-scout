@@ -1,0 +1,107 @@
+name: Scout Stage F Temporal Evidence
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/stage-f-temporal.yml"
+      - "crates/scout-cli/src/temporal.rs"
+      - "crates/scout-cli/src/bin/stage-f-temporal.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Canonical Rust 1.80 Preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run canonical Rust 1.80 preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/preflight-rust.sh
+
+  temporal-evidence:
+    name: Stage F Bounded Repeated Observation
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.80
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.80.0 --profile minimal
+
+      - name: Run three fresh read-only Scout observations
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/stage-f-temporal/source-r12
+          mkdir -p artifacts/stage-f-temporal/source-r13
+
+          for observation in 1 2 3; do
+            echo "stage_f_observation_start: index=${observation}"
+            rm -rf artifacts/r12-shadow artifacts/r13-forensics
+
+            log_file="artifacts/stage-f-temporal/observation-${observation}.log"
+            set +e
+            timeout 300s rustup run 1.80.0 cargo run --locked -p scout-cli --bin scout-cli 2>&1 | tee "$log_file"
+            scout_status="${PIPESTATUS[0]}"
+            set -e
+
+            mapfile -t r12_files < <(find artifacts/r12-shadow -maxdepth 1 -type f -name '*.jsonl' -print | sort)
+            if [[ "${#r12_files[@]}" -ne 1 ]]; then
+              echo "Stage F observation ${observation} expected exactly one R12 artifact; found ${#r12_files[@]}."
+              exit 1
+            fi
+
+            if ! grep -Fq '"event_type":"run_end"' "${r12_files[0]}"; then
+              echo "Stage F observation ${observation} did not produce a completed R12 run."
+              exit 1
+            fi
+
+            cp "${r12_files[0]}" "artifacts/stage-f-temporal/source-r12/observation-${observation}.jsonl"
+
+            if [[ -d artifacts/r13-forensics ]]; then
+              while IFS= read -r r13_file; do
+                cp "$r13_file" "artifacts/stage-f-temporal/source-r13/observation-${observation}-$(basename "$r13_file")"
+              done < <(find artifacts/r13-forensics -maxdepth 1 -type f -name '*.jsonl' -print | sort)
+            fi
+
+            echo "stage_f_observation_complete: index=${observation} scout_exit_status=${scout_status} r12=${r12_files[0]}"
+          done
+
+      - name: Aggregate Stage F temporal evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup run 1.80.0 cargo run --locked -p scout-cli --bin stage-f-temporal -- \
+            artifacts/stage-f-temporal/source-r12/observation-1.jsonl \
+            artifacts/stage-f-temporal/source-r12/observation-2.jsonl \
+            artifacts/stage-f-temporal/source-r12/observation-3.jsonl
+
+      - name: Upload Stage F temporal evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-f-temporal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            artifacts/stage-f-temporal/temporal-evidence.json
+            artifacts/stage-f-temporal/source-r12/*.jsonl
+            artifacts/stage-f-temporal/source-r13/*.jsonl
+            artifacts/stage-f-temporal/observation-*.log
+          if-no-files-found: warn
+          retention-days: 14
