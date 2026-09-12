@@ -1,6 +1,11 @@
 name: Scout Stage G Four-Venue Dataset
 
 on:
+  push:
+    branches:
+      - scout-dev
+    paths:
+      - ".github/workflows/stage-g-dataset.yml"
   pull_request:
     branches:
       - main
