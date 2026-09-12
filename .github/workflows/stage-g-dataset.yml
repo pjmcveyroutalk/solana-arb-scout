@@ -36,10 +36,11 @@ jobs:
     name: Stage G Bounded Four-Venue Observation Campaign
     needs: preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 100
 
     env:
       STAGE_G_OBSERVATION_TARGET: "12"
+      STAGE_G_ATTEMPT_LIMIT: "18"
 
     steps:
       - name: Checkout
@@ -57,92 +58,150 @@ jobs:
           set -euo pipefail
 
           root="artifacts/stage-g-dataset"
-          mkdir -p "$root/source-r12" "$root/source-r13" "$root/logs"
+          mkdir -p \
+            "$root/source-r12" \
+            "$root/source-r13" \
+            "$root/incomplete-r12" \
+            "$root/incomplete-r13" \
+            "$root/logs"
 
           {
-            echo "schema_version=stage-g-dataset-v1"
+            echo "schema_version=stage-g-dataset-v2"
             echo "scope=read_only_four_venue_observation_campaign"
             echo "source_sha=${GITHUB_SHA}"
             echo "source_ref=${GITHUB_REF}"
             echo "workflow_run_id=${GITHUB_RUN_ID}"
             echo "workflow_run_attempt=${GITHUB_RUN_ATTEMPT}"
             echo "observation_target=${STAGE_G_OBSERVATION_TARGET}"
+            echo "attempt_limit=${STAGE_G_ATTEMPT_LIMIT}"
             echo "campaign_bound_note=Operational collection bound only; not a claim of statistical sufficiency, profitable lifetime, or venue-pair superiority."
             echo "campaign_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$root/campaign-metadata.txt"
 
           printf 'observation_index\trun_id\tscout_exit_status\tr13_artifact_count\tr12_artifact\n' \
             > "$root/observations.tsv"
+          printf 'attempt_index\tstatus\tobservation_index\trun_id\tscout_exit_status\tr12_artifact_count\tr12_completed\tr13_artifact_count\tfailure_reason\tlog_artifact\n' \
+            > "$root/attempts.tsv"
 
-          for observation in $(seq 1 "$STAGE_G_OBSERVATION_TARGET"); do
-            echo "stage_g_observation_start: index=${observation}"
+          completed_count=0
+          attempt_count=0
+          incomplete_attempt_count=0
+
+          while [[ "$completed_count" -lt "$STAGE_G_OBSERVATION_TARGET" \
+            && "$attempt_count" -lt "$STAGE_G_ATTEMPT_LIMIT" ]]; do
+            attempt_count=$((attempt_count + 1))
+            echo "stage_g_attempt_start: attempt=${attempt_count} completed=${completed_count} target=${STAGE_G_OBSERVATION_TARGET}"
             rm -rf artifacts/r12-shadow artifacts/r13-forensics
 
-            log_file="$root/logs/observation-${observation}.log"
+            log_file="$root/logs/attempt-${attempt_count}.log"
             set +e
             timeout 300s rustup run 1.80.0 cargo run --locked -p scout-cli --bin scout-cli \
               2>&1 | tee "$log_file"
             scout_status="${PIPESTATUS[0]}"
             set -e
 
-            mapfile -t r12_files < <(
-              find artifacts/r12-shadow -maxdepth 1 -type f -name '*.jsonl' -print | sort
-            )
-            if [[ "${#r12_files[@]}" -ne 1 ]]; then
-              echo "Stage G observation ${observation} expected exactly one R12 artifact; found ${#r12_files[@]}."
-              exit 1
+            r12_files=()
+            if [[ -d artifacts/r12-shadow ]]; then
+              mapfile -t r12_files < <(
+                find artifacts/r12-shadow -maxdepth 1 -type f -name '*.jsonl' -print | sort
+              )
             fi
+            r12_count="${#r12_files[@]}"
 
-            if ! grep -Fq '"event_type":"run_end"' "${r12_files[0]}"; then
-              echo "Stage G observation ${observation} did not produce a completed R12 run."
-              exit 1
-            fi
-
-            run_id="$(
-              python3 -c 'import json,sys; records=(json.loads(line) for line in open(sys.argv[1], encoding="utf-8")); record=next((record for record in records if record.get("event_type")=="run_start"), None); run_id=record.get("run_id") if isinstance(record, dict) else None; print(run_id) if isinstance(run_id, str) and run_id else sys.exit("R12 source has no valid run_start run_id")' "${r12_files[0]}"
-            )"
-
-            r12_target="$root/source-r12/observation-${observation}.jsonl"
-            cp "${r12_files[0]}" "$r12_target"
-
-            r13_count=0
+            r13_files=()
             if [[ -d artifacts/r13-forensics ]]; then
-              while IFS= read -r r13_file; do
-                cp "$r13_file" \
-                  "$root/source-r13/observation-${observation}-$(basename "$r13_file")"
-                r13_count=$((r13_count + 1))
-              done < <(
+              mapfile -t r13_files < <(
                 find artifacts/r13-forensics -maxdepth 1 -type f -name '*.jsonl' -print | sort
               )
             fi
+            r13_count="${#r13_files[@]}"
 
-            printf '%s\t%s\t%s\t%s\t%s\n' \
-              "$observation" "$run_id" "$scout_status" "$r13_count" "$r12_target" \
-              >> "$root/observations.tsv"
+            r12_completed="false"
+            run_id=""
+            failure_reason=""
 
-            echo "stage_g_observation_complete: index=${observation} run_id=${run_id} scout_exit_status=${scout_status} r13_artifact_count=${r13_count}"
+            if [[ "$r12_count" -ne 1 ]]; then
+              failure_reason="r12_artifact_count_${r12_count}"
+            elif ! grep -Fq '"event_type":"run_end"' "${r12_files[0]}"; then
+              failure_reason="r12_missing_run_end"
+            else
+              run_id="$(
+                python3 -c 'import json,sys; records=(json.loads(line) for line in open(sys.argv[1], encoding="utf-8")); record=next((record for record in records if record.get("event_type")=="run_start"), None); run_id=record.get("run_id") if isinstance(record, dict) else None; print(run_id) if isinstance(run_id, str) and run_id else None' "${r12_files[0]}" 2>/dev/null || true
+              )"
+              if [[ -n "$run_id" ]]; then
+                r12_completed="true"
+              else
+                failure_reason="r12_missing_valid_run_start_run_id"
+              fi
+            fi
+
+            if [[ "$r12_completed" == "true" ]]; then
+              completed_count=$((completed_count + 1))
+              observation="$completed_count"
+
+              r12_target="$root/source-r12/observation-${observation}.jsonl"
+              cp "${r12_files[0]}" "$r12_target"
+
+              for r13_file in "${r13_files[@]}"; do
+                cp "$r13_file" \
+                  "$root/source-r13/observation-${observation}-$(basename "$r13_file")"
+              done
+
+              printf '%s\t%s\t%s\t%s\t%s\n' \
+                "$observation" "$run_id" "$scout_status" "$r13_count" "$r12_target" \
+                >> "$root/observations.tsv"
+              printf '%s\tcomplete\t%s\t%s\t%s\t%s\ttrue\t%s\t\t%s\n' \
+                "$attempt_count" "$observation" "$run_id" "$scout_status" "$r12_count" "$r13_count" "$log_file" \
+                >> "$root/attempts.tsv"
+
+              echo "stage_g_observation_complete: observation=${observation} attempt=${attempt_count} run_id=${run_id} scout_exit_status=${scout_status} r13_artifact_count=${r13_count}"
+            else
+              incomplete_attempt_count=$((incomplete_attempt_count + 1))
+
+              for r12_file in "${r12_files[@]}"; do
+                cp "$r12_file" \
+                  "$root/incomplete-r12/attempt-${attempt_count}-$(basename "$r12_file")"
+              done
+              for r13_file in "${r13_files[@]}"; do
+                cp "$r13_file" \
+                  "$root/incomplete-r13/attempt-${attempt_count}-$(basename "$r13_file")"
+              done
+
+              printf '%s\tincomplete\t\t%s\t%s\t%s\tfalse\t%s\t%s\t%s\n' \
+                "$attempt_count" "$run_id" "$scout_status" "$r12_count" "$r13_count" "$failure_reason" "$log_file" \
+                >> "$root/attempts.tsv"
+
+              echo "stage_g_attempt_incomplete: attempt=${attempt_count} scout_exit_status=${scout_status} r12_artifact_count=${r12_count} r13_artifact_count=${r13_count} reason=${failure_reason}"
+            fi
           done
 
-          completed_count="$(find "$root/source-r12" -maxdepth 1 -type f -name 'observation-*.jsonl' | wc -l)"
+          campaign_status="complete"
           if [[ "$completed_count" -ne "$STAGE_G_OBSERVATION_TARGET" ]]; then
-            echo "Stage G campaign expected ${STAGE_G_OBSERVATION_TARGET} completed R12 observations; found ${completed_count}."
-            exit 1
+            campaign_status="incomplete"
           fi
 
-          echo "campaign_completed_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            >> "$root/campaign-metadata.txt"
-          echo "completed_r12_observation_count=${completed_count}" \
-            >> "$root/campaign-metadata.txt"
+          {
+            echo "campaign_ended_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "campaign_status=${campaign_status}"
+            echo "completed_r12_observation_count=${completed_count}"
+            echo "total_attempt_count=${attempt_count}"
+            echo "incomplete_attempt_count=${incomplete_attempt_count}"
+          } >> "$root/campaign-metadata.txt"
 
           (
             cd "$root"
-            sha256sum campaign-metadata.txt observations.tsv
-            find source-r12 source-r13 logs -type f -print0 \
+            sha256sum campaign-metadata.txt observations.tsv attempts.tsv
+            find source-r12 source-r13 incomplete-r12 incomplete-r13 logs -type f -print0 \
               | sort -z \
               | xargs -0 -r sha256sum
           ) > "$root/checksums.sha256"
 
-          echo "stage_g_campaign_complete: completed_r12_observation_count=${completed_count}"
+          if [[ "$campaign_status" != "complete" ]]; then
+            echo "Stage G campaign exhausted ${attempt_count} attempts with ${completed_count}/${STAGE_G_OBSERVATION_TARGET} completed R12 observations."
+            exit 1
+          fi
+
+          echo "stage_g_campaign_complete: completed_r12_observation_count=${completed_count} total_attempt_count=${attempt_count} incomplete_attempt_count=${incomplete_attempt_count}"
           echo "READ-ONLY STAGE G BOUNDED DATASET COLLECTION PASS"
 
       - name: Upload Stage G raw dataset
@@ -153,9 +212,12 @@ jobs:
           path: |
             artifacts/stage-g-dataset/campaign-metadata.txt
             artifacts/stage-g-dataset/observations.tsv
+            artifacts/stage-g-dataset/attempts.tsv
             artifacts/stage-g-dataset/checksums.sha256
             artifacts/stage-g-dataset/source-r12/*.jsonl
             artifacts/stage-g-dataset/source-r13/*.jsonl
+            artifacts/stage-g-dataset/incomplete-r12/*.jsonl
+            artifacts/stage-g-dataset/incomplete-r13/*.jsonl
             artifacts/stage-g-dataset/logs/*.log
           if-no-files-found: warn
           retention-days: 14
